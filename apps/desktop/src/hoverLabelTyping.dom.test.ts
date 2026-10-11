@@ -3,7 +3,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MoleculeObject } from "@chemdraft/chem-core";
+import { serializeDocument, type MoleculeObject } from "@chemdraft/chem-core";
 import { MainWindow } from "./MainWindow";
 import { createPhase4Document, insertNativeTemplateMolecule, selectDocumentObjects } from "./documentWorkflow";
 import { saveKeybindingSettings } from "./keybindingSettings";
@@ -241,6 +241,211 @@ describe("hover label typing", () => {
     expect(editor()?.value).toBe("N2");
     expect(molecule().bonds.find((candidate) => candidate.id === bond.id)!.order).toBe(bond.order);
     expectIntact();
+  });
+
+  async function hoverPoint(point: { x: number; y: number }) {
+    const page = container.querySelector<HTMLElement>(".page")!;
+    await act(async () => {
+      const event = new MouseEvent("pointermove", { bubbles: true, clientX: point.x, clientY: point.y, buttons: 0 });
+      Object.defineProperties(event, { pointerId: { value: 7 }, pointerType: { value: "mouse" }, isPrimary: { value: true } });
+      page.dispatchEvent(event);
+    });
+  }
+
+  it("keeps a label going when the pointer drifts onto a neighbouring atom", async () => {
+    await hover(0);
+    await press("O");
+    await hover(1);
+    await press("M");
+    expect(editor()?.value).toBe("OM");
+    await press("e");
+    await press("Enter");
+    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
+    expect(molecule().atoms[1]!.element).toBe("C");
+    expectIntact();
+    // The label is done: the hover is back on the atom under the pointer.
+    expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "atom", atomId: molecule().atoms[1]!.id });
+  });
+
+  it("keeps a label going when the pointer drifts off the molecule onto empty page", async () => {
+    await hover(0);
+    await press("O");
+    await hoverPoint({ x: 40, y: 40 });
+    expect(snapshot().hoveredNativeTarget).toBeUndefined();
+    await press("M");
+    await press("e");
+    await press("Enter");
+    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
+    expectIntact();
+  });
+
+  // A drift straight after the first instant letter, then a capital element letter: the continuing
+  // key was re-judged against the labelled atom it had just moved the hover back to, read as a new
+  // label there, and CF3 silently became F3.
+  it("keeps CF3 when the pointer drifts onto empty page right after the first letter", async () => {
+    await hover(0);
+    await press("C");
+    await hoverPoint({ x: 40, y: 40 });
+    expect(snapshot().hoveredNativeTarget).toBeUndefined();
+    await press("F");
+    expect(editor()?.value).toBe("CF");
+    await press("3");
+    expect(editor()?.value).toBe("CF3");
+    await press("Enter");
+    expect(molecule().atoms[0]).toMatchObject({ element: "CF3", labelLiteral: true });
+    expectIntact();
+  });
+
+  it("starts a new label on the neighbouring atom for a capital element letter typed right after the first letter", async () => {
+    await hover(0);
+    await press("C");
+    await hover(1);
+    await press("F");
+    expect(molecule().atoms[0]!.element).toBe("C");
+    expect(molecule().atoms[1]!.element).toBe("F");
+    expect(editor()).toBeNull();
+    await press("3");
+    expect(editor()?.value).toBe("F3");
+    await press("Enter");
+    expect(molecule().atoms[0]!.element).toBe("C");
+    expect(molecule().atoms[1]).toMatchObject({ element: "F3" });
+    expectIntact();
+  });
+
+  it("keeps a label going over another atom's bond, for a key that cannot start a label", async () => {
+    await hover(0);
+    await press("O");
+    const { bond } = await hoverBond(3, 0.5);
+    await press("M");
+    expect(editor()?.value).toBe("OM");
+    await press("e");
+    await press("Enter");
+    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
+    expect(molecule().bonds.find((candidate) => candidate.id === bond.id)!.order).toBe(bond.order);
+    expectIntact();
+  });
+
+  it("keeps a digit in the label after a drift onto a neighbour, rather than acting on the neighbour", async () => {
+    await hover(0);
+    await press("N");
+    const before = molecule();
+    await hover(1);
+    await press("2");
+    expect(editor()?.value).toBe("N2");
+    expect(molecule().atoms[1]).toMatchObject(before.atoms[1]!);
+    expect(molecule().bonds).toEqual(before.bonds);
+    expectIntact();
+  });
+
+  it("starts a new label for a capital element letter over a neighbour after a drift", async () => {
+    await hover(0);
+    await press("O");
+    await hover(1);
+    await press("N");
+    expect(molecule().atoms[0]!.element).toBe("O");
+    expect(molecule().atoms[1]!.element).toBe("N");
+    expect(editor()).toBeNull();
+    // And that new label continues on the neighbour.
+    await press("a");
+    expect(editor()?.value).toBe("Na");
+    expectIntact();
+  });
+
+  it("labels the nearer end of another atom's bond for a capital element letter after a drift", async () => {
+    await hover(0);
+    await press("O");
+    const { near, far } = await hoverBond(3, 0.4);
+    await press("S");
+    expect(molecule().atoms[0]!.element).toBe("O");
+    expect(molecule().atoms.find((atom) => atom.id === near.id)!.element).toBe("S");
+    expect(molecule().atoms.find((atom) => atom.id === far.id)!.element).toBe("C");
+    expect(editor()).toBeNull();
+    expectIntact();
+  });
+
+  it("does not continue a label that was undone before the drift", async () => {
+    await hover(0);
+    await press("O");
+    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("edit.undo"); });
+    expect(molecule().atoms[0]!.element).toBe("C");
+    await hover(1);
+    await press("e");
+    expect(editor()).toBeNull();
+    expect(snapshot().activeToolCommandId).toBe("tool.eraser");
+    expect(molecule().atoms.map((atom) => atom.element)).toEqual(["C", "C", "C", "C", "C", "C"]);
+  });
+
+  // Now that the pointer leaving the atom no longer ends a continuation, every other change of
+  // context must. Each case: "O" on atom 0, the context change, a drift to atom 1, then "e", which
+  // must choose the Eraser rather than continue the old label as "Oe".
+  async function expectContinuationEnded() {
+    await hover(1);
+    await press("e");
+    expect(editor()).toBeNull();
+    expect(snapshot().activeToolCommandId).toBe("tool.eraser");
+    expect(molecule().atoms[0]!.element).toBe("O");
+    expect(molecule().atoms).toHaveLength(6);
+  }
+
+  it("ends a label continuation on undo then redo from the menu", async () => {
+    await hover(0);
+    await press("O");
+    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("edit.undo"); });
+    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("edit.redo"); });
+    expect(molecule().atoms[0]!.element).toBe("O");
+    await expectContinuationEnded();
+  });
+
+  it("ends a label continuation when a document is opened, even one with the same atoms", async () => {
+    await hover(0);
+    await press("O");
+    const labelled = molecule();
+    expect(snapshot().file.dirty).toBe(true);
+    // Reopen the document as it stands: same object and atom ids, atom 0 still "O".
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Open native ChemDraft document"]')!;
+    const file = new File([serializeDocument(snapshot().document)], "same.chemdraft", { type: "application/json" });
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+    await act(async () => {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      await file.text();
+    });
+    await act(async () => { await Promise.resolve(); });
+    expect(snapshot().file.dirty).toBe(false);
+    expect(molecule().id).toBe(labelled.id);
+    expect(molecule().atoms[0]).toMatchObject({ id: labelled.atoms[0]!.id, element: "O" });
+    await expectContinuationEnded();
+  });
+
+  it("ends a label continuation when a key goes to a dialog opened from the menu", async () => {
+    await hover(0);
+    await press("O");
+    await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("page.setSizeCustom"); });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom page size"]')!;
+    expect(dialog).not.toBeNull();
+    await press("Tab", dialog);
+    const cancel = [...dialog.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Cancel")!;
+    await act(async () => { cancel.click(); });
+    expect(container.querySelector('[role="dialog"][aria-label="Custom page size"]')).toBeNull();
+    await expectContinuationEnded();
+  });
+
+  it("ends a label continuation when the window loses focus", async () => {
+    await hover(0);
+    await press("O");
+    await act(async () => { window.dispatchEvent(new Event("blur")); });
+    await expectContinuationEnded();
+  });
+
+  it("ends a label continuation when the window is hidden", async () => {
+    await hover(0);
+    await press("O");
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+    try {
+      await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+    } finally {
+      Reflect.deleteProperty(document, "visibilityState");
+    }
+    await expectContinuationEnded();
   });
 
   it("hovers the bond again once a label typed over it commits, so Delete acts on the bond", async () => {
