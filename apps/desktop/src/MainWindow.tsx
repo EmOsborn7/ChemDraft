@@ -1,4 +1,5 @@
 import { snapRotationDegrees } from "./rotationSnap";
+import { planDisplayPage } from "./plannedDisplayPage";
 import { snapPlacementDegrees } from "./placementSnap";
 import { listenTauriEvent } from "./window-manager/tauriEvents";
 import { OpenWarningsList } from "./OpenWarningsList";
@@ -78,6 +79,7 @@ import {
   type TextSpan
 } from "@chemdraft/chem-core";
 import { tryNativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
+import { createAtomLabelDraftRollback, recordAtomLabelDraftRollback, restoreAtomLabelDraft, type AtomLabelDraftState } from "./atomLabelDraft";
 import type { EditorSaveResult } from "@chemdraft/editor-adapter";
 import { sha256Utf8Hex } from "@chemdraft/cdx-compat";
 import {
@@ -178,6 +180,7 @@ import {
   nonElementAtomLabelPlacement,
   defaultMechanismArrowControls,
   planMoleculeAtomLabels,
+  recordedLabelBondSide,
   planPageSvgRender,
   planNativeArtVisual,
   placementAimDegrees,
@@ -369,6 +372,9 @@ import {
   applyNativeArtBooleanOperationToSelection,
   applyNativeCarbonylAtAtomTarget,
   applyNativeAtomElementTarget,
+  commitNativeAtomLabelTarget,
+  normalizeNativeAtomElementLabel,
+  atomLabelEditKeepsStartingLabel,
   applyNativeAtomLabelDraft,
   finishNativeAtomLabelEdit,
   applyChargeToolAtPoint,
@@ -704,6 +710,7 @@ import { MenuBar } from "./MenuBar";
 import { buildAppMenuModel, PLUGIN_MANAGER_COMMAND_ID } from "./appMenu";
 import {
   editHistoryDirection,
+  forceDocumentHistoryCommandId,
   isForcedDocumentHistoryCommandId,
   performTextFieldHistory,
   resolveEditHistoryRoute,
@@ -1258,7 +1265,13 @@ export type NativeMoleculeSelectionDragIntent =
   | { kind: "whole-object" }
   | { kind: "native-part"; target: NativeMoleculeTransformableSelectionPart }
   | { kind: "none" };
-type AtomLabelEditState = {
+type AtomLabelEditState = AtomLabelDraftState & {
+  beforeAtom: MoleculeAtom;
+  beforeMolecule: MoleculeObject;
+  continuesHotkey: boolean;
+  hotkeyUndoDocument?: ChemDraftDocument;
+  /** Render-only attachment target; keyboard ownership remains on atomId. */
+  previewAtomId?: string;
   objectId: string;
   atomId: string;
   initialElement: string;
@@ -1294,7 +1307,41 @@ type AtomLabelFinishReason = "commit" | "blur";
 type AtomLabelEditOptions = {
   clearDraft?: boolean;
   draft?: string;
+  beforeAtom?: MoleculeAtom;
+  beforeMolecule?: MoleculeObject;
+  hotkeyChanged?: boolean;
+  hotkeyUndoDocument?: ChemDraftDocument;
 };
+
+function documentHasAtomLabelDraft(document: ChemDraftDocument, state: AtomLabelEditState): boolean {
+  const object = findDocumentObject(document, state.objectId);
+  const atom = object?.type === "molecule" ? object.atoms.find(a => a.id === state.atomId) : undefined;
+  return atom?.labelLiteral === true && (!state.draft.trim() || atom.element === normalizeNativeAtomElementLabel(state.draft));
+}
+
+function atomLabelEditStart(state: AtomLabelEditState) {
+  return { element: state.initialElement, literal: state.initialLiteral, labelBondSide: state.initialLabelBondSide };
+}
+
+function atomLabelEditKeepsStartingText(state: AtomLabelEditState): boolean {
+  return normalizeNativeAtomElementLabel(state.draft) === state.initialElement &&
+    atomLabelEditKeepsStartingLabel(atomLabelEditStart(state));
+}
+
+/** The same close decision for the editor and every flush; never mutates the session. */
+function finishedAtomLabelDraft(current: ChemDraftDocument, state: AtomLabelEditState) {
+  const target = { objectId: state.objectId, kind: "atom" as const, atomId: state.atomId, distanceToPointer: 0 };
+  const baseline = restoreAtomLabelDraft(current, state);
+  // The recorded/side-dependent starting label wins before considering an attachment.
+  if (atomLabelEditKeepsStartingText(state)) {
+    return { baseline, document: finishNativeAtomLabelEdit(baseline, target, atomLabelEditStart(state)), target };
+  }
+  // Ordinary labels still go through the typed relabel decision (C/N can become literal).
+  const unchanged = !state.draft.trim();
+  return { baseline, ...(unchanged ? { document: baseline, target } : commitNativeAtomLabelTarget(baseline, target, state.draft, {
+    literal: true, beforeAtom: state.beforeAtom, beforeMolecule: state.beforeMolecule
+  })) };
+}
 
 /** A native palette/popover deactivates the document; that blur does not finish an inline edit. */
 function inlineEditorBlurEndsEdit(editor: HTMLElement): boolean {
@@ -1520,7 +1567,7 @@ const GRAPHIC_HANDLE_DRAG_THRESHOLD = 1;
 const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
-const CURRENT_BUILD_STAMP = "10.11.12.00-opus";
+const CURRENT_BUILD_STAMP = "10.11.12.10-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2045,6 +2092,8 @@ export function MainWindow({
   // close restores the pre-edit selection; see the atom-label close effect.
   const atomLabelEditKeepsSelectionRef = useRef<AtomLabelEditState | undefined>(undefined);
   const previousAtomLabelEditRef = useRef<AtomLabelEditState | undefined>(undefined);
+  const cancelledAtomLabelEditRef = useRef<AtomLabelEditState | undefined>(undefined);
+  const finalizedAtomLabelEditRef = useRef<AtomLabelEditState | undefined>(undefined);
   const [textStyleDefaults, setTextStyleDefaults] = useState<NativeTextStyle>(DefaultNativeTextStyle);
   const [activeToolState, setActiveToolState] = useState(() => createActiveToolState(initialActiveToolCommandId));
   const [toolsetRegistry, setToolsetRegistry] = useState<DesktopToolsetRegistry>(() => desktopToolsetRegistry);
@@ -2563,29 +2612,21 @@ export function MainWindow({
   const activeArtLineDrawToolActive = activeNativeArtTool !== undefined &&
     nativeArtToolSupportsArrowHoverEdit(activeNativeArtTool.commandId);
   const activePage = document.pages[0];
-  const plannedDisplayPage = useMemo(() => {
-    if (!nativeDoubleBondSidePreview) {
-      return activePage;
-    }
-
-    return {
-      ...activePage,
-      objects: activePage.objects.map((object) => {
-        if (object.type !== "molecule" || object.id !== nativeDoubleBondSidePreview.objectId) {
-          return object;
-        }
-
-        return {
-          ...object,
-          bonds: object.bonds.map((bond) => (
-            bond.id === nativeDoubleBondSidePreview.bondId && bond.order === "double"
-              ? { ...bond, display: { ...(bond.display ?? {}), doubleBondSide: nativeDoubleBondSidePreview.side } }
-              : bond
-          ))
-        };
-      })
-    };
-  }, [activePage, nativeDoubleBondSidePreview]);
+  // Drafts stay on the original atom in history. Render the same pure plan the close uses,
+  // so an eligible label previews its attachment without adding atoms on each keystroke.
+  const atomLabelPreview = useMemo(() => {
+    if (!activeAtomLabelEdit || !activeAtomLabelEdit.draft.trim() || atomLabelEditKeepsStartingText(activeAtomLabelEdit)) return undefined;
+    return commitNativeAtomLabelTarget(document, {
+      objectId: activeAtomLabelEdit.objectId, atomId: activeAtomLabelEdit.atomId, kind: "atom", distanceToPointer: 0
+    }, activeAtomLabelEdit.draft, {
+      literal: true, beforeAtom: activeAtomLabelEdit.beforeAtom, beforeMolecule: activeAtomLabelEdit.beforeMolecule
+    });
+  }, [document, activeAtomLabelEdit]);
+  const labelDisplayPage = useMemo(() => planDisplayPage(activePage, atomLabelPreview), [activePage, atomLabelPreview]);
+  // The double-bond hover plan changes SVG geometry only, as before label previews.
+  // Object views keep real bond metadata for selection chrome and interaction.
+  const plannedDisplayPage = useMemo(() => planDisplayPage(labelDisplayPage, undefined, nativeDoubleBondSidePreview),
+    [labelDisplayPage, nativeDoubleBondSidePreview]);
   const editorSvgDisplayPage = useMemo(() => {
     const svgObjects = plannedDisplayPage.objects.filter((object) => editorPageSvgSurfaceIncludesObject(object));
     if (svgObjects.length === plannedDisplayPage.objects.length) {
@@ -2790,12 +2831,23 @@ export function MainWindow({
       return false;
     }
 
-    installDocumentHistory({
-      ...currentHistory,
-      present: normalizeCommittedDocument(nextDocument)
-    });
+    const present = normalizeCommittedDocument(nextDocument);
+    const undoLabel = documentUndoLabelsRef.current.get(currentHistory.present);
+    if (undoLabel) documentUndoLabelsRef.current.set(present, undoLabel);
+    installDocumentHistory({ ...currentHistory, present });
     return true;
   }, [installDocumentHistory]);
+  // Strip the live draft before normalization, then carry the name across both object changes.
+  const atomLabelHistorySnapshot = useCallback((current: ChemDraftDocument): ChemDraftDocument => {
+    const edit = activeAtomLabelEditRef.current;
+    const stripped = edit && edit.documentIdentity === documentIdentityRef.current &&
+      edit.historyNavigation === historyNavigationCountRef.current && documentHasAtomLabelDraft(current, edit)
+      ? restoreAtomLabelDraft(current, edit) : current;
+    const clean = normalizeCommittedDocument(stripped);
+    const label = documentUndoLabelsRef.current.get(current);
+    if (label) documentUndoLabelsRef.current.set(clean, label);
+    return clean;
+  }, []);
   const commitDocumentChange = useCallback((
     nextDocumentOrUpdate: ChemDraftDocument | ((current: ChemDraftDocument) => ChemDraftDocument),
     undoLabel?: string
@@ -2809,11 +2861,12 @@ export function MainWindow({
     }
 
     const present = normalizeCommittedDocument(nextDocument);
-    if (undoLabel) {
-      documentUndoLabelsRef.current.set(present, undoLabel);
+    const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
+    if (label) {
+      documentUndoLabelsRef.current.set(present, label);
     }
     installDocumentHistory({
-      past: boundedHistoryPast([...currentHistory.past, currentHistory.present], present),
+      past: boundedHistoryPast([...currentHistory.past, atomLabelHistorySnapshot(currentHistory.present)], present),
       present,
       future: []
     });
@@ -2823,18 +2876,21 @@ export function MainWindow({
       return nextFileState;
     });
     return true;
-  }, [installDocumentHistory]);
+  }, [atomLabelHistorySnapshot, installDocumentHistory]);
   /** Drag-session commits install their history entry directly so undo lands on the pre-drag
    *  document — `commitDocumentChange` would record the last preview frame instead. This is that
    *  shared install plus the unsaved-changes bookkeeping every document mutation owes. */
   const commitDocumentHistoryFrom = useCallback((
     startDocument: ChemDraftDocument,
-    nextDocument: ChemDraftDocument
+    nextDocument: ChemDraftDocument,
+    undoLabel?: string
   ) => {
     const currentHistory = documentHistoryRef.current;
     const present = normalizeCommittedDocument(nextDocument);
+    const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
+    if (label) documentUndoLabelsRef.current.set(present, label);
     installDocumentHistory({
-      past: boundedHistoryPast([...currentHistory.past, startDocument], present),
+      past: boundedHistoryPast([...currentHistory.past, atomLabelHistorySnapshot(startDocument)], present),
       present,
       future: []
     });
@@ -2843,7 +2899,7 @@ export function MainWindow({
       fileStateRef.current = nextFileState;
       return nextFileState;
     });
-  }, [installDocumentHistory]);
+  }, [atomLabelHistorySnapshot, installDocumentHistory]);
   const applyArtTransformQaScene = useCallback(() => {
     const changed = commitDocumentChange((current) => artTransformQaSceneDocument(current, artTransformQaDraft));
     if (changed) {
@@ -2903,13 +2959,13 @@ export function MainWindow({
     }
 
     installDocumentHistory({
-      past: boundedHistoryPast([...currentHistory.past, startDocument], currentHistory.present),
+      past: boundedHistoryPast([...currentHistory.past, atomLabelHistorySnapshot(startDocument)], currentHistory.present),
       present: currentHistory.present,
       future: []
     });
     markDocumentDirty();
     return true;
-  }, [installDocumentHistory, markDocumentDirty]);
+  }, [atomLabelHistorySnapshot, installDocumentHistory, markDocumentDirty]);
 
   useEffect(() => {
     if (!bondToolActive) {
@@ -3667,18 +3723,23 @@ export function MainWindow({
     }
 
     const currentDocument = documentRef.current;
-    const nextDocument = applyNativeAtomElementTarget(currentDocument, target, label);
+    const result = commitNativeAtomLabelTarget(currentDocument, target, label);
+    const split = result.target.kind === "atom" && result.target.atomId !== target.atomId;
+    const nextDocument = split ? selectDocumentObject(result.document, target.objectId) : result.document;
     if (nextDocument === currentDocument) {
       setStatus(`Cannot label hovered atom ${label}`);
       return;
     }
 
-    commitDocumentChange(nextDocument);
+    commitDocumentChange(nextDocument, split ? `Add ${label} substituent` : `Label atom ${label}`);
+    if (split) {
+      setSelectedNativeMoleculePart(result.target);
+    }
     setActiveTextEditObjectId(undefined);
     setActiveAtomLabelEdit(undefined);
     setHoveredNativeAtom(undefined);
     setFreeformNativeBond(undefined);
-    setStatus(`Labeled hovered atom ${label}`);
+    setStatus(result.message ?? `Labeled hovered atom ${label}`);
   }, [commitDocumentChange, selectedNativeMoleculePart]);
 
   const hoveredGrowthArrowPlan = useCallback((target: NativeMoleculeDeleteTarget): NativeBondGrowthPlan | undefined => {
@@ -5505,6 +5566,13 @@ export function MainWindow({
     const edit: AtomLabelEditState = {
       objectId: target.objectId,
       atomId: target.atomId,
+      beforeAtom: continuing?.beforeAtom ?? options.beforeAtom ?? atom,
+      beforeMolecule: continuing?.beforeMolecule ?? options.beforeMolecule ?? object,
+      draftBeforeAtom: continuing?.draftBeforeAtom ?? atom,
+      draftBeforeMolecule: continuing?.draftBeforeMolecule ?? object,
+      draftRollback: continuing?.draftRollback ?? createAtomLabelDraftRollback(object),
+      continuesHotkey: continuing?.continuesHotkey ?? options.hotkeyChanged === true,
+      hotkeyUndoDocument: continuing?.hotkeyUndoDocument ?? options.hotkeyUndoDocument,
       initialElement: continuing?.initialElement ?? atom.element,
       initialLiteral: continuing ? continuing.initialLiteral : atom.labelLiteral === true,
       ...(continuing
@@ -5537,17 +5605,23 @@ export function MainWindow({
       return;
     }
 
-    replacePresentDocument((current) =>
+    replacePresentDocument((current) => {
       // Text-typed labels are literal: they draw exactly as typed, contribute no implicit
       // hydrogens, and are valence-checked without them. A side-dependent label typed back to its
       // starting text is written as it started (applyNativeAtomLabelDraft).
-      applyNativeAtomLabelDraft(current, {
+      const next = applyNativeAtomLabelDraft(current, {
         objectId: state.objectId,
         kind: "atom",
         atomId: state.atomId,
         distanceToPointer: 0
-      }, draft, { element: state.initialElement, literal: state.initialLiteral, labelBondSide: state.initialLabelBondSide })
-    );
+      }, draft, { element: state.initialElement, literal: state.initialLiteral, labelBondSide: state.initialLabelBondSide });
+      const molecule = findDocumentObject(current, state.objectId);
+      const preview = findDocumentObject(next, state.objectId);
+      if (molecule?.type === "molecule" && preview?.type === "molecule") {
+        recordAtomLabelDraftRollback(state, molecule, preview);
+      }
+      return next;
+    });
   }, [replacePresentDocument]);
 
   const cancelAtomLabelEdit = useCallback((state: AtomLabelEditState) => {
@@ -5558,26 +5632,18 @@ export function MainWindow({
     if (!active || active.objectId !== state.objectId || active.atomId !== state.atomId) {
       return;
     }
-    replacePresentDocument((current) =>
-      applyNativeAtomElementTarget(current, {
-        objectId: state.objectId,
-        kind: "atom",
-        atomId: state.atomId,
-        distanceToPointer: 0
-      }, state.initialElement, {
-        literal: state.initialLiteral,
-        ...(state.initialLabelBondSide ? { labelBondSide: state.initialLabelBondSide } : {})
-      })
-    );
+    // One targeted rollback: label fields (including recorded side), with current positions kept.
+    replacePresentDocument((current) => restoreAtomLabelDraft(current, state));
     atomLabelEditKeepsSelectionRef.current = state;
+    cancelledAtomLabelEditRef.current = state;
     setActiveAtomLabelEdit(undefined);
     setStatus("Atom label unchanged");
   }, [replacePresentDocument]);
 
   const finishAtomLabelEdit = useCallback((state: AtomLabelEditState, reason: AtomLabelFinishReason) => {
-    // The label itself is already in the document: every keystroke wrote it. Finishing only closes
-    // the editor. A late blur (the input unmounting after Enter, or after another path closed the
-    // edit) must not touch a selection that no longer belongs to this edit.
+    // Keystrokes only write a draft; the close applies the decision once. A late blur (the input
+    // unmounting after Enter, or after another path closed the edit) must not touch a selection
+    // that no longer belongs to this edit.
     const active = activeAtomLabelEditRef.current;
     if (!active || active.objectId !== state.objectId || active.atomId !== state.atomId) {
       return;
@@ -5589,6 +5655,30 @@ export function MainWindow({
     // see the atom-label close effect.
     setActiveAtomLabelEdit(undefined);
   }, []);
+
+  const finalizeAtomLabelDraft = useCallback((state: AtomLabelEditState) => {
+    // History navigation and document replacement own the state they installed.
+    if (state.documentIdentity !== documentIdentityRef.current ||
+      state.historyNavigation !== historyNavigationCountRef.current ||
+      (!atomLabelEditKeepsStartingText(state) && !documentHasAtomLabelDraft(documentRef.current, state))) return undefined;
+    const result = finishedAtomLabelDraft(documentRef.current, state);
+    const changed = !atomLabelEditKeepsStartingText(state) && result.document !== result.baseline;
+    const currentLabel = documentUndoLabelsRef.current.get(documentRef.current);
+    if (currentLabel) documentUndoLabelsRef.current.set(result.baseline, currentLabel);
+    // Coalesce only with the first key's own entry; a later external commit stays separate.
+    if (changed && state.continuesHotkey && documentHistoryRef.current.past.at(-1) === state.hotkeyUndoDocument) {
+      replacePresentDocument(result.document);
+      documentUndoLabelsRef.current.set(documentRef.current, atomLabelUndoLabel(result.baseline, result.target, state.draft));
+    } else if (changed) {
+      commitDocumentHistoryFrom(result.baseline, result.document, atomLabelUndoLabel(result.baseline, result.target, state.draft));
+    } else {
+      replacePresentDocument(result.document);
+    }
+    if (changed && "message" in result && result.message) setStatus(result.message);
+    else if (changed) setStatus(`Labeled atom ${normalizeNativeAtomElementLabel(state.draft)}`);
+    else setStatus("");
+    return result;
+  }, [commitDocumentHistoryFrom, replacePresentDocument]);
 
   /**
    * Put the selection back the way it was before `state`'s edit selected its atom. The atom was
@@ -5795,6 +5885,14 @@ export function MainWindow({
   }, []);
 
   const applyTextDocumentAtPoint = useCallback((point: ClientPoint) => {
+    // Finish the label and its history entry before the text placement takes its baseline.
+    const edit = activeAtomLabelEditRef.current;
+    if (edit) {
+      finalizeAtomLabelDraft(edit);
+      finalizedAtomLabelEditRef.current = edit;
+      activeAtomLabelEditRef.current = undefined;
+      setActiveAtomLabelEdit(undefined);
+    }
     const currentDocument = documentRef.current;
     const nextDocument = insertNativeTextObject(currentDocument, point, "Text", textStyleDefaults);
     const inserted = getSelectedTextObject(nextDocument);
@@ -5814,7 +5912,7 @@ export function MainWindow({
       focusTextObjectEditor(inserted.id);
     }
     setStatus("Inserted text - type to replace placeholder");
-  }, [assignHoveredNativeDeleteTarget, commitDocumentChange, focusTextObjectEditor, restoreToolAfterTextPlacement, textStyleDefaults]);
+  }, [assignHoveredNativeDeleteTarget, commitDocumentChange, finalizeAtomLabelDraft, focusTextObjectEditor, restoreToolAfterTextPlacement, textStyleDefaults]);
 
   /** Drop the interaction chrome a stamp invalidates. Every sibling placement path does this; a
    *  bond part-selection left lit here would keep receiving style commands aimed at the stamp.
@@ -6226,7 +6324,15 @@ export function MainWindow({
     const labelResult = convertNativeTextObjectToAtomLabel(currentDocument, objectId);
     if (labelResult.target) {
       if (labelResult.document !== currentDocument) {
-        commitDocumentChange(labelResult.document, "Convert Text to Atom Label");
+        commitDocumentChange(
+          labelResult.document,
+          atomLabelUndoLabel(
+            currentDocument,
+            labelResult.target,
+            nativeTextObjectLabel(currentDocument, objectId),
+            "Convert Text to Atom Label"
+          )
+        );
         setSelectedNativeMoleculePart(labelResult.target);
       }
       if (labelResult.message) setStatus(labelResult.message);
@@ -7516,7 +7622,7 @@ export function MainWindow({
       return;
     }
 
-    const currentHistory = documentHistoryRef.current;
+    const currentHistory = { ...documentHistoryRef.current, present: atomLabelHistorySnapshot(documentHistoryRef.current.present) };
     const nextHistory = direction === "undo"
       ? undoDocumentHistory(currentHistory)
       : redoDocumentHistory(currentHistory);
@@ -7557,7 +7663,7 @@ export function MainWindow({
           ? "Undid last document change"
           : "Redid document change"
     );
-  }, [assignHoveredNativeDeleteTarget, cancelSpin3dSession, installDocumentHistory]);
+  }, [assignHoveredNativeDeleteTarget, atomLabelHistorySnapshot, cancelSpin3dSession, installDocumentHistory]);
 
   const clearDocumentInteractionState = useCallback((options: { clearSpin3dModelCache?: boolean } = {}) => {
     cancelSpin3dSession(undefined, { clearModelCache: options.clearSpin3dModelCache });
@@ -7830,12 +7936,8 @@ export function MainWindow({
     ) {
       return current;
     }
-    return normalizeCommittedDocument(finishNativeAtomLabelEdit(current, {
-      objectId: edit.objectId,
-      kind: "atom",
-      atomId: edit.atomId,
-      distanceToPointer: 0
-    }, { element: edit.initialElement, literal: edit.initialLiteral, labelBondSide: edit.initialLabelBondSide }));
+    if (!atomLabelEditKeepsStartingText(edit) && !documentHasAtomLabelDraft(current, edit)) return current;
+    return normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document);
   }, []);
 
   // Write the working document + file association to the session file now. Reads refs only, so it
@@ -8278,7 +8380,15 @@ export function MainWindow({
             setStatus(result.disabledReason);
             return;
           }
-          commitDocumentChange(result.document, "Convert Text to Atom Label");
+          commitDocumentChange(
+            result.document,
+            atomLabelUndoLabel(
+              documentRef.current,
+              result.target,
+              selectedNativeTextObjectLabel(documentRef.current),
+              "Convert Text to Atom Label"
+            )
+          );
           setActiveTextEditObjectId(undefined);
           setSelectedNativeMoleculePart(result.target);
           if (result.message) setStatus(result.message);
@@ -9763,27 +9873,30 @@ export function MainWindow({
   useLayoutEffect(() => {
     const previous = previousAtomLabelEditRef.current;
     previousAtomLabelEditRef.current = activeAtomLabelEdit;
-    if (!previous || (activeAtomLabelEdit?.objectId === previous.objectId && activeAtomLabelEdit.atomId === previous.atomId)) {
-      return;
-    }
-    // Every way a session closes passes here — Enter, Escape, a blur or click away, a tool picked in
-    // the palette or by key, a move straight to another atom's edit. One that ended on its starting
-    // text did not rewrite the label, so it keeps the bond side it was written with
-    // (finishNativeAtomLabelEdit); re-read from a turned-round drawing, the chemistry would change.
-    // A close by undo or redo, or by opening another document, leaves that state exactly as it is.
-    if (
-      previous.documentIdentity === documentIdentityRef.current &&
-      previous.historyNavigation === historyNavigationCountRef.current
-    ) {
-      replacePresentDocument((current) => finishNativeAtomLabelEdit(current, {
-        objectId: previous.objectId,
-        kind: "atom",
-        atomId: previous.atomId,
-        distanceToPointer: 0
-      }, { element: previous.initialElement, literal: previous.initialLiteral, labelBondSide: previous.initialLabelBondSide }));
-    }
+    if (!previous || (activeAtomLabelEdit?.objectId === previous.objectId && activeAtomLabelEdit.atomId === previous.atomId)) return;
+    const cancelled = cancelledAtomLabelEditRef.current;
+    cancelledAtomLabelEditRef.current = undefined;
+    const finalized = finalizedAtomLabelEditRef.current;
+    finalizedAtomLabelEditRef.current = undefined;
+    const kept = atomLabelEditKeepsSelectionRef.current;
+    atomLabelEditKeepsSelectionRef.current = undefined;
+    const result = !cancelled && !finalized ? finalizeAtomLabelDraft(previous) : undefined;
+    if (result && kept && result.target.kind === "atom") setSelectedNativeMoleculePart(result.target);
     if (activeAtomLabelEdit) {
-      // Moved straight to another atom's edit: that edit owns the selection now.
+      if (result) {
+        // The next editor was opened before the previous close ran. Its rollback baseline must
+        // include the completed attachment, without adopting another atom's live draft.
+        const beforeDocument = documentRef.current;
+        setActiveAtomLabelEdit(current => {
+          if (!current) return current;
+          const beforeMolecule = findDocumentObject(beforeDocument, current.objectId);
+          const beforeAtom = beforeMolecule?.type === "molecule" ? beforeMolecule.atoms.find(a => a.id === current.atomId) : undefined;
+          return beforeAtom && beforeMolecule?.type === "molecule"
+            ? { ...current, beforeAtom, beforeMolecule, draftBeforeAtom: beforeAtom, draftBeforeMolecule: beforeMolecule,
+              draftRollback: createAtomLabelDraftRollback(beforeMolecule) } : current;
+        });
+      }
+      // A direct move to another atom's edit leaves selection owned by that edit.
       return;
     }
     // A label typed with the pointer off its atom is done: hover what the pointer is on again.
@@ -9791,13 +9904,9 @@ export function MainWindow({
       hoverRetargetedForLabelRef.current = false;
       rederiveNativeCanvasHoverRef.current?.(documentRef.current);
     }
-    const kept = atomLabelEditKeepsSelectionRef.current;
-    atomLabelEditKeepsSelectionRef.current = undefined;
-    if (kept && kept.objectId === previous.objectId && kept.atomId === previous.atomId) {
-      return;
-    }
+    if (kept && kept.objectId === previous.objectId && kept.atomId === previous.atomId) return;
     restoreSelectionAfterAtomLabelEdit(previous);
-  }, [activeAtomLabelEdit, replacePresentDocument, restoreSelectionAfterAtomLabelEdit]);
+  }, [activeAtomLabelEdit, finalizeAtomLabelDraft, restoreSelectionAfterAtomLabelEdit]);
 
   useEffect(() => {
     const objectIds = [...document.selection.objectIds];
@@ -10582,7 +10691,10 @@ export function MainWindow({
           const object = findDocumentObject(documentRef.current, assignment.objectId);
           const atom = object?.type === "molecule" ? object.atoms.find((candidate) => candidate.id === assignment.atomId) : undefined;
           const draft = `${assignment.label}${event.key}`;
-          if (atom?.element === assignment.label && startAtomLabelEdit(hoveredTarget, { draft })) {
+          if (atom?.element === assignment.label && startAtomLabelEdit(hoveredTarget, {
+            draft, beforeAtom: assignment.beforeAtom, beforeMolecule: assignment.beforeMolecule,
+            hotkeyChanged: assignment.hotkeyChanged, hotkeyUndoDocument: assignment.hotkeyUndoDocument
+          })) {
             event.preventDefault();
             updateAtomLabelDraft(activeAtomLabelEditRef.current!, draft);
             return;
@@ -10597,6 +10709,10 @@ export function MainWindow({
         );
         if (hoveredTargetCommandId) {
           event.preventDefault();
+          const beforeObject = hoveredTarget ? findDocumentObject(documentRef.current, hoveredTarget.objectId) : undefined;
+          const beforeAtom = beforeObject?.type === "molecule" && hoveredTarget?.kind === "atom"
+            ? beforeObject.atoms.find(a => a.id === hoveredTarget.atomId) : undefined;
+          const beforeHotkeyDocument = documentRef.current;
           invokeCommandRef.current(hoveredTargetCommandId);
           // Only a label assignment made by a hover key starts continuation. Other keys and
           // selected-atom assignments retain their existing shortcut behavior.
@@ -10607,8 +10723,11 @@ export function MainWindow({
           ) {
             const object = findDocumentObject(documentRef.current, hoveredTarget.objectId);
             const atom = object?.type === "molecule" ? object.atoms.find((candidate) => candidate.id === hoveredTarget.atomId) : undefined;
-            if (atom?.element === assignedElement) {
-              hoverLabelAssignmentRef.current = { objectId: hoveredTarget.objectId, atomId: atom.id, label: atom.element };
+            if (atom?.element === assignedElement && beforeAtom && beforeObject?.type === "molecule") {
+              const hotkeyChanged = documentRef.current !== beforeHotkeyDocument;
+              hoverLabelAssignmentRef.current = { objectId: hoveredTarget.objectId, atomId: atom.id, label: atom.element,
+                beforeAtom, beforeMolecule: beforeObject, hotkeyChanged,
+                hotkeyUndoDocument: hotkeyChanged ? documentHistoryRef.current.past.at(-1) : undefined };
             }
           }
           return;
@@ -10627,7 +10746,10 @@ export function MainWindow({
       }
 
       event.preventDefault();
-      invokeCommandRef.current(commandId);
+      // This key already passed the event-target text-field guard. A delayed inline-editor
+      // focus retry can make activeElement disagree with that target; preserve the canvas
+      // routing decision rather than reclassifying Undo/Redo as text history in invoke.
+      invokeCommandRef.current(editHistoryDirection(commandId) ? forceDocumentHistoryCommandId(commandId) : commandId);
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -17979,7 +18101,7 @@ export function MainWindow({
                   }
                   return (
                   <>
-                {document.pages[0].objects.map((object, layerIndex) => {
+                {labelDisplayPage.objects.map((object, layerIndex) => {
                   // An Eraser sweep shows its own preview; leftover selection chrome (a whole chain
                   // highlighted by the chain tool) would read as "all of this will be erased".
                   const selectionChromeActive = activeToolState.activeKind === "selection" && eraserSweepPreview === undefined;
@@ -18037,7 +18159,10 @@ export function MainWindow({
                       selectedPart={selectedPart}
                       transformHandlesEnabled={selectionChromeActive}
                       editingText={activeTextEditObjectId === object.id}
-                      editingAtomLabel={activeAtomLabelEdit?.objectId === object.id ? activeAtomLabelEdit : undefined}
+                      editingAtomLabel={activeAtomLabelEdit?.objectId === object.id ? {
+                        ...activeAtomLabelEdit,
+                        previewAtomId: atomLabelPreview?.target.kind === "atom" ? atomLabelPreview.target.atomId : undefined
+                      } : undefined}
                       growthPreview={hoveredNativeAtom?.objectId === object.id ? hoveredNativeAtom : undefined}
                       deleteTarget={hoveredNativeDeleteTarget?.objectId === object.id ? hoveredNativeDeleteTarget : undefined}
                       hoverDestructive={activeToolState.activeCommandId === "tool.eraser"}
@@ -20601,7 +20726,11 @@ export function hoveredNativeTargetShortcutCommand(
  * A label typed by hovering an atom and pressing an element key, open for continuation. `leftAtom`
  * records that the pointer has since left the atom and its own bonds.
  */
-type HoverLabelAssignment = { objectId: string; atomId: string; label: string; leftAtom?: boolean };
+type HoverLabelAssignment = {
+  objectId: string; atomId: string; label: string; leftAtom?: boolean;
+  beforeAtom: MoleculeAtom; beforeMolecule: MoleculeObject;
+  hotkeyChanged: boolean; hotkeyUndoDocument?: ChemDraftDocument;
+};
 
 /**
  * Whether moving the hover to `target` keeps a hover-label continuation alive: still on the atom
@@ -21393,7 +21522,8 @@ function SpinOverlay({
               const neighbour = projectedByIndex.get(index);
               return neighbour ? [{ x: neighbour.sx, y: neighbour.sy }] : [];
             }),
-            labelStyle
+            labelStyle,
+            recordedLabelBondSide(groupAtom, heavyNeighbourIndices[atom.index]?.map((index) => state.atoms[index]?.id).filter((id): id is string => id !== undefined) ?? [])
           )
         : undefined;
       const label = placement?.label ?? drawnLabel;
@@ -24184,7 +24314,6 @@ function reactSvgAttributeName(name: string): string {
     "color-interpolation-filters": "colorInterpolationFilters",
     "dominant-baseline": "dominantBaseline",
     "fill-opacity": "fillOpacity",
-    "fill-rule": "fillRule",
     "flood-color": "floodColor",
     "flood-opacity": "floodOpacity",
     "font-family": "fontFamily",
@@ -24837,8 +24966,8 @@ function DocumentObjectViewContent({
               >
                 {(editingAtomLabel
                   ? nativeMoleculeSvgFragments
-                      .filter((fragment) => fragment.key !== `label-${object.id}-${editingAtomLabel.atomId}`)
-                      .map((fragment) => stripPageSvgFragmentByKey(fragment, `label-${object.id}-${editingAtomLabel.atomId}`))
+                      .filter((fragment) => fragment.key !== `label-${object.id}-${editingAtomLabel.previewAtomId ?? editingAtomLabel.atomId}`)
+                      .map((fragment) => stripPageSvgFragmentByKey(fragment, `label-${object.id}-${editingAtomLabel.previewAtomId ?? editingAtomLabel.atomId}`))
                   : nativeMoleculeSvgFragments
                 ).map((fragment) => renderStaticPageSvgFragment(fragment))}
               </g>
@@ -24998,7 +25127,7 @@ function DocumentObjectViewContent({
             </div>
           ) : null}
           {editingAtomLabel ? object.atoms
-            .filter((atom) => atom.id === editingAtomLabel.atomId)
+            .filter((atom) => atom.id === (editingAtomLabel.previewAtomId ?? editingAtomLabel.atomId))
             .map((atom) => {
               const editorLabel = editingAtomLabel.draft.trim() || atom.element || "C";
               const labelStyle = atomLabelPlanByAtomId.get(atom.id)?.drawingStyle ?? drawingStyle;
@@ -25013,8 +25142,8 @@ function DocumentObjectViewContent({
                   className="native-atom-label-editor"
                   data-atom-label-editor="true"
                   data-atom-label-draft-empty={editingAtomLabel.draft.length === 0 ? "true" : undefined}
-                  data-atom-id={atom.id}
-                  key={`atom-label-editor-${atom.id}`}
+                  data-atom-id={editingAtomLabel.atomId}
+                  key={`atom-label-editor-${editingAtomLabel.atomId}`}
                   spellCheck={false}
                   style={{
                     left: `calc(${atom.x + anchorOffset.x - object.x}px * var(--page-scale))`,
@@ -29131,6 +29260,32 @@ function findDocumentObject(document: ChemDraftDocument, objectId: string): Docu
   }
 
   return undefined;
+}
+
+function atomLabelUndoLabel(
+  sourceDocument: ChemDraftDocument,
+  resultTarget: NativeMoleculeDeleteTarget | undefined,
+  label: string,
+  relabelUndoLabel = "Edit Atom Label"
+): string {
+  const sourceObject = resultTarget?.kind === "atom"
+    ? findDocumentObject(sourceDocument, resultTarget.objectId)
+    : undefined;
+  const attachedSubstituent = sourceObject?.type === "molecule" && resultTarget?.kind === "atom" &&
+    !sourceObject.atoms.some((atom) => atom.id === resultTarget.atomId);
+  return attachedSubstituent
+    ? `Add ${normalizeNativeAtomElementLabel(label)} substituent`
+    : relabelUndoLabel;
+}
+
+function nativeTextObjectLabel(document: ChemDraftDocument, objectId: string): string {
+  const object = findDocumentObject(document, objectId);
+  return object?.type === "text" ? object.text : "";
+}
+
+function selectedNativeTextObjectLabel(document: ChemDraftDocument): string {
+  const objectId = document.selection.objectIds[0];
+  return objectId ? nativeTextObjectLabel(document, objectId) : "";
 }
 
 function agentObjectSummary(object: DocumentObject): AgentSnapshot["objects"][number] {

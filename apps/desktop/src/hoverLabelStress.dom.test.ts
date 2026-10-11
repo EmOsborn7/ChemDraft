@@ -2,7 +2,8 @@
 
 // Stress: typing "OMe" with the pointer resting on a bond of a long zigzag chain, where bond hit
 // zones crowd the atoms. Every trial starts over a bond and must label one of its atoms while
-// leaving the active tool and the chain's structure alone.
+// leaving the active tool and the existing chain intact. On an internal carbon, #94 attaches
+// the one-bond label as a substituent; at a terminal carbon it replaces the atom label.
 // HOVER_STRESS_TRIALS raises the trial count for a local run (default 24).
 
 import { act, createElement } from "react";
@@ -76,6 +77,26 @@ describe("hover label typing over a long chain (stress)", () => {
     return object;
   };
 
+  function expectedAttachmentCount(before: MoleculeObject, atomId: string) {
+    return before.bonds.filter(bond => bond.fromAtomId === atomId || bond.toAtomId === atomId).length > 1 ? 1 : 0;
+  }
+
+  function expectOMeResult(before: MoleculeObject, atomId: string) {
+    const after = molecule();
+    if (expectedAttachmentCount(before, atomId)) {
+      expect(after.atoms.slice(0, before.atoms.length)).toEqual(before.atoms);
+      const substituent = after.atoms[before.atoms.length]!;
+      expect(substituent).toMatchObject({ element: "OMe", labelLiteral: true });
+      const attachment = after.bonds[before.bonds.length]!;
+      expect(attachment.order).toBe("single");
+      expect([attachment.fromAtomId, attachment.toAtomId].sort()).toEqual([atomId, substituent.id].sort());
+    } else {
+      expect(after.atoms.find(atom => atom.id === atomId)).toMatchObject({ element: "OMe", labelLiteral: true });
+      expect(after.atoms.filter(atom => atom.id !== atomId)).toEqual(before.atoms.filter(atom => atom.id !== atomId));
+    }
+    expect(after.bonds.slice(0, before.bonds.length)).toEqual(before.bonds);
+  }
+
   async function press(key: string, target: EventTarget = document.activeElement ?? document.body) {
     const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
     await act(async () => { target.dispatchEvent(event); });
@@ -120,18 +141,18 @@ describe("hover label typing over a long chain (stress)", () => {
       else if (hovered?.kind === "atom") tally.overAtom += 1;
       else tally.overNothing += 1;
 
-      for (const key of ["O", "M", "e"]) {
-        await press(key);
-      }
+      await press("O");
+      const labelledId = molecule().atoms.find(atom => atom.element === "O")!.id;
+      expect([from.id, to.id]).toContain(labelledId);
+      for (const key of ["M", "e"]) await press(key);
       await press("Enter");
       const after = molecule();
-      // Exactly one atom changed, it now reads "OMe", and it is an end of the bond the pointer was on.
-      const changed = after.atoms.filter((atom) => start.atoms.find((old) => old.id === atom.id)?.element !== atom.element);
-      if (changed.length === 1 && changed[0]!.element === "OMe" && (changed[0]!.id === from.id || changed[0]!.id === to.id)) {
-        tally.labelled += 1;
-      }
+      // OMe belongs to the nearer end: a terminal relabel or an internal substituent.
+      expectOMeResult(start, labelledId);
+      tally.labelled += 1;
       if (snapshot().activeToolCommandId !== "tool.bond") tally.toolSwitched += 1;
-      if (after.atoms.length !== start.atoms.length || after.bonds.length !== start.bonds.length) tally.structureChanged += 1;
+      const added = expectedAttachmentCount(start, labelledId);
+      if (after.atoms.length !== start.atoms.length + added || after.bonds.length !== start.bonds.length + added) tally.structureChanged += 1;
       if (snapshot().activeToolCommandId !== "tool.bond") {
         await act(async () => { await window.__CHEMDRAFT_AGENT__!.command("tool.bond"); });
       }
@@ -201,10 +222,11 @@ describe("hover label typing over a long chain (stress)", () => {
       for (const key of ["M", "e"]) await press(key);
       await press("Enter");
       const after = molecule();
-      const changed = after.atoms.filter((candidate) => start.atoms.find((old) => old.id === candidate.id)?.element !== candidate.element);
-      if (changed.length === 1 && changed[0]!.id === atom.id && changed[0]!.element === "OMe") row.labelled += 1;
+      expectOMeResult(start, atom.id);
+      row.labelled += 1;
       if (snapshot().activeToolCommandId !== "tool.bond") row.toolSwitched += 1;
-      if (after.atoms.length !== start.atoms.length || after.bonds.length !== start.bonds.length) row.structureChanged += 1;
+      const added = expectedAttachmentCount(start, atom.id);
+      if (after.atoms.length !== start.atoms.length + added || after.bonds.length !== start.bonds.length + added) row.structureChanged += 1;
       await resetTrial();
     }
 
@@ -257,10 +279,11 @@ describe("hover label typing over a long chain (stress)", () => {
       if (wandered) tally.wanderedOffLabelledAtom += 1;
       await press("Enter");
       const after = molecule();
-      const changed = after.atoms.filter((atom) => start.atoms.find((old) => old.id === atom.id)?.element !== atom.element);
-      if (changed.length === 1 && changed[0]!.id === labelled[0]!.id && changed[0]!.element === "OMe") tally.labelled += 1;
+      expectOMeResult(start, labelled[0]!.id);
+      tally.labelled += 1;
       if (snapshot().activeToolCommandId !== "tool.bond") tally.toolSwitched += 1;
-      if (after.atoms.length !== start.atoms.length || after.bonds.length !== start.bonds.length) tally.structureChanged += 1;
+      const added = expectedAttachmentCount(start, labelled[0]!.id);
+      if (after.atoms.length !== start.atoms.length + added || after.bonds.length !== start.bonds.length + added) tally.structureChanged += 1;
       await resetTrial();
     }
 

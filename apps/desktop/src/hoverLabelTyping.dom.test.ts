@@ -106,11 +106,28 @@ describe("hover label typing", () => {
     }
   }
 
-  function expectIntact() {
+  function expectIntact(attachments = 0) {
     expect(snapshot().activeToolCommandId).toBe("tool.bond");
     expect(snapshot().document.pages[0].objects).toHaveLength(1);
-    expect(molecule().atoms).toHaveLength(6);
-    expect(molecule().bonds).toHaveLength(6);
+    expect(molecule().atoms).toHaveLength(6 + attachments);
+    expect(molecule().bonds).toHaveLength(6 + attachments);
+  }
+
+  function expectSubstituent(label: string, atomId = molecule().atoms[0]!.id) {
+    const current = molecule();
+    expect(current.atoms.find(atom => atom.id === atomId)).toMatchObject({ element: "C" });
+    const substituent = current.atoms[6]!;
+    expect(substituent).toMatchObject({ element: label, labelLiteral: true });
+    const attachment = current.bonds.filter(bond => bond.fromAtomId === substituent.id || bond.toAtomId === substituent.id);
+    expect(attachment).toHaveLength(1);
+    expect([attachment[0]!.fromAtomId, attachment[0]!.toAtomId]).toContain(atomId);
+    expect(attachment[0]!.order).toBe("single");
+    expectIntact(1);
+    return substituent;
+  }
+
+  function expectOMeSubstituent(atomId = molecule().atoms[0]!.id) {
+    return expectSubstituent("OMe", atomId);
   }
 
   it.each(["OMe", "OEt", "CF3", "NO2", "OBn", "CH3"])("types %s through the existing label editor without erasing", async (label) => {
@@ -129,11 +146,13 @@ describe("hover label typing", () => {
     }
     await press("Enter");
     expect(editor()).toBeNull();
-    expect(molecule().atoms[0]).toMatchObject({ element: label, labelLiteral: true });
-    expect(molecule().bonds).toEqual(before.bonds);
-    expect(molecule().atoms.map(({ id, x, y, formalCharge }) => ({ id, x, y, formalCharge })))
-      .toEqual(before.atoms.map(({ id, x, y, formalCharge }) => ({ id, x, y, formalCharge })));
-    expectIntact();
+    // All six labels take one bond: on this ring they attach rather than replace its carbon.
+    expect(molecule().atoms.slice(0, 6)).toEqual(before.atoms);
+    expect(molecule().atoms[6]).toMatchObject({ element: label, labelLiteral: true });
+    expect(molecule().bonds.slice(0, 6)).toEqual(before.bonds);
+    expect(molecule().atoms).toHaveLength(7);
+    expect(molecule().bonds).toHaveLength(7);
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(`Attached ${label} as a substituent`);
   });
 
   it("assigns N to atom A then O to atom B instantly", async () => {
@@ -206,10 +225,9 @@ describe("hover label typing", () => {
     await press("e");
     expectIntact();
     await press("Enter");
-    expect(molecule().atoms.find((atom) => atom.id === near.id)).toMatchObject({ element: "OMe", labelLiteral: true });
+    expectOMeSubstituent(near.id);
     expect(molecule().atoms.find((atom) => atom.id === far.id)!.element).toBe("C");
     expect(molecule().bonds.find((candidate) => candidate.id === bond.id)!.order).toBe(bond.order);
-    expectIntact();
   });
 
   it("labels the end of the bond nearer the pointer", async () => {
@@ -228,9 +246,8 @@ describe("hover label typing", () => {
     expect(editor()?.value).toBe("OM");
     await press("e");
     await press("Enter");
-    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
+    expectOMeSubstituent();
     expect(molecule().bonds.find((candidate) => candidate.id === bond.id)!.order).toBe(bond.order);
-    expectIntact();
   });
 
   it("keeps a digit in the label, not the bond order, when drifting onto the atom's own bond", async () => {
@@ -260,9 +277,8 @@ describe("hover label typing", () => {
     expect(editor()?.value).toBe("OM");
     await press("e");
     await press("Enter");
-    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
+    expectOMeSubstituent();
     expect(molecule().atoms[1]!.element).toBe("C");
-    expectIntact();
     // The label is done: the hover is back on the atom under the pointer.
     expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "atom", atomId: molecule().atoms[1]!.id });
   });
@@ -275,14 +291,14 @@ describe("hover label typing", () => {
     await press("M");
     await press("e");
     await press("Enter");
-    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
-    expectIntact();
+    expectOMeSubstituent();
   });
 
   // A drift straight after the first instant letter, then a capital element letter: the continuing
   // key was re-judged against the labelled atom it had just moved the hover back to, read as a new
   // label there, and CF3 silently became F3.
   it("keeps CF3 when the pointer drifts onto empty page right after the first letter", async () => {
+    const before = molecule();
     await hover(0);
     await press("C");
     await hoverPoint({ x: 40, y: 40 });
@@ -292,8 +308,12 @@ describe("hover label typing", () => {
     await press("3");
     expect(editor()?.value).toBe("CF3");
     await press("Enter");
-    expect(molecule().atoms[0]).toMatchObject({ element: "CF3", labelLiteral: true });
-    expectIntact();
+    expect(molecule().atoms[0]!.element).toBe("C");
+    expectSubstituent("CF3");
+    expect(molecule().atoms).toHaveLength(7);
+    expect(molecule().bonds.slice(0, 6)).toEqual(before.bonds);
+    expectIntact(1);
+    expect(molecule().atoms.some(atom => atom.element === "F3" || atom.element === "F")).toBe(false);
   });
 
   it("starts a new label on the neighbouring atom for a capital element letter typed right after the first letter", async () => {
@@ -320,9 +340,8 @@ describe("hover label typing", () => {
     expect(editor()?.value).toBe("OM");
     await press("e");
     await press("Enter");
-    expect(molecule().atoms[0]).toMatchObject({ element: "OMe", labelLiteral: true });
+    expectOMeSubstituent();
     expect(molecule().bonds.find((candidate) => candidate.id === bond.id)!.order).toBe(bond.order);
-    expectIntact();
   });
 
   it("keeps a digit in the label after a drift onto a neighbour, rather than acting on the neighbour", async () => {
@@ -454,12 +473,13 @@ describe("hover label typing", () => {
     await press("M");
     await press("e");
     await press("Enter");
-    expect(molecule().atoms.find((atom) => atom.id === near.id)).toMatchObject({ element: "OMe" });
+    const substituent = expectOMeSubstituent(near.id);
     expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: bond.id });
-    // Delete over the bond removes the bond. Were the hover still on the atom, it would strip "OMe".
+    // Delete removes the ring bond under the pointer and leaves the OMe attachment intact.
     await press("Delete");
     expect(molecule().bonds.some((candidate) => candidate.id === bond.id)).toBe(false);
-    expect(molecule().atoms.find((atom) => atom.id === near.id)).toMatchObject({ element: "OMe" });
+    expect(molecule().atoms.find((atom) => atom.id === near.id)).toMatchObject({ element: "C" });
+    expect(molecule().atoms.find((atom) => atom.id === substituent.id)).toEqual(substituent);
   });
 
   it("hovers the bond again when the next key does not continue the label, so Delete acts on the bond", async () => {

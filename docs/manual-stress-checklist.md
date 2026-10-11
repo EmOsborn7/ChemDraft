@@ -135,6 +135,9 @@ held keys cleared on window blur, no focus stealing, hints hidden during inline 
 and macOS glyphs versus Windows key names (check all of these on both platforms); and sketch-style
 hashed, dashed, and wedge bonds showing no line through the hashes.
 
+On macOS and Windows, type OMe on all six atoms of benzene/cyclohexane, exercise nickname hotkeys and text conversion, then Enter/Tab/click-away/tool-change/Escape and Undo/Redo: check restored ring carbons, preview/commit placement, new-atom selection, valence guards, and specific status messages.
+Save with an OMe draft open (the saved file has the attachment; the editor stays open), retype a ring SCN to its starting text (no split or Undo entry), place Text during an open OMe edit (Undo removes text, then the attachment), and Escape after another atom was recoloured (the recolour remains).
+
 Cold launch on Windows: launch and quit ChemDraft ten times in a row, with its palettes open (on a busy
 machine as well as an idle one); no "ChemDraft ran into an error" dialog appears at launch, and tool
 shortcuts, palette commands, popovers and tooltips all respond afterwards.

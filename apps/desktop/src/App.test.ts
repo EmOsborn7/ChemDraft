@@ -2566,8 +2566,8 @@ describe("ChemDraft desktop shell", () => {
     // command or merge cannot leave a cyano label unrecorded for a later rotation to re-read. Its
     // behaviour is tested in abbreviationChemistry.test.ts; this guards the wiring. The sixth call
     // is the flush (documentForFlush), which writes the document as an open label edit's close
-    // would leave it.
-    expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(6);
+    // would leave it. History snapshots now strip live drafts before a seventh normalization.
+    expect(mainWindowSource.match(/normalizeCommittedDocument\(/g)).toHaveLength(7);
     expect(mainWindowSource).not.toContain("reconcileNativeChargeMarks(");
     // A cancelled label edit, or one that ends on its starting text, puts back the record it
     // started with, not the drawing's side: at the keystroke that brings it back, at the close,
@@ -2575,7 +2575,9 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("initialLabelBondSide: atom.labelBondSide");
     expect(mainWindowSource).toContain("labelBondSide: state.initialLabelBondSide");
     expect(mainWindowSource).toContain("applyNativeAtomLabelDraft(current,");
-    expect(mainWindowSource).toContain("finishNativeAtomLabelEdit(current,");
+    expect(mainWindowSource).toContain("finishNativeAtomLabelEdit(baseline,");
+    expect(mainWindowSource).toContain("const clean = normalizeCommittedDocument(stripped);");
+    expect(mainWindowSource).toContain("normalizeCommittedDocument(finishedAtomLabelDraft(current, edit).document)");
     expect(mainWindowSource).toContain("const flushed = documentForFlush();");
     expect(mainWindowSource).toContain("createNativeSavePayload(documentForFlush())");
     expect(mainWindowSource).toContain("createDialogExportResult(documentForFlush(), dialog)");

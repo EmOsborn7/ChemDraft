@@ -16,8 +16,10 @@ import {
 } from "@chemdraft/chem-core";
 
 import {
+  atomDisplayLabelPlacement,
   atomLabelLayout,
   nativeGroupLabelDisplay,
+  planBondExtension,
   planMoleculeAtomLabels,
   planPageSvgRender
 } from "./index";
@@ -91,6 +93,49 @@ describe("a group label on a ring vertex points out of the ring", () => {
   }
   const planAt = (molecule: MoleculeObject, at: number) =>
     planMoleculeAtomLabels(molecule).find((plan) => plan.atom.id === `v${at}`)!;
+
+  it.each([[0, "OMe", "start"], [3, "MeO", "end"]] as const)(
+    "an OMe substituent grown from cyclohexane vertex %d draws %s with its O on the attachment",
+    (at, text, anchorSide) => {
+      const original = ring("flat-topped", at, "C", false);
+      const source = original.atoms[at]!;
+      const drawingStyle = nativeDrawingStyleFromObjectStyle(original.style);
+      const extension = planBondExtension({ atoms: original.atoms, bonds: original.bonds,
+        clickPoint: source, preferredAtomId: source.id, bondLength: drawingStyle.bondLengthPx,
+        hitRadius: 8, targetBondAngleDegrees: drawingStyle.chainAngleDegrees,
+        pageBounds: { x: 0, y: 0, width: 792, height: 612 } });
+      expect(extension).toBeDefined();
+      const direction = at === 0 ? 1 : -1;
+      const substituent: MoleculeAtom = { id: "OMe", element: "OMe", labelLiteral: true,
+        formalCharge: 0, ...extension!.newAtomPoint };
+      expect((substituent.x - source.x) * direction).toBeGreaterThan(0);
+      const molecule: MoleculeObject = { ...original,
+        atoms: [...original.atoms, substituent],
+        bonds: [...original.bonds, { id: "attachment", fromAtomId: source.id, toAtomId: substituent.id, order: "single" }] };
+      const plan = planMoleculeAtomLabels(molecule).find(candidate => candidate.atom.id === substituent.id)!;
+      expect(molecule.atoms.slice(0, 6)).toEqual(original.atoms);
+      expect(molecule.bonds.slice(0, 6)).toEqual(original.bonds);
+      expect(plan.atom).toBe(substituent);
+      expect(plan.label).toBe(text);
+      expect(plan.labelAnchor).toEqual({ side: anchorSide, length: 1 });
+      expect(plan.anchor).toEqual({ x: substituent.x, y: substituent.y });
+      const run = plan.layout.runs[0]!;
+      expect(run.text).toBe(text);
+      expect(run.textAnchor).toBe(anchorSide);
+      const glyph = drawingStyle.atomLabelFontSizePx * 0.62;
+      const oxygenLeft = anchorSide === "start" ? run.x : run.x - glyph;
+      expect(oxygenLeft).toBeLessThanOrEqual(0);
+      expect(oxygenLeft + glyph).toBeGreaterThanOrEqual(0);
+      const box = plan.layout.bounds;
+      expect(at === 0 ? box.x + box.width : -box.x).toBeGreaterThan(glyph * 2);
+      const line = planPageSvgRender({ ...createEmptyDocument().pages[0]!, objects: [molecule] })
+        .fragments.flatMap(elementFragments)
+        .find(fragment => String(fragment.attrs.class).includes("native-bond-line") && fragment.attrs["data-bond-id"] === "attachment")!;
+      const endX = Number(line.attrs.x2);
+      expect((substituent.x - endX) * direction).toBeGreaterThanOrEqual(glyph / 2);
+      expect((endX - source.x) * direction).toBeGreaterThan(0);
+    }
+  );
 
   // The side each vertex's bonds pull to; "tie" for the top and bottom of a vertical-sided ring.
   const sides = {
@@ -227,5 +272,43 @@ describe("label anchoring stress: OMe, CO2Me, NHBoc, Ph and TMS at four bond dir
     expect(bondEnd).toBeLessThanOrEqual(
       Math.max(centredReach, drawingStyle.atomLabelBondClearancePx, drawingStyle.bondMarginWidthPx) + 0.001
     );
+  });
+});
+
+describe("a cyano label recorded with its bond on the left, drawn with it on the right", () => {
+  it.each([
+    // [label, drawn text]: the C (or the head carrying it) meets the bond at the label's right end.
+    ["CN", "NC"],
+    ["SCN", "NCS"],
+    ["OCN", "NCO"]
+  ] as const)("%s is drawn %s, its attachment on the atom", (label, text) => {
+    expect(nativeGroupLabelDisplay(label, "right", "left")).toEqual({ text, anchor: { side: "end", length: 1 } });
+  });
+
+  it.each(["CH2CN", "NMeCN"])("%s has no unambiguous turned text, so it is not drawn as a group", label => {
+    expect(nativeGroupLabelDisplay(label, "right", "left")).toBeUndefined();
+  });
+
+  it("reads with the drawn side when no reading side is given, as before", () => {
+    expect(nativeGroupLabelDisplay("CN", "right")).toBeUndefined();
+    expect(nativeGroupLabelDisplay("CN", "left", "left")).toEqual({ text: "CN", anchor: { side: "start", length: 1 } });
+  });
+
+  const atoms = (record?: MoleculeAtom["labelBondSide"]): MoleculeAtom[] => [
+    { id: "label", element: "CN", x: 0, y: 0, formalCharge: 0, labelLiteral: true, ...(record ? { labelBondSide: record } : {}) },
+    { id: "ring", element: "C", x: 30, y: 0, formalCharge: 0 }
+  ];
+  const bonds = [{ id: "b", fromAtomId: "ring", toAtomId: "label", order: "single" as const }];
+
+  it("draws a recorded-left CN whose bond lies on its right as NC", () => {
+    const molecule = atoms({ side: "left", atomId: "ring" });
+    expect(atomDisplayLabelPlacement(molecule[0]!, bonds, undefined, molecule)).toEqual({
+      label: "NC", anchor: { side: "end", length: 1 }
+    });
+  });
+
+  it("ignores a record for another atom and reads the drawn side, as the chemistry does", () => {
+    const molecule = atoms({ side: "left", atomId: "elsewhere" });
+    expect(atomDisplayLabelPlacement(molecule[0]!, bonds, undefined, molecule)).toEqual({ label: "CN" });
   });
 });
