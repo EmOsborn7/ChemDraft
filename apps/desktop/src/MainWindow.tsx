@@ -1517,7 +1517,7 @@ const GRAPHIC_HANDLE_DRAG_THRESHOLD = 1;
 const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
-const CURRENT_BUILD_STAMP = "10.11.08.30-opus";
+const CURRENT_BUILD_STAMP = "10.11.08.45-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2251,6 +2251,13 @@ export function MainWindow({
   const artPaintTargetCueTimerRef = useRef<number | undefined>(undefined);
   const hoveredNativeDeleteTargetRef = useRef<NativeMoleculeDeleteTarget | undefined>(undefined);
   const hoverLabelAssignmentRef = useRef<{ objectId: string; atomId: string; label: string } | undefined>(undefined);
+  // The page point the canvas hover was last resolved at: picks a hovered bond's nearer atom
+  // when an element key is typed with the pointer resting on the bond.
+  const hoverPagePointRef = useRef<ClientPoint | undefined>(undefined);
+  // Set while a label key has moved the hover from a bond onto one of its atoms. Once that label is
+  // no longer in progress, the hover goes back to whatever is under the pointer (the bond), so the
+  // next Delete or digit acts on what the user is pointing at.
+  const hoverRetargetedFromBondRef = useRef(false);
   // Latest binding of the pointermove hover derivation, re-invoked by the charge hotkey after a
   // commit. The hotkey is declared far above `updateNativeCanvasHover`, so a direct reference
   // would be a use-before-initialization in the deps array (same reason `invokeCommandRef`
@@ -2695,8 +2702,7 @@ export function MainWindow({
   );
   const assignHoveredNativeDeleteTarget = useCallback((target: NativeMoleculeDeleteTarget | undefined) => {
     hoveredNativeDeleteTargetRef.current = target;
-    const assignment = hoverLabelAssignmentRef.current;
-    if (target?.kind !== "atom" || target.objectId !== assignment?.objectId || target.atomId !== assignment.atomId) {
+    if (!hoverTargetKeepsLabelContinuation(target, hoverLabelAssignmentRef.current)) {
       hoverLabelAssignmentRef.current = undefined;
     }
     setHoveredNativeDeleteTarget(target);
@@ -9759,6 +9765,11 @@ export function MainWindow({
       // Moved straight to another atom's edit: that edit owns the selection now.
       return;
     }
+    // A label typed with the pointer on a bond is done: hover what the pointer is on again.
+    if (hoverRetargetedFromBondRef.current) {
+      hoverRetargetedFromBondRef.current = false;
+      rederiveNativeCanvasHoverRef.current?.(documentRef.current);
+    }
     const kept = atomLabelEditKeepsSelectionRef.current;
     atomLabelEditKeepsSelectionRef.current = undefined;
     if (kept && kept.objectId === previous.objectId && kept.atomId === previous.atomId) {
@@ -10499,8 +10510,34 @@ export function MainWindow({
       }
 
       if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-        const hoveredTarget = hoveredNativeDeleteTargetRef.current;
         const assignment = hoverLabelAssignmentRef.current;
+        // With the pointer resting on a bond (easy on a zigzag chain, whose bond zones crowd the
+        // atoms), a label key belongs to an atom: the one being labelled if the bond is its own,
+        // otherwise the bond's end nearer the pointer. Hovering that atom first keeps every key on
+        // the atom path, so no letter falls through to a tool shortcut mid-label ("e" = Eraser).
+        if (keybindingSchemeRef.current === "chemdraft") {
+          // A key that doesn't continue the label ends it: re-derive the hover from the pointer first.
+          const current = hoveredNativeDeleteTargetRef.current;
+          const continuingOnAtom = assignment !== undefined && current?.kind === "atom" &&
+            current.objectId === assignment.objectId && current.atomId === assignment.atomId &&
+            /^[a-z0-9]$/i.test(event.key);
+          if (hoverRetargetedFromBondRef.current && !continuingOnAtom && !activeAtomLabelEditRef.current) {
+            hoverRetargetedFromBondRef.current = false;
+            rederiveNativeCanvasHoverRef.current?.(documentRef.current);
+          }
+          const labelAtom = hoverLabelAtomTargetForKey(
+            documentRef.current,
+            hoveredNativeDeleteTargetRef.current,
+            hoverPagePointRef.current,
+            assignment,
+            event.key
+          );
+          if (labelAtom) {
+            assignHoveredNativeDeleteTarget(labelAtom);
+            hoverRetargetedFromBondRef.current = true;
+          }
+        }
+        const hoveredTarget = hoveredNativeDeleteTargetRef.current;
         if (event.key !== "Shift") {
           hoverLabelAssignmentRef.current = undefined;
         }
@@ -10575,12 +10612,20 @@ export function MainWindow({
     replacePresentDocument,
     restoreToolAfterEyedropper,
     selectedNativeMoleculePart,
+    assignHoveredNativeDeleteTarget,
     shortcutRegistry,
     startAtomLabelEdit,
     switchToSelectTool,
     syncPathArtPreview,
     updateAtomLabelDraft
   ]);
+
+  // Any tool change ends a hover-label continuation, whichever way it arrives (palette, native menu,
+  // shortcut), so a letter typed after switching tools is never appended to the earlier label.
+  // A layout effect, so it lands before the browser can deliver the next key.
+  useLayoutEffect(() => {
+    hoverLabelAssignmentRef.current = undefined;
+  }, [activeToolState.activeCommandId]);
 
   useEffect(() => {
     // A pointer press ends the brief hover-key continuation window, even if the press stays on
@@ -11513,6 +11558,8 @@ export function MainWindow({
     point: ClientPoint | undefined,
     eventTarget?: EventTarget | null
   ) => {
+    hoverPagePointRef.current = point;
+    hoverRetargetedFromBondRef.current = false;
     if (!point) {
       setHoveredNativeAtom(undefined);
       setNativeDoubleBondSidePreview(undefined);
@@ -11603,7 +11650,10 @@ export function MainWindow({
     const clientPoint = lastCanvasPointerClientPointRef.current;
     // The DOM hint (the atom label glyph under the pointer) is part of the hover derivation, so
     // resolve the element at the pointer the way a real pointer event's target would report it.
-    const eventTarget = clientPoint ? window.document.elementFromPoint(clientPoint.x, clientPoint.y) : undefined;
+    // (Guarded like agentBridge.ts: hosts without layout, such as jsdom, have no elementFromPoint.)
+    const eventTarget = clientPoint && typeof window.document.elementFromPoint === "function"
+      ? window.document.elementFromPoint(clientPoint.x, clientPoint.y)
+      : undefined;
     updateNativeCanvasHover(sourceDocument, clientPoint ? pagePointFromClientPoint(clientPoint) : undefined, eventTarget);
   }, [pagePointFromClientPoint, updateNativeCanvasHover]);
   rederiveNativeCanvasHoverRef.current = rederiveNativeCanvasHoverFromLastPointer;
@@ -20485,6 +20535,62 @@ export function hoveredNativeTargetShortcutCommand(
 
   const element = nativeElementFromKeyboardKey(key);
   return element ? atomElementCommandId(element) : undefined;
+}
+
+type HoverLabelAssignment = { objectId: string; atomId: string; label: string };
+
+/**
+ * Whether moving the hover to `target` keeps a hover-label continuation alive: still on the atom
+ * being labelled, or on one of that atom's own bonds (the pointer drifting off a small atom mid-word).
+ */
+export function hoverTargetKeepsLabelContinuation(
+  target: NativeMoleculeDeleteTarget | undefined,
+  assignment: HoverLabelAssignment | undefined
+): boolean {
+  if (!assignment || !target || target.objectId !== assignment.objectId) {
+    return false;
+  }
+  return target.kind === "atom"
+    ? target.atomId === assignment.atomId
+    : target.fromAtomId === assignment.atomId || target.toAtomId === assignment.atomId;
+}
+
+/**
+ * The atom a key typed over a hovered BOND belongs to (ChemDraft scheme), or undefined to leave the
+ * hover as it is. Mid-label (a continuation is open and the bond is the labelled atom's own), any
+ * letter or digit goes to that atom, so "CF3" never turns its 3 into a bond order. Otherwise an
+ * element key, which would label an atom if one were hovered, labels the bond's end nearer the
+ * pointer. Digits keep their bond-order meaning and other letters keep their tool shortcuts, as they
+ * do over an atom.
+ */
+export function hoverLabelAtomTargetForKey(
+  document: ChemDraftDocument,
+  target: NativeMoleculeDeleteTarget | undefined,
+  pointer: ClientPoint | undefined,
+  assignment: HoverLabelAssignment | undefined,
+  key: string
+): NativeMoleculeDeleteTarget | undefined {
+  if (target?.kind !== "bond") {
+    return undefined;
+  }
+  if (assignment && /^[a-z0-9]$/i.test(key) && hoverTargetKeepsLabelContinuation(target, assignment)) {
+    return { objectId: target.objectId, kind: "atom", atomId: assignment.atomId, distanceToPointer: 0 };
+  }
+  if (Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, key) || !nativeElementFromKeyboardKey(key)) {
+    return undefined;
+  }
+  const molecule = findDocumentObject(document, target.objectId);
+  if (molecule?.type !== "molecule") {
+    return undefined;
+  }
+  const from = molecule.atoms.find((atom) => atom.id === target.fromAtomId);
+  const to = molecule.atoms.find((atom) => atom.id === target.toAtomId);
+  if (!from || !to) {
+    return undefined;
+  }
+  const distance = (atom: MoleculeAtom) => pointer ? Math.hypot(atom.x - pointer.x, atom.y - pointer.y) : 0;
+  const nearer = distance(to) < distance(from) ? to : from;
+  return { objectId: target.objectId, kind: "atom", atomId: nearer.id, distanceToPointer: distance(nearer) };
 }
 
 export function activeNativeTargetShortcutCommand(
