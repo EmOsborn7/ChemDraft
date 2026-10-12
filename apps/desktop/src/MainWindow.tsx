@@ -1590,7 +1590,7 @@ const GRAPHIC_HANDLE_DRAG_THRESHOLD = 1;
 const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
-const CURRENT_BUILD_STAMP = "10.12.09.40-opus";
+const CURRENT_BUILD_STAMP = "10.12.09.55-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -6343,13 +6343,18 @@ export function MainWindow({
       // Lossy-copy warnings (dative bonds flattened, dummy-atom labels) ride the copy result so
       // the status bar never reports a silent success (AGENTS.md §6.7).
       const warningSuffix = warnings.length > 0 ? ` — ${warnings.join(" ")}` : "";
-      setStatus(didWrite ? `Copied ${label} to clipboard${warningSuffix}` : `Copy as ${label} failed: clipboard unavailable`);
+      setStatus(didWrite ? `Copied ${label} to clipboard${warningSuffix}` : `Copy as ${label} failed: clipboard unavailable${warningSuffix}`);
     };
 
     switch (commandId) {
       case "clipboard.copyAs.smiles": {
         const warnings: string[] = [];
-        await writeText(await copyAsSmiles(current, warnings), "SMILES", warnings);
+        try {
+          await writeText(await copyAsSmiles(current, warnings), "SMILES", warnings);
+        } catch (error) {
+          const warningSuffix = warnings.length > 0 ? ` — ${warnings.join(" ")}` : "";
+          setStatus(`Copy as SMILES failed: ${error instanceof Error ? error.message : String(error)}${warningSuffix}`);
+        }
         return;
       }
       case "clipboard.copyAs.mol": {
