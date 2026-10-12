@@ -21,6 +21,7 @@ import {
   type OpenWarningsReport
 } from "./openWarnings";
 import { modifierHint, type HeldModifiers, type ModifierHintContext, type ModifierHintInteraction } from "./modifierHints";
+import { modifierLabels } from "./modifierLabels";
 import {
   createElement,
   memo,
@@ -1611,7 +1612,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.12.17.15-opus";
+const CURRENT_BUILD_STAMP = "10.12.17.25-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -1719,7 +1720,7 @@ function scissorsStatusLabel(action = "click path to split"): string {
 
 function eyedropperStatusLabel(target: GraphicStylePaintTarget): string {
   const targetLabel = target === "fill" ? "Fill" : "Stroke";
-  return `Eyedropper: ${targetLabel} target selected; click source art; switch Fill/Stroke, ⌥ click copies all; Esc exits`;
+  return `Eyedropper: ${targetLabel} target selected; click source art; switch Fill/Stroke, ${modifierLabels().optionGlyph} click copies all; Esc exits`;
 }
 
 function eyedropperChooseTargetStatusLabel(target: GraphicStylePaintTarget): string {
@@ -1729,7 +1730,7 @@ function eyedropperChooseTargetStatusLabel(target: GraphicStylePaintTarget): str
 
 function eyedropperSameTargetStatusLabel(target: GraphicStylePaintTarget): string {
   const targetLabel = target === "fill" ? "Fill" : "Stroke";
-  return `Eyedropper: ${targetLabel} target selected; click different source art; switch Fill/Stroke, ⌥ click copies all; Esc exits`;
+  return `Eyedropper: ${targetLabel} target selected; click different source art; switch Fill/Stroke, ${modifierLabels().optionGlyph} click copies all; Esc exits`;
 }
 // Whole-molecule double-click is normally read from the browser's `event.detail` click
 // counter. That counter is unreliable when the first press mutates the DOM/selection under
