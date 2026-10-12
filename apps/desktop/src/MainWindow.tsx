@@ -132,10 +132,13 @@ import {
   buildDocumentSessionEnvelope,
   buildDocumentTabsSession,
   documentIsBlank,
+  documentSessionRestoreCandidates,
   parseDocumentSessionEnvelope,
-  rawDocumentSessionTab,
   shouldRestoreDocumentSession,
-  strictSessionFlushRefusal
+  strictSessionFlushRefusal,
+  unrestoredTabContents,
+  unrestoredTabDisplayName,
+  unrestoredTabsNotice
 } from "./documentSession";
 import { createPersistentPluginStorage } from "./plugins/pluginStorage";
 import {
@@ -1621,7 +1624,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.12.17.50-opus";
+const CURRENT_BUILD_STAMP = "10.12.18.05-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2151,6 +2154,10 @@ export function MainWindow({
   }>());
   const pendingTabScrollRef = useRef<{ left: number; top: number } | undefined>(undefined);
   const [closeTabPrompt, setCloseTabPrompt] = useState<string>();
+  const [keptDrawingsPrompt, setKeptDrawingsPrompt] = useState<"notice">();
+  const keptDrawingsPromptRef = useRef(keptDrawingsPrompt);
+  keptDrawingsPromptRef.current = keptDrawingsPrompt;
+  const [keptDrawingsMessage, setKeptDrawingsMessage] = useState<string>();
   const [closeTabSaving, setCloseTabSaving] = useState(false);
   const [closeTabSaveMessage, setCloseTabSaveMessage] = useState<string>();
   const closeTabPromptRef = useRef(closeTabPrompt);
@@ -2242,6 +2249,11 @@ export function MainWindow({
   customizeMainToolbarActiveRef.current = customizeMainToolbarActive;
   const [webPaletteFallback, setWebPaletteFallback] = useState(false);
   const effectiveNativePalette = nativePalette && !webPaletteFallback;
+  const [nativeToolsetLayoutReady, setNativeToolsetLayoutReady] = useState(false);
+  const [nativeToolsetStartupReady, setNativeToolsetStartupReady] = useState(false);
+  const [keptDrawingsStartupWaitExpired, setKeptDrawingsStartupWaitExpired] = useState(false);
+  const nativeToolsetsSuspendedForLaunchPrompt =
+    (nativeToolsetStartupReady || keptDrawingsStartupWaitExpired) && keptDrawingsPrompt !== undefined;
   const [webPalettePositions, setWebPalettePositions] = useState<Record<string, PalettePosition>>(() =>
     createDefaultToolsetPositions(desktopToolsetRegistry)
   );
@@ -2386,6 +2398,8 @@ export function MainWindow({
   const shellOpenFailureRef = useRef<string | undefined>(undefined);
   const documentSessionSaveEnabledRef = useRef(false);
   const unrestoredSessionTabsRef = useRef<unknown[]>([]);
+  const [unrestoredSessionTabCount, setUnrestoredSessionTabCount] = useState(0);
+  const unrestoredTabFlowRunningRef = useRef(false);
   const sessionPayloadCacheRef = useRef(new WeakMap<ChemDraftDocument, ReturnType<typeof createNativeSavePayload>>());
   const statusRef = useRef(status);
   const lastExportDirectoryRef = useRef<string | undefined>(undefined);
@@ -3182,6 +3196,7 @@ export function MainWindow({
         resolvedToolsetIdsRef.current = new Set(toolbarCatalog.registry().listToolsets().map((toolset) => toolset.id));
         layoutSaveEnabledRef.current = true;
         layoutHydratedRef.current = true;
+        setNativeToolsetLayoutReady(true);
       })
       .catch((error: unknown) => {
         if (!active) {
@@ -8161,8 +8176,8 @@ export function MainWindow({
     path?: string,
     options?: OpenDocumentContentsOptions
   ) => {
-    if (closeTabPromptRef.current || (isDesktopRuntime() && !documentSessionHydratedRef.current)) {
-      // Wait for Save/Discard/Cancel and the startup restore before activating an OS open-with.
+    if (closeTabPromptRef.current || keptDrawingsPromptRef.current || (isDesktopRuntime() && !documentSessionHydratedRef.current)) {
+      // Wait for the close/kept-drawing prompt and startup restore before activating an OS open-with.
       pendingDocumentOpensRef.current.push({ contents, displayName, path, options });
       return;
     }
@@ -8230,7 +8245,7 @@ export function MainWindow({
   openDocumentContentsRef.current = openDocumentContents;
 
   useEffect(() => {
-    if (closeTabPrompt || !documentSessionHydratedRef.current) return;
+    if (closeTabPrompt || keptDrawingsPrompt || !documentSessionHydratedRef.current) return;
     const opens = pendingDocumentOpensRef.current.splice(0);
     void (async () => {
       for (const request of opens) {
@@ -8241,7 +8256,7 @@ export function MainWindow({
         }
       }
     })();
-  }, [closeTabPrompt]);
+  }, [closeTabPrompt, keptDrawingsPrompt]);
 
   const acceptPageFitRecommendation = useCallback(() => {
     if (!pageFitPrompt) {
@@ -8409,7 +8424,7 @@ export function MainWindow({
 
   // Restore every tab before processing startup file opens (see documentSession.ts). If a user
   // already started editing while the read was pending, keep that work active and append the restored
-  // tabs. Unreadable tabs stay in the envelope; a wholly unreadable session keeps autosave closed.
+  // tabs. Unreadable tabs stay in the envelope; an unreadable envelope keeps autosave closed.
   useEffect(() => {
     if (documentSessionHydratedRef.current) {
       return undefined;
@@ -8426,7 +8441,7 @@ export function MainWindow({
           return;
         }
         // Only a completed restore (or an absent/pristine session) is a clean read.
-        // A parser or document-open failure must leave autosave closed.
+        // An unreadable outer envelope must leave autosave closed; raw tabs remain recoverable.
         const restore = async () => {
           const envelope = parseDocumentSessionEnvelope(raw);
           if (!envelope) {
@@ -8436,18 +8451,19 @@ export function MainWindow({
           if (!shouldRestoreDocumentSession(envelope)) return;
           const shellOpenFailure = shellOpenFailureRef.current;
           shellOpenFailureRef.current = undefined;
-          const sessions = envelope.tabs ?? [envelope];
-          const skipped = [...(envelope.unrestoredTabs ?? [])];
+          const skipped: unknown[] = [];
           const restored = [];
-          for (const session of sessions) {
+          for (const [candidateIndex, rawTab] of documentSessionRestoreCandidates(envelope).entries()) {
             try {
+              const session = parseDocumentSessionEnvelope(rawTab, true);
+              if (!session) throw new Error("Unreadable tab envelope");
               const opened = openNativeDocument(session.contents);
               const resolved = await resolveOpenResultDocument(opened);
               if (!resolved) throw new Error(formatOpenFailure(opened.warnings));
               const history = createDocumentHistory(normalizeCommittedDocument(admitParsedDocument(resolved.document)));
-              restored.push({ session, opened, resolved, history, id: crypto.randomUUID() });
+              restored.push({ session, opened, resolved, history, candidateIndex, id: crypto.randomUUID() });
             } catch {
-              skipped.push(rawDocumentSessionTab(session));
+              skipped.push(rawTab);
             }
           }
           if (!active) return;
@@ -8456,10 +8472,13 @@ export function MainWindow({
             && !fileStateRef.current.path
             && !fileStateRef.current.dirty
             && documentIsBlank(documentRef.current);
-          if (!restored.length) throw new Error("No readable document tabs");
           unrestoredSessionTabsRef.current = skipped;
-          const restoreNotice = skipped.length
-            ? `; ${skipped.length} ${skipped.length === 1 ? "tab could" : "tabs could"} not be restored` : "";
+          setUnrestoredSessionTabCount(skipped.length);
+          const restoreNotice = unrestoredTabsNotice(skipped.length);
+          if (!restored.length) {
+            setStatus(`Could not restore the last session${restoreNotice}`);
+            return;
+          }
           const restoredTabs = restored.map(({ id, session }) => ({ id, title: session.displayName }));
           let tabs: Array<{ id: string; title: string }> = restoredTabs;
           if (!pristine) {
@@ -8485,7 +8504,7 @@ export function MainWindow({
           documentTabsRef.current = tabs;
           setDocumentTabs(tabs);
           if (pristine) {
-            const selected = restored.find(({ session }) => session === sessions[envelope.activeTabIndex ?? 0]) ?? restored[0]!;
+            const selected = restored.find(({ candidateIndex }) => candidateIndex === (envelope.activeTabIndex ?? 0)) ?? restored[0]!;
             installDocumentTab(selected.id);
           } else if (restoreNotice) setStatus((current) => current + restoreNotice);
         };
@@ -8502,6 +8521,11 @@ export function MainWindow({
       .finally(async () => {
         if (active) {
           documentSessionHydratedRef.current = true;
+          if (unrestoredSessionTabsRef.current.length) {
+            keptDrawingsPromptRef.current = "notice";
+            setKeptDrawingsPrompt("notice");
+            return;
+          }
           const opens = pendingDocumentOpensRef.current.splice(0);
           for (const request of opens) {
             try {
@@ -8731,6 +8755,138 @@ export function MainWindow({
       }
     });
   }, []);
+
+  const updateUnrestoredTabNotices = useCallback((previousCount: number) => {
+    const previousNotice = unrestoredTabsNotice(previousCount);
+    if (!previousNotice) return;
+    const notice = unrestoredTabsNotice(unrestoredSessionTabsRef.current.length);
+    // Switching back to a restored tab must not resurrect an obsolete recovery notice.
+    for (const [id, snapshot] of documentTabSnapshotsRef.current) {
+      documentTabSnapshotsRef.current.set(id, { ...snapshot, status: snapshot.status.replace(previousNotice, notice) });
+    }
+  }, []);
+
+  const saveUnrestoredTabs = useCallback(async () => {
+    if (unrestoredTabFlowRunningRef.current || !unrestoredSessionTabsRef.current.length) return;
+    unrestoredTabFlowRunningRef.current = true;
+    setKeptDrawingsMessage(undefined);
+    let saved = 0;
+    let canceled = false;
+    const failures: string[] = [];
+    try {
+      const carried = [...unrestoredSessionTabsRef.current];
+      for (const [index, rawTab] of carried.entries()) {
+        const name = unrestoredTabDisplayName(rawTab, index);
+        try {
+          const contents = unrestoredTabContents(rawTab);
+          let filename = nativePathBasename(name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/, "");
+          if (!filename) filename = `Kept drawing ${index + 1}`;
+          if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(filename)) filename = `_${filename}`;
+          const extension = filename.match(/\.([a-z0-9]+)$/i)?.[1] ?? "chemdraft";
+          if (!/\.[a-z0-9]+$/i.test(filename)) filename += `.${extension}`;
+          const path = await pickNativeSavePath(filename, { title: `Save Drawing — ${name}`, extension });
+          if (!path) {
+            canceled = true;
+            break;
+          }
+          // Write exactly the chosen path: changing its extension after the save prompt could
+          // overwrite a different file which the picker never asked the user about.
+          await writeNativeTextFile(path, contents);
+          const previousCount = unrestoredSessionTabsRef.current.length;
+          const position = unrestoredSessionTabsRef.current.indexOf(rawTab);
+          if (position >= 0) unrestoredSessionTabsRef.current.splice(position, 1);
+          setUnrestoredSessionTabCount(unrestoredSessionTabsRef.current.length);
+          saved += 1;
+          await writeDocumentSessionNow({ strict: true });
+          updateUnrestoredTabNotices(previousCount);
+        } catch (error) {
+          failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      const message = `Saved ${saved} ${saved === 1 ? "drawing" : "drawings"}; ${unrestoredSessionTabsRef.current.length} kept for later${canceled ? " (save canceled)" : ""}${failures.length ? `. Save failed: ${failures.join("; ")}` : ""}`;
+      setStatus(message);
+      setKeptDrawingsMessage(message);
+      return !unrestoredSessionTabsRef.current.length;
+    } finally {
+      unrestoredTabFlowRunningRef.current = false;
+    }
+  }, [updateUnrestoredTabNotices, writeDocumentSessionNow]);
+
+  const discardUnrestoredTabs = useCallback(async () => {
+    if (unrestoredTabFlowRunningRef.current || !unrestoredSessionTabsRef.current.length) return;
+    unrestoredTabFlowRunningRef.current = true;
+    setKeptDrawingsMessage(undefined);
+    const carried = [...unrestoredSessionTabsRef.current];
+    try {
+      unrestoredSessionTabsRef.current = [];
+      setUnrestoredSessionTabCount(0);
+      await writeDocumentSessionNow({ strict: true });
+      updateUnrestoredTabNotices(carried.length);
+      setStatus(`Deleted ${carried.length} kept ${carried.length === 1 ? "drawing" : "drawings"}`);
+      return true;
+    } catch (error) {
+      // A failed session write is not a completed discard. Keep the data available to retry.
+      unrestoredSessionTabsRef.current = carried;
+      setUnrestoredSessionTabCount(carried.length);
+      const message = `Delete failed; the drawings are kept for later: ${error instanceof Error ? error.message : String(error)}`;
+      setStatus(message);
+      setKeptDrawingsMessage(message);
+      return false;
+    } finally {
+      unrestoredTabFlowRunningRef.current = false;
+    }
+  }, [updateUnrestoredTabNotices, writeDocumentSessionNow]);
+
+  // One summary box owns the whole chain: each raw drawing gets its own save panel.
+  // A failed native box safely keeps the drawings; this launch flow has no React dialog fallback.
+  const keptDrawingsTitle = `${unrestoredSessionTabCount} ${unrestoredSessionTabCount === 1 ? "drawing didn't" : "drawings didn't"} open`;
+  const keptDrawingNames = unrestoredSessionTabsRef.current.map(unrestoredTabDisplayName).join("\n");
+  // Suspension makes open_toolset_window skip creation and report closed. Let startup reconcile
+  // finish (or establish a genuine fallback) before the launch box can acquire that suspension.
+  // Bound only the prompt's wait, not native setup: 1 s allows the reconciler's two 200 ms retry
+  // delays plus 600 ms for layout/IPC. A stalled IPC must not indefinitely lock commands and opens.
+  const keptDrawingsPromptReady = !effectiveNativePalette || !isDesktopRuntime()
+    || nativeToolsetStartupReady || keptDrawingsStartupWaitExpired;
+  useEffect(() => {
+    if (!keptDrawingsPrompt || keptDrawingsPromptReady) return;
+    const timer = window.setTimeout(() => setKeptDrawingsStartupWaitExpired(true), 1000);
+    return () => window.clearTimeout(timer);
+  }, [keptDrawingsPrompt, keptDrawingsPromptReady]);
+  useNativePrompt({
+    title: keptDrawingsTitle,
+    message: [
+      `${unrestoredSessionTabCount === 1 ? "Its drawing is" : "Their drawings are"} kept, but this version of ChemDraft can't show ${unrestoredSessionTabCount === 1 ? "it" : "them"}. It may have been saved by a newer ChemDraft, or the data may be damaged.`,
+      keptDrawingNames,
+      "Choose Save Drawing… to save each drawing, or Delete to delete the kept drawings.\nCancel keeps the drawings for the next launch.",
+      keptDrawingsMessage
+    ].filter(Boolean).join("\n\n"),
+    kind: "warning",
+    choices: [
+      { id: "save", label: "Save Drawing…" },
+      { id: "delete", label: "Delete", destructive: true },
+      { id: "cancel", label: "Cancel", cancel: true }
+    ]
+  }, async (choice) => {
+    if (choice === "cancel") { setKeptDrawingsPrompt(undefined); return; }
+    if (choice === "save") {
+      if (await saveUnrestoredTabs()) { setKeptDrawingsPrompt(undefined); return; }
+    } else if (choice === "delete") {
+      const confirmed = await nativePrompt({
+        title: "Delete the kept drawing?",
+        message: `Delete the kept drawing? This cannot be undone.\n\n${unrestoredSessionTabsRef.current.map(unrestoredTabDisplayName).join("\n")}`,
+        kind: "warning",
+        choices: [
+          { id: "delete", label: "Delete", destructive: true },
+          { id: "cancel", label: "Cancel", cancel: true }
+        ]
+      }, async () => "cancel");
+      if (confirmed === "delete" && await discardUnrestoredTabs()) {
+        setKeptDrawingsPrompt(undefined);
+        return;
+      }
+    }
+    return false;
+  }, keptDrawingsPromptReady ? keptDrawingsPrompt : undefined, true, async () => "cancel");
 
   const saveCurrentDocument = useCallback(async (forceSaveAs: boolean): Promise<boolean> => {
     const savingTabId = activeDocumentTabIdRef.current;
@@ -10254,6 +10410,7 @@ export function MainWindow({
   );
 
   const invoke = useCallback(async (commandId: string) => {
+    if (keptDrawingsPromptRef.current) return;
     if (closeTabPromptRef.current && commandId.startsWith("document.")) return;
     if (commandId === convertTextToAtomLabelCommandId) {
       const disabledReason = selectedTextToAtomLabelDisabledReason(documentRef.current);
@@ -11770,7 +11927,25 @@ export function MainWindow({
       return;
     }
 
+    // The saved layout may add visible toolsets after the first render. Reconcile that layout
+    // before allowing the kept-drawings launch prompt to suspend native window creation.
+    if (!nativeToolsetLayoutReady) {
+      return;
+    }
+    // A plugin or a timed-out layout/IPC can finish while the box is open. Its hidden windows are
+    // healthy; cancel/defer reconciliation until the launch sequence releases them instead of
+    // counting suspension's refusal to create/reveal windows as genuine failures.
+    if (nativeToolsetsSuspendedForLaunchPrompt) {
+      return;
+    }
+
     let cancelled = false;
+    const useFallback = () => {
+      if (cancelled) return;
+      setWebPaletteFallback(true);
+      setVisibleToolsetIds(createDefaultVisibleToolsetIds(toolsetRegistry));
+      setStatus("Native toolset windows unavailable; using in-window toolbars");
+    };
     void reconcileNativePaletteWindows({
       listToolsetWindowStates,
       openToolsetWindow: (toolsetId) => openToolsetWindow(toolsetId, toolsetWindowGeometry(toolsetId)),
@@ -11783,30 +11958,28 @@ export function MainWindow({
         return;
       }
       if (result.outcome === "native") {
+        setNativeToolsetStartupReady(true);
         // Do NOT narrow visibleToolsetIds to the set that actually opened. If one palette missed its
         // creating frame (is_visible() briefly false) while others opened, the reconciler returns a
         // partial openedToolsetIds; overwriting the desired set with it — and then persisting that —
         // would permanently drop that palette. The desired set stays authoritative.
         //
-        // A partial set now means the reconciler retried that palette and it still would not open,
-        // because it keeps going until the whole desired set is up. This effect cannot be the retry:
-        // its deps are native mode and the registry, and it reads the desired set from a ref, so
-        // nothing re-runs it when an open fails.
+        // A partial set means the reconciler retried that palette and it still would not open.
+        // Registry changes and the end of the launch prompt can reconcile again; an individual
+        // open failure does not re-run the effect, so the reconciler itself owns retries.
         return;
       }
       // Retries exhausted — native windows are genuinely unavailable, so show in-window toolbars
       // rather than leaving the app with no toolbars at all. (A transient startup miss no longer
       // lands here; reconcileNativePaletteWindows retries first so it can't permanently trap the
       // palettes in the viewport.)
-      setWebPaletteFallback(true);
-      setVisibleToolsetIds(createDefaultVisibleToolsetIds(toolsetRegistry));
-      setStatus("Native toolset windows unavailable; using in-window toolbars");
-    });
+      useFallback();
+    }).catch(useFallback);
 
     return () => {
       cancelled = true;
     };
-  }, [effectiveNativePalette, toolsetRegistry, toolsetWindowGeometry]);
+  }, [effectiveNativePalette, nativeToolsetLayoutReady, nativeToolsetsSuspendedForLaunchPrompt, toolsetRegistry, toolsetWindowGeometry]);
 
   // A pointer-down anywhere in the document window dismisses any open palette popover (the colour
   // picker floats in its own window; "click elsewhere closes it"). Native palettes only — in the
@@ -30198,12 +30371,15 @@ async function pickNativeOpenPath(): Promise<string | undefined> {
   return typeof selected === "string" ? selected : undefined;
 }
 
-async function pickNativeSavePath(defaultPath: string): Promise<string | undefined> {
+async function pickNativeSavePath(
+  defaultPath: string,
+  options?: { title: string; extension: string }
+): Promise<string | undefined> {
   const { save } = await loadTauriDialogModule();
   const selected = await save({
-    title: "Save ChemDraft Document",
+    title: options?.title ?? "Save ChemDraft Document",
     defaultPath,
-    filters: [{ name: "ChemDraft", extensions: ["chemdraft"] }]
+    filters: [{ name: options ? "Saved document" : "ChemDraft", extensions: [options?.extension ?? "chemdraft"] }]
   });
   return selected ?? undefined;
 }
