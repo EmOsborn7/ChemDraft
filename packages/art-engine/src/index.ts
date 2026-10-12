@@ -10,6 +10,10 @@ import type {
   VisualEffect,
   VisualEffectStyle
 } from "@chemdraft/chem-core";
+export { planArrangementArrows, arrangementArrowPadding, arrangementArrowBend, planFollowingArrangementArrow, planReactionConditionLabel } from "./arrangementArrows";
+export { planReactionOffshoot, reactionArrowFrame, reactionArrowContactParameter, captureReactionOffshootGeometry, reactionOffshootObstacleBounds } from "./arrangementArrows";
+export type { ReactionArrowPath, ReactionOffshootGeometry } from "./arrangementArrows";
+export type { ArrangementArrowItem, ArrangementArrowPlan, ArrangementArrowCycle } from "./arrangementArrows";
 import Flatten from "@flatten-js/core";
 import { getStroke, type StrokeOptions } from "perfect-freehand";
 import type { PathInfo } from "roughjs/bin/core";
@@ -1405,6 +1409,15 @@ export function graphicPathEditPoints(object: GraphicObject): GraphicPathEditPoi
   };
 }
 
+/** Native arrow handle points transformed into the visible page coordinate system. */
+export function graphicPathVisualEditPoints(object: GraphicObject): GraphicPathEditPoints | undefined {
+  const points = graphicPathEditPoints(object);
+  return points ? {...points,
+    start:projectGraphicObjectVisualPointForDirectEdit(object,points.start),
+    end:projectGraphicObjectVisualPointForDirectEdit(object,points.end),
+    middle:projectGraphicObjectVisualPointForDirectEdit(object,points.middle)} : undefined;
+}
+
 export function graphicPathNodeEditPoints(object: GraphicObject): GraphicPathNodeEditPoints | undefined {
   const pathKind = graphicPathKind(object);
   if (pathKind !== "polyline" && pathKind !== "bezier") {
@@ -1426,6 +1439,37 @@ export function graphicPathNodeEditPoints(object: GraphicObject): GraphicPathNod
       ...(node.outControl ? { outControl: node.outControl } : {})
     }))
   };
+}
+
+export const MAX_WAVE_AMPLITUDE_PX=40;
+export const MAX_WAVE_CYCLES=512;
+export function graphicWavyLineCycles(object:GraphicObject):number {
+  const stored=metadataNumber(object.data.waveCycles);
+  if(stored!==undefined) return clamp(Math.round(stored),1,MAX_WAVE_CYCLES);
+  const start=pointMetadata(object.data.lineStart),end=pointMetadata(object.data.lineEnd);
+  return start && end ? Math.min(MAX_WAVE_CYCLES,Math.max(2,Math.round(Math.hypot(end.x-start.x,end.y-start.y)/8))) : 2;
+}
+export function graphicWavyLineAmplitude(object:GraphicObject):number {
+  const stored=metadataNumber(object.data.waveAmplitudePx);
+  if(stored!==undefined) return clamp(stored,0,MAX_WAVE_AMPLITUDE_PX);
+  return pointMetadata(object.data.lineStart) && pointMetadata(object.data.lineEnd)
+    ? Math.max(2,Math.min(5,(metadataNumber(object.style.strokeWidth) ?? 2)*1.6))
+    : Math.max(4,Math.min(12,object.height*0.24));
+}
+
+/** Keep the rotation/projection center and shaft endpoints fixed when the wave's frame grows. */
+export function editWavyLineAppearance(object:GraphicObject,settings:{smoothness?:number;amplitudePx?:number;cycles?:number}):GraphicObject|undefined {
+  if(graphicPathKind(object)!=="wavy") return undefined;
+  const data={...object.data};
+  if(settings.smoothness!==undefined && Number.isFinite(settings.smoothness)) data.waveSmoothness=clamp(settings.smoothness,0,1);
+  if(settings.amplitudePx!==undefined && Number.isFinite(settings.amplitudePx)) data.waveAmplitudePx=clamp(settings.amplitudePx,0,MAX_WAVE_AMPLITUDE_PX);
+  if(settings.cycles!==undefined && Number.isFinite(settings.cycles)) data.waveCycles=clamp(Math.round(settings.cycles),1,MAX_WAVE_CYCLES);
+  if(data.waveSmoothness===object.data.waveSmoothness && data.waveAmplitudePx===object.data.waveAmplitudePx && data.waveCycles===object.data.waveCycles) return object;
+  if(data.waveAmplitudePx===object.data.waveAmplitudePx) return {...object,data};
+  const bounds=boundsForGraphicPath(object,data),center=objectCenter(object);
+  const halfWidth=Math.max(Math.abs(bounds.x-center.x),Math.abs(bounds.x+bounds.width-center.x));
+  const halfHeight=Math.max(Math.abs(bounds.y-center.y),Math.abs(bounds.y+bounds.height-center.y));
+  return {...object,data,x:center.x-halfWidth,y:center.y-halfHeight,width:halfWidth*2,height:halfHeight*2};
 }
 
 export function editGraphicPathGeometry(
@@ -2620,9 +2664,22 @@ function boundsForGraphicPath(object: GraphicObject, data: GraphicObject["data"]
   const nodePoints = graphicPathNodesFromData(data)
     .flatMap((node) => [node.point, node.inControl, node.outControl])
     .filter((point): point is NativeArtPoint => point !== undefined);
-  const points = data.artPathKind === "quadratic" && start && end && middle
+  let points = data.artPathKind === "quadratic" && start && end && middle
     ? quadraticBezierSamplePoints(start, quadraticControlForMiddlePoint(start, middle, end), end, 24)
     : [...nodePoints, start, end, middle].filter((point): point is NativeArtPoint => point !== undefined);
+  if(data.artPathKind==="wavy" && data.waveAmplitudePx!==undefined) {
+    const amplitude=graphicWavyLineAmplitude({...object,data});
+    if(start && end) {
+      const length=Math.hypot(end.x-start.x,end.y-start.y)||1,nx=-(end.y-start.y)/length,ny=(end.x-start.x)/length;
+      points=[start,end].flatMap(p=>[-1,1].map(sign=>({x:p.x+sign*nx*amplitude,y:p.y+sign*ny*amplitude})));
+    } else {
+      const center=objectCenter(object);
+      points=[{x:object.x,y:center.y-amplitude},{x:object.x+object.width,y:center.y+amplitude}];
+      // A click-placed wave's width controls its endpoints; amplitude only changes its height.
+      const padding=Math.max(6,(metadataNumber(object.style.strokeWidth) ?? 2)*2);
+      return {x:object.x,y:center.y-amplitude-padding,width:object.width,height:2*(amplitude+padding)};
+    }
+  }
   if (points.length === 0) {
     return {
       x: object.x,
@@ -3685,17 +3742,26 @@ function graphicPathD(
 
   if (pathKind === "wavy") {
     const endpoints = graphicPathEndpoints(object, coordinateSpace, inset);
+    const smoothness=metadataNumber(object.data.waveSmoothness);
+    if (smoothness!==undefined || metadataNumber(object.data.waveCycles)!==undefined) {
+      const explicit=pointMetadata(object.data.lineStart) && pointMetadata(object.data.lineEnd);
+      const amplitude=graphicWavyLineAmplitude(object);
+      const originX=coordinateSpace==="page" ? object.x : 0,originY=coordinateSpace==="page" ? object.y : 0;
+      return adjustableWavyLinePathD(explicit ? endpoints.start : {x:originX+inset,y:originY+object.height/2},
+        explicit ? endpoints.end : {x:originX+object.width-inset,y:originY+object.height/2},amplitude,smoothness ?? (explicit ? 0 : 1),
+        graphicWavyLineCycles(object));
+    }
     if (pointMetadata(object.data.lineStart) && pointMetadata(object.data.lineEnd)) {
       return wavyLinePathD(
         endpoints.start,
         endpoints.end,
-        Math.max(2, Math.min(5, (metadataNumber(object.style.strokeWidth) ?? 2) * 1.6))
+        graphicWavyLineAmplitude(object)
       );
     }
     const originX = coordinateSpace === "page" ? object.x : 0;
     const originY = coordinateSpace === "page" ? object.y : 0;
     const midY = originY + object.height / 2;
-    const amplitude = Math.max(4, Math.min(12, object.height * 0.24));
+    const amplitude = graphicWavyLineAmplitude(object);
     return [
       `M ${formatNumber(originX + inset)} ${formatNumber(midY)}`,
       `C ${formatNumber(originX + object.width * 0.16)} ${formatNumber(midY - amplitude)}, ${formatNumber(originX + object.width * 0.28)} ${formatNumber(midY + amplitude)}, ${formatNumber(originX + object.width * 0.4)} ${formatNumber(midY)}`,
@@ -4230,6 +4296,27 @@ function pointForArtSpace(
   return coordinateSpace === "page"
     ? point
     : { x: point.x - object.x, y: point.y - object.y };
+}
+
+/** Round a triangle wave's peaks with tangent quadratic fillets. As the rounding expands,
+ * the adjacent slope increases just enough to retain the same peak amplitude and endpoints. */
+function adjustableWavyLinePathD(start:NativeArtPoint,end:NativeArtPoint,amplitude:number,smoothness:number,cycles?:number):string {
+  const dx=end.x-start.x,dy=end.y-start.y,length=Math.hypot(dx,dy);
+  if (length<1) return `M ${formatNumber(start.x)} ${formatNumber(start.y)} L ${formatNumber(end.x)} ${formatNumber(end.y)}`;
+  const count=clamp(Math.round(cycles ?? Math.max(2,Math.round(length/8))),1,MAX_WAVE_CYCLES),half=length/(count*2),quarter=half/2;
+  const rounding=Math.max(0,Math.min(1,smoothness))*quarter,slope=amplitude/(quarter-rounding/2);
+  const point=(along:number,normal:number)=>`${formatNumber(start.x+dx/length*along-dy/length*normal)} ${formatNumber(start.y+dy/length*along+dx/length*normal)}`;
+  const parts=[`M ${point(0,0)}`];
+  for (let i=0;i<count*2;i++) {
+    const base=i*half,sign=i%2===0 ? 1 : -1;
+    if (rounding===0) parts.push(`L ${point(base+quarter,sign*amplitude)}`);
+    else {
+      if (rounding<quarter) parts.push(`L ${point(base+quarter-rounding,sign*slope*(quarter-rounding))}`);
+      parts.push(`Q ${point(base+quarter,sign*slope*quarter)} ${point(base+quarter+rounding,sign*slope*(quarter-rounding))}`);
+    }
+    if (rounding<quarter) parts.push(`L ${point(base+half,0)}`);
+  }
+  return parts.join(" ");
 }
 
 function wavyLinePathD(start: NativeArtPoint, end: NativeArtPoint, amplitude: number): string {

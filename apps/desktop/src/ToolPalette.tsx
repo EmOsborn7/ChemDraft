@@ -204,6 +204,7 @@ const ART_BOOLEAN_COMMAND_IDS = [
 ] as const;
 
 const ART_ARRANGE_COLUMN_ITEM_IDS = [
+  "layout.arrange.circle",
   "layout.alignLeft",
   "layout.distributeHorizontal",
   "layout.distributeVertical",

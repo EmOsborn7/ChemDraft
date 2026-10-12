@@ -5187,7 +5187,7 @@ textarea:focus-visible,
 }
 
 .text-object-run[data-text-script="subscript"] {
-  vertical-align: sub;
+  vertical-align: -0.16em;
 }
 
 .text-object-run[data-text-script="superscript"] {
@@ -5423,11 +5423,16 @@ textarea:focus-visible,
     min-height: 30px;
   }
 
+  .menu-bar {
+    height: auto;
+    min-height: 28px;
+  }
+
+  /* Scrolling this ancestor clips both dropdowns and nested flyouts. Wrap the
+     section headings instead so menus can extend over the document canvas. */
   .menu {
-    order: 3;
-    width: 100%;
-    overflow: auto;
-    padding-bottom: 4px;
+    flex-wrap: wrap;
+    overflow: visible;
   }
 
   .command-bar {
@@ -7158,3 +7163,46 @@ textarea:focus-visible,
   font-size: 10px;
   line-height: 1.35;
 }
+
+.waviness-dialog { max-height: calc(100dvh - 32px); }
+.arrangement-spacing-dialog { max-height: calc(100dvh - 32px); }
+.arrangement-spacing-dialog .plugin-prompt-body { min-height: 0; overflow-y: auto; }
+.arrangement-spacing-dialog input[type="range"] { width: 100%; accent-color: var(--cd-accent); }
+.arrangement-spacing-preview { display: block; width: 100%; height: 280px; object-fit: contain; background: white; border: 1px solid var(--cd-border); }
+.waviness-dialog .plugin-prompt-body { min-height: 0; overflow-y: auto; }
+.waviness-dialog input[type="range"] { width: 100%; margin: 8px 0 0; accent-color: var(--cd-accent); }
+.waviness-scale { display: flex; justify-content: space-between; font-size: 12px; }
+.waviness-preview { display: block; width: 100%; height: 120px; background: var(--cd-bg-control); border: 1px solid var(--cd-border); }
+
+.reaction-conditions-dialog textarea,
+.reaction-conditions-dialog select {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--cd-border-control);
+  border-radius: 2px;
+  background: var(--cd-bg-control);
+  color: inherit;
+  font: inherit;
+}
+.reaction-conditions-dialog textarea { resize: vertical; min-height: 80px; }
+.reaction-conditions-dialog { max-height: calc(100dvh - 32px); }
+.reaction-conditions-dialog .plugin-prompt-body { min-height: 0; overflow-y: auto; }
+.reaction-conditions-dialog .plugin-prompt-header,
+.reaction-conditions-dialog .plugin-prompt-actions { flex-shrink: 0; }
+.reaction-conditions-tools { display: flex; flex-wrap: wrap; gap: 4px; }
+.reaction-conditions-tools button { min-width: 30px; }
+.reaction-conditions-tools button[aria-pressed="true"] { outline: 2px solid var(--cd-border-control); }
+.reaction-conditions-dialog .reaction-conditions-format-help { margin: 0; font-size: 12px; }
+.reaction-conditions-preview {
+  padding: 8px;
+  min-height: 40px;
+  border: 1px solid var(--cd-border-control);
+  background: var(--cd-bg-control);
+  text-align: center;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+  font-size: 14px;
+}
+.reaction-conditions-preview-placeholder { opacity: 0.6; }

@@ -3180,7 +3180,9 @@ describe("ChemDraft desktop shell", () => {
     expect(markup).not.toContain('data-command-id="tool.art.rectShadow"');
     expect(markup).not.toContain('data-command-id="tool.art.arc90Dashed"');
     const booleanCommandIds = new Set(["art.boolean.union", "art.boolean.subtract", "art.boolean.intersect", "art.boolean.split"]);
-    expect(artGroups.flat().filter((command) => !booleanCommandIds.has(command.id)).every((command) => command.assetName)).toBe(true);
+    // Arrangement and boolean commands use original inline SVG glyphs rather than asset files.
+    expect(artGroups.flat().filter((command) => !booleanCommandIds.has(command.id) && !command.id.startsWith("layout.arrange.")).every((command) => command.assetName)).toBe(true);
+    expect(artGroups.flat().find((command) => command.id === "layout.arrange.circle")?.icon).toBe("arrange");
     expect(artGroups.flat().filter((command) => booleanCommandIds.has(command.id)).every((command) => command.assetName === undefined)).toBe(true);
     expect(markup).not.toContain("data-art-tool-icon=");
     expect(buttonMarkupForCommand(markup, "tool.art.rect")).toContain('data-command-flyout-button="shapes"');

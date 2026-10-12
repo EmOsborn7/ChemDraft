@@ -886,7 +886,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
+                "description": "Stamp a ° symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -1316,6 +1316,108 @@
               "tooltip": {
                 "title": "Distribute Vertically",
                 "shortcut": "Option+Shift+Cmd+V"
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
+              "commandId": "layout.arrange.circle",
+              "title": "Arrange Selection",
+              "disabledReason": "Select at least two objects or groups",
+              "icon": "arrange",
+              "category": "layout",
+              "id": "layout.arrange.circle",
+              "kind": "button",
+              "label": "Arrange Selection",
+              "primary": {
+                "type": "command",
+                "commandId": "layout.arrange.circle"
+              },
+              "submenu": {
+                "type": "command-grid",
+                "title": "Arrange Selection",
+                "columns": 1,
+                "items": [
+                  {
+                    "commandId": "layout.arrange.circle",
+                    "label": "Circle",
+                    "icon": "arrange",
+                    "tooltip": {
+                      "title": "Arrange in a Circle",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.oval",
+                    "label": "Oval",
+                    "icon": "arrangeOval",
+                    "tooltip": {
+                      "title": "Arrange in an Oval",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid.left",
+                    "label": "Grid — Left",
+                    "icon": "arrangeGridLeft",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Left)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid",
+                    "label": "Grid — Centered",
+                    "icon": "arrangeGridCenter",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Centered)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid.right",
+                    "label": "Grid — Right",
+                    "icon": "arrangeGridRight",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Right)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.row",
+                    "label": "Row",
+                    "icon": "arrangeRow",
+                    "tooltip": {
+                      "title": "Arrange in a Row",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.column",
+                    "label": "Column",
+                    "icon": "arrangeColumn",
+                    "tooltip": {
+                      "title": "Arrange in a Column",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.adjustArrangementSpacing",
+                    "label": "Adjust spacing…",
+                    "icon": "align",
+                    "tooltip": {
+                      "title": "Adjust arrangement spacing",
+                      "shortcut": null
+                    }
+                  }
+                ]
+              },
+              "tooltip": {
+                "title": "Arrange Selection",
+                "shortcut": null,
+                "description": "Click for a circle. Long-press or press Arrow Down for oval, left/centered/right grid, row and column."
               },
               "layout": {
                 "colSpan": 1,
@@ -2754,7 +2856,7 @@
               "tooltip": {
                 "title": "Symbol Tool Group",
                 "shortcut": null,
-                "description": "Stamp a \u00b0 symbol. Long-press for other symbols."
+                "description": "Stamp a ° symbol. Long-press for other symbols."
               },
               "layout": {
                 "colSpan": 1,
@@ -3756,6 +3858,108 @@
               }
             },
             {
+              "commandId": "layout.arrange.circle",
+              "title": "Arrange Selection",
+              "disabledReason": "Select at least two objects or groups",
+              "icon": "arrange",
+              "category": "layout",
+              "id": "layout.arrange.circle",
+              "kind": "button",
+              "label": "Arrange Selection",
+              "primary": {
+                "type": "command",
+                "commandId": "layout.arrange.circle"
+              },
+              "submenu": {
+                "type": "command-grid",
+                "title": "Arrange Selection",
+                "columns": 1,
+                "items": [
+                  {
+                    "commandId": "layout.arrange.circle",
+                    "label": "Circle",
+                    "icon": "arrange",
+                    "tooltip": {
+                      "title": "Arrange in a Circle",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.oval",
+                    "label": "Oval",
+                    "icon": "arrangeOval",
+                    "tooltip": {
+                      "title": "Arrange in an Oval",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid.left",
+                    "label": "Grid — Left",
+                    "icon": "arrangeGridLeft",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Left)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid",
+                    "label": "Grid — Centered",
+                    "icon": "arrangeGridCenter",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Centered)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid.right",
+                    "label": "Grid — Right",
+                    "icon": "arrangeGridRight",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Right)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.row",
+                    "label": "Row",
+                    "icon": "arrangeRow",
+                    "tooltip": {
+                      "title": "Arrange in a Row",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.column",
+                    "label": "Column",
+                    "icon": "arrangeColumn",
+                    "tooltip": {
+                      "title": "Arrange in a Column",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.adjustArrangementSpacing",
+                    "label": "Adjust spacing…",
+                    "icon": "align",
+                    "tooltip": {
+                      "title": "Adjust arrangement spacing",
+                      "shortcut": null
+                    }
+                  }
+                ]
+              },
+              "tooltip": {
+                "title": "Arrange Selection",
+                "shortcut": null,
+                "description": "Click for a circle. Long-press or press Arrow Down for oval, left/centered/right grid, row and column."
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
               "commandId": "layout.flipHorizontal",
               "title": "Flip Horizontally",
               "icon": "align",
@@ -4456,6 +4660,108 @@
               "tooltip": {
                 "title": "Distribute Vertically",
                 "shortcut": "Option+Shift+Cmd+V"
+              },
+              "layout": {
+                "colSpan": 1,
+                "rowSpan": 1
+              }
+            },
+            {
+              "commandId": "layout.arrange.circle",
+              "title": "Arrange Selection",
+              "disabledReason": "Select at least two objects or groups",
+              "icon": "arrange",
+              "category": "layout",
+              "id": "layout.arrange.circle",
+              "kind": "button",
+              "label": "Arrange Selection",
+              "primary": {
+                "type": "command",
+                "commandId": "layout.arrange.circle"
+              },
+              "submenu": {
+                "type": "command-grid",
+                "title": "Arrange Selection",
+                "columns": 1,
+                "items": [
+                  {
+                    "commandId": "layout.arrange.circle",
+                    "label": "Circle",
+                    "icon": "arrange",
+                    "tooltip": {
+                      "title": "Arrange in a Circle",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.oval",
+                    "label": "Oval",
+                    "icon": "arrangeOval",
+                    "tooltip": {
+                      "title": "Arrange in an Oval",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid.left",
+                    "label": "Grid — Left",
+                    "icon": "arrangeGridLeft",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Left)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid",
+                    "label": "Grid — Centered",
+                    "icon": "arrangeGridCenter",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Centered)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.grid.right",
+                    "label": "Grid — Right",
+                    "icon": "arrangeGridRight",
+                    "tooltip": {
+                      "title": "Arrange in a Grid (Right)",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.row",
+                    "label": "Row",
+                    "icon": "arrangeRow",
+                    "tooltip": {
+                      "title": "Arrange in a Row",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.arrange.column",
+                    "label": "Column",
+                    "icon": "arrangeColumn",
+                    "tooltip": {
+                      "title": "Arrange in a Column",
+                      "shortcut": null
+                    }
+                  },
+                  {
+                    "commandId": "layout.adjustArrangementSpacing",
+                    "label": "Adjust spacing…",
+                    "icon": "align",
+                    "tooltip": {
+                      "title": "Adjust arrangement spacing",
+                      "shortcut": null
+                    }
+                  }
+                ]
+              },
+              "tooltip": {
+                "title": "Arrange Selection",
+                "shortcut": null,
+                "description": "Click for a circle. Long-press or press Arrow Down for oval, left/centered/right grid, row and column."
               },
               "layout": {
                 "colSpan": 1,

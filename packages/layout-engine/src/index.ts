@@ -63,6 +63,11 @@ import {
 } from "./valence";
 
 export {
+  ArrangementLayouts, ArrangementGridAlignments, planObjectArrangement,
+  type ArrangementLayout, type ArrangementGridAlignment, type ArrangementItem, type ArrangementOptions, type ArrangementPlan
+} from "./arrangement";
+
+export {
   atomBondOrderUsageMap,
   nativeAtomBondOrderUsage,
   nativeAtomChargeIsExpressible,
@@ -3194,6 +3199,8 @@ function projectionDistanceAlongSegment(
   };
 }
 
+export const nativeTextSubscriptOffsetEm = 0.16;
+
 function planTextObjectSvg(object: TextObject, layerIndex: number): PageSvgElementFragment {
   const textStyle = nativeTextStyleFromObjectStyle(object.style);
   const lines = textObjectSpanLines(object);
@@ -3243,7 +3250,7 @@ function textSpanLineFragments(
     elementFragment("tspan", `text-line-${lineIndex}-${spanIndex}-${span.text}`, {
       x: spanIndex === 0 ? x : undefined,
       dy: spanIndex === 0 && lineIndex > 0 ? lineAdvancePx : undefined,
-      "baseline-shift": span.script === "normal" ? undefined : span.script === "superscript" ? "super" : "sub",
+      "baseline-shift": span.script === "normal" ? undefined : span.script === "superscript" ? "super" : `${-nativeTextSubscriptOffsetEm*100}%`,
       "font-size": span.script === "normal" ? metadataNumber(span.style.fontSizePx) : "72%",
       fill: metadataString(span.style.color),
       "font-family": metadataString(span.style.fontFamily),
@@ -4914,6 +4921,68 @@ export function planMoleculeAtomLabels(
     );
     return plan ? [plan] : [];
   });
+}
+
+/** Visible labels can extend beyond a molecule's stored atom frame (notably long nicknames). */
+/** Centre the visible ring system rather than a tall substituent or a long atom label.
+ * Acyclic structures use their atom frame; clearance still measures every visible part. */
+export function moleculeAnchorForArrangement(object:MoleculeObject):LayoutPoint {
+  const ringIds=new Set(moleculeFillRingCycles(object).flatMap(cycle=>[...cycle.atomIds]));
+  const atoms=object.atoms.filter(atom=>ringIds.has(atom.id));
+  const point=atoms.length ? {x:atoms.reduce((sum,atom)=>sum+atom.x,0)/atoms.length,
+    y:atoms.reduce((sum,atom)=>sum+atom.y,0)/atoms.length} :
+    {x:object.x+object.width/2,y:object.y+object.height/2};
+  return transformPointForObject(object,point);
+}
+
+export function moleculeVisualBoundsForArrangement(object: MoleculeObject): LayoutBounds {
+  const bounds = [object, ...planMoleculeAtomLabels(object).map((plan) => ({
+    x: plan.anchor.x + plan.layout.bounds.x,
+    y: plan.anchor.y + plan.layout.bounds.y,
+    width: plan.layout.bounds.width,
+    height: plan.layout.bounds.height
+  }))];
+  const points=bounds.flatMap(b=>[{x:b.x,y:b.y},{x:b.x+b.width,y:b.y},{x:b.x+b.width,y:b.y+b.height},{x:b.x,y:b.y+b.height}])
+    .map(point=>transformPointForObject(object,point));
+  const x = Math.min(...points.map(p=>p.x));
+  const y = Math.min(...points.map(p=>p.y));
+  return {
+    x, y,
+    width: Math.max(...points.map(p=>p.x)) - x,
+    height: Math.max(...points.map(p=>p.y)) - y
+  };
+}
+
+/** Conservative silhouette points for connecting-arrow clearance. Empty corners of the stored
+ * rectangular atom frame must not shorten a curved arrow approaching a fused ring obliquely.
+ * Bond widths and label layouts come from the same helpers as the molecule renderer. */
+export function moleculeOutlinePointsForArrangement(object: MoleculeObject): LayoutPoint[] {
+  const points: LayoutPoint[] = [];
+  const addBox = (x: number, y: number, width: number, height: number) => {
+    points.push({ x, y }, { x: x + width, y }, { x: x + width, y: y + height }, { x, y: y + height });
+  };
+  if (!object.atoms.length) {
+    addBox(object.x, object.y, object.width, object.height);
+    return points.map((point) => transformPointForObject(object, point));
+  }
+  const byId = new Map(object.atoms.map((atom) => [atom.id, atom]));
+  for (const atom of object.atoms) addBox(atom.x - 1, atom.y - 1, 2, 2);
+  for (const bond of object.bonds) {
+    const style = nativeMoleculeBondDrawingStyle(object, bond.id);
+    const display = nativeBondDisplayStyle(bond);
+    let padding = nativeBondStrokeWidth(bond, style) / 2;
+    if (bond.order === "double" || bond.order === "triple" || bond.order === "aromatic") padding += nativeMultipleBondGapPx(style);
+    if (display === "wedge" || display === "hashed") padding = Math.max(padding, nativeWedgeWidth(style) / 2 + style.bondStrokeWidthPx);
+    for (const id of [bond.fromAtomId, bond.toAtomId]) {
+      const atom = byId.get(id);
+      if (atom) addBox(atom.x - padding, atom.y - padding, 2 * padding, 2 * padding);
+    }
+  }
+  for (const label of planMoleculeAtomLabels(object)) {
+    const b = label.layout.bounds;
+    addBox(label.anchor.x + b.x, label.anchor.y + b.y, b.width, b.height);
+  }
+  return points.map((point) => transformPointForObject(object, point));
 }
 
 export function planAtomLabel(

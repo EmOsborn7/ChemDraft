@@ -340,8 +340,10 @@ describe("exportDocumentToSvg", () => {
 
     expect(result.warnings).toEqual([]);
     expect(result.contents).toContain('data-object-id="text_script_export_001"');
-    expect(result.contents).toContain('baseline-shift="sub"');
+    expect(result.contents).toContain('baseline-shift="-16%"');
     expect(result.contents).toContain('font-size="72%"');
+    expect(result.contents).toContain('>H</tspan><tspan baseline-shift="-16%"');
+    expect(result.contents).toContain('>2</tspan><tspan fill="#1f5fbf">O</tspan>');
     expect(result.contents).toContain('fill="#1f5fbf"');
     expect(result.contents).toContain(">H</tspan>");
     expect(result.contents).toContain(">2</tspan>");

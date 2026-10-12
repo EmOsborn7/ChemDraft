@@ -74,3 +74,17 @@ plus `testMoleculeFromSmiles` (a test-only reader whose bare lowercase `n` does 
 type-4 bond does not), and `porphyrinoid` / `fusedPyrroleLadder` builders.
 
 Layout must not change chemical identity.
+
+`planObjectArrangement` plans translation-only circle, oval, grid, row, and column layouts from
+visible item bounds. Circle centers have equal angular spacing; oval centers have equal angular
+steps on a 3:2 ellipse. The radius clears every pair of differently sized items, with a configurable
+minimum gap (48 document pixels by default). Linear layouts have equal edge gaps. Grid tracks
+use the largest item in each row/column. Optional page bounds reject layouts that cannot fit
+without resizing. Reapplying a layout is stable; no engine or new dependency is loaded.
+Cycle plans also expose their ellipse center/radii. Optional `cyclePadding` reserves room for
+connecting arcs (including the full horizontal extent of a two-item cycle) inside page bounds.
+The arrow path/clearance planner lives in art-engine; the layout planner does not create objects.
+An incomplete final grid row is centered by default; `gridAlignment` also accepts `left` and `right`.
+Its visible frame aligns with the full rows, with equal edge gaps between final-row items.
+`moleculeOutlinePointsForArrangement` shares bond-width and atom-label math with the renderer;
+art-engine uses these points to clear molecule silhouettes rather than blank rectangular corners.

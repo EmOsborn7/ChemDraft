@@ -16,6 +16,11 @@ the superseding entry says so — read the newest entry that touches a subsystem
 
 **Slices with their own file:**
 
+- [Selection auto-arrangement](selection-arrangement.md) — circle, oval, grid, row and column presets
+  for existing selections, with size-aware clearance. Implemented on the feature branch; unreleased.
+- [Adjustable wavy lines](wavy-line-smoothness.md) — right-click slider from spiky to smooth,
+  preview, native persistence and one-step Undo. Implemented on the feature branch; unreleased.
+
 - [ChemDraw-compatible keybinding scheme](chemdraw-keybinding-scheme.md) — a Preferences toggle that
   remaps tools, hover hotkeys, and menu chords to match ChemDraw's defaults for migrating users;
   documents the mapping rules, what is covered, and what is deliberately unmapped.

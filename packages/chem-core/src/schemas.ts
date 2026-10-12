@@ -225,6 +225,10 @@ export const GraphicObjectDataSchema = z
     pathControlPoint: PointSchema.optional(),
     pathD: z.string().optional(),
     artPathKind: z.enum(["line", "wavy", "arc", "quadratic", "polyline", "bezier", "freehand"]).optional(),
+    // Art wavy lines: 0 = sharp zigzag, 1 = fully rounded. Absent preserves legacy geometry.
+    waveSmoothness: NormalizedCoordinateSchema.optional(),
+    waveAmplitudePx: z.number().finite().min(0).max(40).optional(),
+    waveCycles: z.number().finite().int().min(1).max(512).optional(),
     pathNodes: z.array(GraphicPathNodeSchema).min(1).optional(),
     pathClosed: z.boolean().optional(),
     freehandPoints: z.array(GraphicFreehandPointSchema).min(1).optional(),

@@ -80,3 +80,92 @@ CDXML of a pasted aromatic reopen with the same tautomer; and Spin 3D on a paste
 
 This list is repo-wide and cumulative. Add to it when a slice ships a new interactive surface; do not
 replace it with a slice-scoped list, or the standing checklist is lost when that slice ends.
+
+Auto-arrangement surfaces: select six differently sized compounds, click Arrange Selection for a
+circle, then open its flyout by long press and Arrow Down and choose Oval, Grid, Row and Column.
+Repeat with 2, 3, 7 and 12 compounds; verify equal circle angles, clearance around long atom labels,
+upright structures, and unchanged clockwise order. Group each compound with its caption and repeat;
+captions and anchored electron marks must travel with their compound, once. Check one Undo/Redo
+per arrangement, selection retained, an unselected arrow/conditions text unchanged, save/reopen,
+and matching SVG export. Near a page edge the whole layout shifts onto the page; an oversized
+layout reports that it cannot fit and changes nothing. Verify the flyout in native palettes on
+both platforms, and add/remove the control in Customize Main Toolbar without losing its routing.
+
+Auto-arrangement arrows: Circle/Oval adds one clockwise curved arrow per compound, including the
+last-to-first connection; Row/Column adds straight arrows between neighbors and Grid snakes through
+alternate rows. Check a two-compound cycle has two distinct arcs and remains on the page. Long labels
+and grouped captions must clear the arrow shaft and head. Repeat a click and Select All then arrange:
+no duplicate arrows, no generated arrow used as a compound. Switch from Circle to Grid and back:
+the previous generated arrows are replaced while hand-drawn arrows remain unchanged. Save/reopen
+retains editable geometry and duplicate prevention; SVG matches the canvas. One Undo/Redo restores
+both compound positions and generated arrows. A too-small gap refuses the whole operation.
+
+Arrangement refinements: with five fused-ring compounds, verify curves extend into empty corners
+of their molecule frames while keeping visible bonds and long labels clear. Check Grid — Centered
+puts the bottom two compounds symmetrically below the top three; Grid — Left and Grid — Right
+align that row's visible edge to the full rows. Repeat with different sizes, seven compounds, groups
+and captions. The flyout has seven distinct icons, depicting a circle, an oval, each grid alignment,
+a horizontal row, and a vertical column. Reapplying any grid alignment is stable and switching
+alignment updates its arrows once. Check native flyouts and one Undo/Redo on both platforms.
+
+### Following arrangement arrows and reaction conditions (unreleased)
+
+On both macOS and Windows, arrange five or six differently sized compounds in each layout. Drag one
+compound, drag an entire cycle, rotate/resize a compound, and move a group with its caption. Verify
+live arrow clearance, exact ellipse translation, retained stroke/head styling, and a single Undo/Redo
+for each gesture. Move endpoints together then apart: an impossible shaft hides and restores.
+Right-click a generated or manually drawn art arrow > Reaction conditions…, enter three lines,
+choose both label sides, cancel, clear, and reopen. Drag a label, move its arrow/compound, and verify
+its chosen offset follows. Double-click the label to edit and change font size; the text reflows.
+Insert degree, delta, plus/minus and micro symbols at the caret and over a selected range. Select
+formula digits for subscript and charges for superscript; reset to Normal and try script typing.
+Verify the formatted preview, Cancel, Save, Undo/Redo, dialog reopening and exported formulas without
+extra spaces. Place all five three-line labels inside a mixed-size cycle: check midpoint centering,
+nearby collision adjustments and that a label that cannot fit stays inside instead of jumping across it.
+Check Tab focus trapping, Escape cancellation, and that typing/clipboard shortcuts in the dialog
+cannot affect the canvas. Save/reopen the native document and export SVG/PNG/PDF. Repeat arrangement
+with Select All; verify no duplicate arrows or labels. Delete an endpoint/arrow or change layouts;
+verify removed connections leave authored labels as free text, with Undo restoring attachments.
+
+Arrange a tert-butyl-substituted ring with differently sized fused rings in Circle/Oval/Row/Column/
+Grid. Check ring centers line up with the cycle or row while all substituents and labels stay clear.
+Rotate a compound and repeat. Check the raised condition subscripts match between canvas, dialog
+preview, native reopen and SVG/PNG/PDF exports.
+Right-click the main arrow and attach both offshoot sides, including while Select All is active.
+Check the new fork starts tangent to the main shaft. Select it and drag the join handle along
+straight and curved parents, including near the ends and through several live previews. Check
+the contact stays on the shaft, the branch rotates with the local tangent, and the saved fraction
+survives parent edits, native reopening and one-step Undo/Redo. Older files without a contact
+fraction retain their midpoint join and saved shape, and can be slid with the same handle.
+Repeat one side (no duplicate), edit branch heads/bends/strokes, attach catalyst text, move/rotate the
+parent and drag a compound in the cycle. Check live tail attachment and condition following. Undo/
+Redo each operation, save/reopen, reorder layers and delete the parent. Authored labels survive
+orphan removal; a hidden parent shaft hides/restores branches. Near page edges, check shortened or
+refused creation and adjust heads manually if a later parent move sends them outside the page.
+
+Arrange five compounds as Oval, add conditions on an arrow replaced by Grid, then Select All and
+switch to Grid. Repeat Grid and switch through Row/Oval/Grid: there must still be five arrangement
+items, with four grid/row connectors. Detached condition text must persist without becoming an
+item or converting to an atom. Check one-step Undo/Redo. Reopen an older faulty native drawing,
+reapply Grid, and verify condition-derived connectors are removed and the text remains editable.
+
+On native macOS and Windows, draw a wavy art line and right-click > Adjust waviness….
+Slide from Spiky through intermediate positions to Smooth and check the preview. Cancel/Escape
+must discard both shape and Amplitude edits. Check Flat (zero height), intermediate heights and Tall,
+including changing height on an older line without moving its shape slider. Peaks must stay
+visible/selectable after saving and endpoint edits, with the shaft endpoints and rotation center fixed.
+
+Select a mixed-size circle, oval, row and grid. Open Adjust spacing from the arrangement flyout
+and selection context menu. Preview tighter spacing: molecule/bond/font sizes stay fixed, circle/oval
+arcs remain curved, and conditions/offshoots follow. Cancel/Escape changes nothing; Save has one
+Undo/Redo step. Check clearance/page limits and native save/reopen on macOS and Windows. On diagonal
+curves, default conditions sit perpendicular to the visible shaft midpoint, on the requested side;
+manual label offsets remain intact.
+Adjust Frequency independently and together with the other controls. Count complete waves in the
+preview and drawing at low/high settings, and check height/endpoints stay fixed. Verify the explicit
+count survives native reopening and endpoint edits, and all three controls cancel/Undo/Redo together.
+Save must be one Undo/Redo step, preserve the clicked object's endpoints/paint/selection,
+and leave other selected objects untouched. Check keyboard slider
+adjustment and Tab focus containment. Reopen an adjusted native file, resize/rotate the wave,
+add an arrowhead, and compare canvas with SVG/PNG/PDF exports. Include click-placed, vertical,
+diagonal and very short waves. Old wavy lines should keep their existing shape until adjusted.

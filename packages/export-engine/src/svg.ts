@@ -71,8 +71,8 @@ export function exportDocumentToSvg(document: ChemDraftDocument, options: SvgExp
   };
 }
 
-function serializeSvgFragment(fragment: PageSvgFragment, indent: number): string {
-  const pad = " ".repeat(indent);
+function serializeSvgFragment(fragment: PageSvgFragment, indent: number, inline = false): string {
+  const pad = inline ? "" : " ".repeat(indent);
   if (fragment.kind === "text") {
     return `${pad}${escapeXml(fragment.text)}`;
   }
@@ -82,6 +82,12 @@ function serializeSvgFragment(fragment: PageSvgFragment, indent: number): string
   }
 
   const attrs = serializeSvgAttributes(fragment.attrs);
+  // Pretty-printing between tspans inserts visible spaces into formatted formulas.
+  // Keep every descendant of SVG text inline, preserving only authored whitespace.
+  if (inline || fragment.tag === "text" || fragment.tag === "tspan") {
+    const content = fragment.children.map(child => serializeSvgFragment(child, 0, true)).join("");
+    return `${pad}<${fragment.tag}${attrs}>${content}</${fragment.tag}>`;
+  }
   const children = fragment.children
     .map((child) => serializeSvgFragment(child, indent + 2))
     .filter((child) => child.length > 0);

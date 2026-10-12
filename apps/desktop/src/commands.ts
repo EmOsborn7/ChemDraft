@@ -20,10 +20,14 @@ import {
   SHAFT_MARK_SIZE_MIN_PX
 } from "@chemdraft/art-engine";
 import type { CommandDefinition } from "@chemdraft/plugin-host";
+import { ArrangementLayouts, ArrangementGridAlignments, type ArrangementLayout, type ArrangementGridAlignment } from "@chemdraft/layout-engine";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
 import {
   nativeHotkeyElements,
   selectedGroupObjectIds,
+  selectedArrangementObjectIds,
+  reactionConditionArrow,
+  wavyLineForAdjustment,
   selectedArtBooleanEligibleObjectIds,
   type NativeHotkeyElement
 } from "./documentWorkflow";
@@ -658,6 +662,24 @@ export const distributeModeCommandIds = {
   centers: "layout.distribute.mode.centers",
   spacing: "layout.distribute.mode.spacing"
 } as const;
+
+export const arrangementLayoutLabels: Record<ArrangementLayout, string> = {
+  circle: "Circle", oval: "Oval", grid: "Grid", row: "Row", column: "Column"
+};
+export function arrangementCommandId(layout: ArrangementLayout, gridAlignment: ArrangementGridAlignment = "center"): string {
+  return `layout.arrange.${layout}${layout === "grid" && gridAlignment !== "center" ? `.${gridAlignment}` : ""}`;
+}
+export function arrangementLayoutForCommand(commandId: string): ArrangementLayout | undefined {
+  if (commandId === arrangementCommandId("grid", "left") || commandId === arrangementCommandId("grid", "right")) return "grid";
+  return ArrangementLayouts.find((layout) => arrangementCommandId(layout) === commandId);
+}
+export function arrangementGridAlignmentForCommand(commandId: string): ArrangementGridAlignment | undefined {
+  return ArrangementGridAlignments.find((alignment) => arrangementCommandId("grid", alignment) === commandId);
+}
+export function arrangementIconName(layout: ArrangementLayout, gridAlignment: ArrangementGridAlignment = "center"): IconName {
+  if (layout === "grid") return gridAlignment === "left" ? "arrangeGridLeft" : gridAlignment === "right" ? "arrangeGridRight" : "arrangeGridCenter";
+  return { circle: "arrange", oval: "arrangeOval", row: "arrangeRow", column: "arrangeColumn" }[layout] as IconName;
+}
 
 export type ObjectPaintType = "none" | "solid" | "linear-gradient" | "radial-gradient" | "gloss";
 
@@ -1859,13 +1881,39 @@ export function textStylePatchForCommand(
   return undefined;
 }
 
-export function createLayerActions(document: ChemDraftDocument): CommandSpec[] {
+export function createLayerActions(document: ChemDraftDocument, contextObjectId?: string): CommandSpec[] {
   const hasSelection = document.selection.objectIds.length > 0;
   const hasMultiSelection = document.selection.objectIds.length >= 2;
   const hasDistributableSelection = document.selection.objectIds.length >= 3;
   const hasSelectedGroup = selectedGroupObjectIds(document).length > 0;
   const hasBooleanSelection = selectedArtBooleanEligibleObjectIds(document).length >= 2;
+  const hasArrangementSelection = selectedArrangementObjectIds(document).length >= 2;
+  const conditionTargetId = contextObjectId ?? (document.selection.objectIds.length === 1 ? document.selection.objectIds[0] : undefined);
   return [
+    {id:"layout.adjustArrangementSpacing",title:"Adjust arrangement spacing…",icon:"align",source:"core",category:"layout",
+      enabled:hasArrangementSelection,disabledReason:"Select at least two objects or groups",
+      description:"Bring the arrangement closer together or farther apart while keeping molecule sizes fixed"},
+    {id:"art.adjustWaviness",title:"Adjust waviness…",icon:"style",source:"core",category:"art",
+      enabled:!!conditionTargetId && !!wavyLineForAdjustment(document,conditionTargetId),
+      disabledReason:"Select one wavy line",description:"Adjust a wavy line from spiky to smooth"},
+    {id: "reaction.conditions", title: "Reaction conditions…", icon: "text", source: "core", category: "layout",
+      enabled: !!conditionTargetId && !!reactionConditionArrow(document, conditionTargetId),
+      disabledReason: "Select one arrow or reaction-condition label", description: "Add or edit conditions attached to an arrow"},
+    ...(["outside","inside"] as const).map((side):CommandSpec=>({
+      id:`reaction.offshoot.${side}`,title:`Attach offshoot — ${side==="outside" ? "top / outside" : "bottom / inside"}`,
+      icon:"mechanism",source:"core",category:"layout",enabled:!!conditionTargetId && !!reactionConditionArrow(document,conditionTargetId),
+      disabledReason:"Select one arrow or reaction-condition label",description:"Attach an editable catalyst or reagent branch to the selected arrow"
+    })),
+    ...ArrangementLayouts.flatMap((layout) => (layout === "grid" ? ArrangementGridAlignments : ["center"] as const).map((gridAlignment): CommandSpec => ({
+      id: arrangementCommandId(layout, gridAlignment),
+      title: `Arrange in ${layout === "oval" ? "an" : "a"} ${arrangementLayoutLabels[layout]}${layout === "grid" ? ` (${gridAlignment === "center" ? "Centered" : gridAlignment === "left" ? "Left" : "Right"})` : ""}`,
+      icon: arrangementIconName(layout, gridAlignment),
+      source: "core",
+      category: "layout",
+      enabled: hasArrangementSelection,
+      disabledReason: "Select at least two objects or groups",
+      description: `Arrange the selection in ${layout === "oval" ? "an" : "a"} ${layout} with ${layout === "circle" || layout === "oval" ? "curved" : "straight"} connecting arrows`
+    }))),
     {
       id: "layout.alignLeft",
       title: "Align Left",

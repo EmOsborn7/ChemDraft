@@ -1,9 +1,22 @@
 import {
+  planArrangementArrows,
+  arrangementArrowBend,
+  planFollowingArrangementArrow,
+  planReactionConditionLabel,
+  planReactionOffshoot,
+  captureReactionOffshootGeometry,
+  reactionArrowContactParameter,
+  reactionOffshootObstacleBounds,
+  type ReactionOffshootGeometry,
+  type ArrangementArrowItem,
+  arrangementArrowPadding,
+  type ArrangementArrowPlan,
   editGraphicMarkerSize,
   snapGraphicMarkerSizePx,
   clampGraphicShaftMarkSizePx,
   editGraphicCornerRadius,
   editGraphicPathGeometry,
+  editWavyLineAppearance,
   deleteGraphicPathNode,
   deleteGraphicPathSegment,
   splitGraphicPathSegmentAtPoint,
@@ -12,6 +25,7 @@ import {
   graphicCornerRadiusEditPoint,
   graphicObjectSupportsBooleanOperation,
   graphicPathEditPoints,
+  graphicPathVisualEditPoints,
   graphicPathNodeEditPoints,
   inactiveVisualEffectsForStyle,
   mergeVisualEffectsByKind,
@@ -114,6 +128,13 @@ import {
   type TextExportResult
 } from "@chemdraft/export-engine";
 import {
+  planObjectArrangement,
+  moleculeVisualBoundsForArrangement,
+  moleculeAnchorForArrangement,
+  moleculeOutlinePointsForArrangement,
+  type ArrangementLayout,
+  type LayoutBounds,
+  type ArrangementOptions,
   findNearestAtomAtPoint,
   findNearestBondHit,
   moleculeFillCycleKey,
@@ -2247,6 +2268,23 @@ export function nativeGraphicRadialGradientHandlePoints(
   };
 }
 
+export function wavyLineForAdjustment(document:ChemDraftDocument,objectId:string):GraphicObject|undefined {
+  const object=findDocumentObject(document,objectId);
+  return object?.type==="graphic" && graphicPathEditPoints(object)?.pathKind==="wavy" ? object : undefined;
+}
+
+export function setWavyLineSmoothness(document:ChemDraftDocument,objectId:string,smoothness:number|undefined):ChemDraftDocument {
+  return setWavyLineSettings(document,objectId,{smoothness});
+}
+
+export function setWavyLineSettings(document:ChemDraftDocument,objectId:string,settings:{smoothness?:number;amplitudePx?:number;cycles?:number}):ChemDraftDocument {
+  const object=wavyLineForAdjustment(document,objectId);
+  if (!object) return document;
+  const edited=editWavyLineAppearance(object,settings);
+  if(!edited || edited===object) return document;
+  return applyPatch(document,{op:"updateObject",objectId,changes:edited},{now:phase4Timestamp});
+}
+
 export function updateNativeGraphicPathHandle(
   document: ChemDraftDocument,
   objectId: string,
@@ -2256,6 +2294,19 @@ export function updateNativeGraphicPathHandle(
   const object = findDocumentObject(document, objectId);
   if (!object || object.type !== "graphic") {
     return document;
+  }
+
+  const attachment=reactionOffshootAttachment(object);
+  const parent=attachment && findDocumentObject(document,attachment.parentArrowId);
+  const parentPath=parent?.type==="graphic" ? graphicPathVisualEditPoints(parent) : undefined;
+  if (handle==="start" && attachment && parentPath && !attachment.blocked) {
+    const geometry={...attachment.geometry,contactT:reactionArrowContactParameter(parentPath,point)};
+    if (Math.abs(geometry.contactT-(attachment.geometry.contactT ?? 0.5))<1e-8) return document;
+    const plan=planReactionOffshoot(parentPath,attachment.side,geometry);
+    return applyPatch(document,{op:"updateObject",objectId,changes:{...plan.bounds,rotation:0,
+      data:{...plan.data,markerStart:object.data.markerStart,markerEnd:object.data.markerEnd},
+      compatibility:{...object.compatibility!,unknown:{...object.compatibility!.unknown,
+        reactionOffshoot:{...attachment,geometry}}}}},{now:phase4Timestamp});
   }
 
   const edited = editGraphicPathGeometry(object, handle, point);
@@ -4041,7 +4092,7 @@ export function convertNativeTextObjectToAtom(
   const object = page.objects.find((candidate): candidate is TextObject =>
     candidate.id === objectId && candidate.type === "text"
   );
-  if (!object) {
+  if (!object || isReactionConditionLabel(object)) {
     return document;
   }
 
@@ -8499,7 +8550,9 @@ export function getSelectedObject(document: ChemDraftDocument): DocumentObject |
   return undefined;
 }
 
-function textObjectSpansForTextChange(object: TextObject, nextText: string): TextSpan[] {
+export function textObjectSpansForTextChange(
+  object: Pick<TextObject, "text" | "spans">, nextText: string, insertionScript?: TextSpan["script"]
+): TextSpan[] {
   if (object.text === nextText) {
     return textObjectSpansForWorkflow(object);
   }
@@ -8531,14 +8584,14 @@ function textObjectSpansForTextChange(object: TextObject, nextText: string): Tex
   return normalizeTextSpans([
     ...textSpansForRange(currentSpans, 0, prefixLength),
     ...(insertedText.length > 0
-      ? [{ text: insertedText, script: insertionSpan.script, style: { ...insertionSpan.style } }]
+      ? [{ text: insertedText, script: insertionScript ?? insertionSpan.script, style: { ...insertionSpan.style } }]
       : []),
     ...textSpansForRange(currentSpans, object.text.length - suffixLength, object.text.length)
   ]);
 }
 
-function updateTextObjectSpansInRange(
-  object: TextObject,
+export function updateTextObjectSpansInRange(
+  object: Pick<TextObject, "text" | "spans">,
   range: NativeTextSelectionRange,
   updateSpan: (span: TextSpan) => TextSpan
 ): TextSpan[] {
@@ -8581,7 +8634,7 @@ function updateTextObjectSpansInRange(
   return normalizeTextSpans(nextSpans);
 }
 
-function textObjectSpansForWorkflow(object: TextObject): TextSpan[] {
+function textObjectSpansForWorkflow(object: Pick<TextObject, "text" | "spans">): TextSpan[] {
   const spans = normalizeTextSpans(object.spans);
   if (spans.length > 0 && spans.map((span) => span.text).join("") === object.text) {
     return spans;
@@ -8658,7 +8711,7 @@ function textSpanStylesEqual(first: TextSpan["style"], second: TextSpan["style"]
   return firstKeys.length === secondKeys.length && firstKeys.every((key) => first[key] === second[key]);
 }
 
-function textObjectUniformScript(object: TextObject): TextSpan["script"] {
+function textObjectUniformScript(object: Pick<TextObject, "text" | "spans">): TextSpan["script"] {
   const spans = textObjectSpansForWorkflow(object);
   if (spans.length === 0) {
     return "normal";
@@ -10451,7 +10504,7 @@ export function moveDocumentObject(
     return document;
   }
   const patches = moveDocumentObjectPatches(page, object, position, options);
-  return patches.length === 0 ? document : applyPatches(document, patches, { now: phase4Timestamp });
+  return patches.length === 0 ? document : reconcileReactionConnections(document, applyPatches(document, patches, { now: phase4Timestamp }));
 }
 
 /**
@@ -12238,12 +12291,502 @@ export function moveDocumentObjects(
         })
       : []
   );
-  return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+  return patches.length > 0 ? reconcileReactionConnections(document, applyPatches(document, patches, { now: phase4Timestamp })) : document;
 }
 
 export type DocumentAlignMode = "left" | "center" | "right" | "top" | "middle" | "bottom";
 export type DocumentDistributeAxis = "horizontal" | "vertical";
 export type DocumentDistributeMode = "centers" | "spacing";
+
+/** Groups are single items; their selected descendants and attached marks must not move twice. */
+export function selectedArrangementObjectIds(document: ChemDraftDocument): string[] {
+  const page = selectionPage(document);
+  const selected = selectionLayoutObjects(document);
+  const objects = objectByIdIndex(page.objects);
+  const contained = new Set<string>();
+  const includeDescendant = (id: string) => {
+    if (contained.has(id)) return;
+    contained.add(id);
+    const object = objects.get(id);
+    if (object?.type === "group") object.childObjectIds.forEach(includeDescendant);
+  };
+  selected.forEach((object) => {
+    if (object.type === "group") object.childObjectIds.forEach(includeDescendant);
+  });
+  const roots = selected.filter((object) => !arrangementConnectorEndpoints(object) && !reactionOffshootAttachment(object) && !isReactionConditionLabel(object) && !contained.has(object.id) &&
+    (object.type !== "group" || resolveGroupedDocumentObjectIds(page.objects, [object.id]).length > 0));
+  const carried = cascadeCarriedAnchoredMarkIds(page.objects, new Set(roots.flatMap((object) =>
+    resolveGroupedDocumentObjectIds(page.objects, [object.id])
+  )));
+  return roots.filter((object) => !carried.has(object.id)).map((object) => object.id);
+}
+
+export function arrangeSelectedDocumentObjects(
+  document: ChemDraftDocument,
+  layout: ArrangementLayout,
+  options: Pick<ArrangementOptions, "gap" | "columns" | "gridAlignment"> & { addArrows?: boolean } = {}
+): { document: ChemDraftDocument; status: string } {
+  const page = selectionPage(document);
+  const items = selectedArrangementObjectIds(document).map((id) => arrangementItem(page.objects, id)!);
+  const plan = planObjectArrangement(items, layout, {
+    ...options, ...(options.addArrows ? { cyclePadding: arrangementArrowPadding } : {}),
+    pageBounds: { x: 0, y: 0, width: page.width, height: page.height }
+  });
+  if (!plan.ok) {
+    return { document, status: plan.reason === "selection" ? "Select at least two objects or groups" :
+      plan.reason === "page" ? "This arrangement does not fit on the page. Try a grid or a larger page." :
+      "Cannot arrange this selection: invalid bounds or spacing." };
+  }
+  // Snake through alternating grid rows: every connector is straight and row transitions stay
+  // beside the grid rather than cutting diagonally through intermediate compounds.
+  let connectionOrder = plan.placements;
+  if (layout === "grid") {
+    const columns = Math.min(items.length, options.columns ?? Math.ceil(Math.sqrt(items.length)));
+    connectionOrder = [];
+    for (let start = 0, row = 0; start < plan.placements.length; start += columns, row++) {
+      const entries = plan.placements.slice(start, start + columns);
+      connectionOrder.push(...(row % 2 ? entries.reverse() : entries));
+    }
+  }
+  const outlines = new Map(items.map((item) => [item.id, item.outline]));
+  const arrowItems = connectionOrder.map((item) => ({ ...item,
+    outline: outlines.get(item.id)!.map((p) => ({ x: p.x + item.dx, y: p.y + item.dy }))
+  }));
+  const arrows = options.addArrows ? planArrangementArrows(arrowItems, plan.cycle) : [];
+  if (!arrows || arrows.some(({ bounds }) => bounds.x < 0 || bounds.y < 0 ||
+      bounds.x + bounds.width > page.width || bounds.y + bounds.height > page.height)) {
+    return { document, status: "There is not enough room for connecting arrows. Try a larger gap or page." };
+  }
+  const moves = plan.placements.flatMap((placement) =>
+    selectionLayoutItemMoves(page.objects, placement.id, placement.dx, placement.dy)
+  );
+  const moved = applyLayoutItemMoves(document, moves);
+  const connected = options.addArrows ? syncArrangementArrows(moved, page.id, new Set(items.map((item) => item.id)), arrows) : moved;
+  const next = reconcileReactionConnections(document, connected);
+  return { document: next, status: next === document ? "Selection is already arranged" :
+    `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}${options.addArrows ? ` with ${arrows.length} arrows` : ""}` };
+}
+
+/** Change distances between item anchors by translation, with every item kept at its original size. */
+export function adjustArrangementSpacing(document:ChemDraftDocument,factor:number):{document:ChemDraftDocument;ok:boolean;status:string} {
+  const fail=(status:string)=>({document,ok:false,status});
+  if(!Number.isFinite(factor) || factor<=0) return fail("Choose a valid spacing");
+  const page=selectionPage(document),ids=selectedArrangementObjectIds(document);
+  if(ids.length<2) return fail("Select at least two compounds or groups");
+  if(Math.abs(factor-1)<1e-9) return {document,ok:true,status:"Original spacing"};
+  const items=ids.map(id=>arrangementItem(page.objects,id)!);
+  const anchors=items.map(item=>item.anchor ?? {x:item.bounds.x+item.bounds.width/2,y:item.bounds.y+item.bounds.height/2});
+  const center={x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length};
+  const deltas=anchors.map(p=>({x:(p.x-center.x)*(factor-1),y:(p.y-center.y)*(factor-1)}));
+  const placed=items.map((item,i)=>({...item,bounds:{...item.bounds,x:item.bounds.x+deltas[i].x,y:item.bounds.y+deltas[i].y},
+    ...(item.anchor ? {anchor:{x:item.anchor.x+deltas[i].x,y:item.anchor.y+deltas[i].y}} : {}),
+    outline:item.outline?.map(p=>({x:p.x+deltas[i].x,y:p.y+deltas[i].y}))}));
+  if(placed.some(({bounds:b})=>b.x<0 || b.y<0 || b.x+b.width>page.width || b.y+b.height>page.height))
+    return fail("This spacing would extend beyond the page");
+  for(let i=0;i<placed.length;i++) for(let j=i+1;j<placed.length;j++) {
+    const a=placed[i].bounds,b=placed[j].bounds;
+    if(a.x<b.x+b.width+12 && a.x+a.width>b.x-12 && a.y<b.y+b.height+12 && a.y+a.height>b.y-12)
+      return fail("The compounds need more space between them");
+  }
+  const moves=ids.flatMap((id,i)=>selectionLayoutItemMoves(page.objects,id,deltas[i].x,deltas[i].y));
+  let moved=applyLayoutItemMoves(document,moves);
+  const selected=new Set(ids);
+  const connectors=page.objects.filter((o):o is GraphicObject=>{
+    const e=arrangementConnectorEndpoints(o);return o.type==="graphic" && !!e && selected.has(e.fromId) && selected.has(e.toId);
+  });
+  // Preserve a complete circular/oval cycle exactly, clipping its new arcs around fixed-size compounds.
+  const first=connectors[0],data=first?.data,c=data?.arcCenter;
+  if(connectors.length===ids.length && c && typeof data.arcRadiusX==="number" && typeof data.arcRadiusY==="number" &&
+      connectors.every(o=>o.data.artPathKind==="arc" && o.data.arcRadiusX===data.arcRadiusX && o.data.arcRadiusY===data.arcRadiusY &&
+        o.data.arcCenter?.x===c.x && o.data.arcCenter?.y===c.y)) {
+    const byFrom=new Map(connectors.map(o=>[arrangementConnectorEndpoints(o)!.fromId,o]));
+    const order:string[]=[],seen=new Set<string>();let id=ids[0];
+    while(!seen.has(id) && byFrom.has(id)) {seen.add(id);order.push(id);id=arrangementConnectorEndpoints(byFrom.get(id)!)!.toId;}
+    if(order.length===ids.length && id===ids[0]) {
+      const map=new Map(placed.map(item=>[item.id,item]));
+      const arrows=planArrangementArrows(order.map(id=>map.get(id)!),{center:{x:center.x+(c.x-center.x)*factor,y:center.y+(c.y-center.y)*factor},
+        radiusX:data.arcRadiusX*factor,radiusY:data.arcRadiusY*factor});
+      if(!arrows) return fail("The connecting arrows need more space");
+      for(const plan of arrows) {const original=byFrom.get(plan.fromId)!;
+        plan.data={...plan.data,markerStart:original.data.markerStart,markerEnd:original.data.markerEnd ?? plan.data.markerEnd};}
+      moved=syncArrangementArrows(moved,page.id,selected,arrows);
+    }
+  }
+  const result=reconcileReactionConnections(document,moved);
+  const updated=result.pages.find(p=>p.id===page.id)!;
+  for(const object of page.objects) {
+    const e=arrangementConnectorEndpoints(object);
+    if(!e || (!selected.has(e.fromId) && !selected.has(e.toId))) continue;
+    if(!arrangementItem(page.objects,e.fromId) || !arrangementItem(page.objects,e.toId)) continue;
+    const next=updated.objects.find(o=>o.id===object.id);
+    if(next?.type!=="graphic") return fail("The connecting arrows need more space");
+    if(next.x<0 || next.y<0 || next.x+next.width>page.width || next.y+next.height>page.height)
+      return fail("This spacing would extend beyond the page");
+    const path=graphicPathVisualEditPoints(next);
+    const head=Math.max(next.data.markerStart?.sizePx ?? 0,next.data.markerEnd?.sizePx ?? 0,12);
+    if(!path || Math.hypot(path.end.x-path.start.x,path.end.y-path.start.y)<head+6 ||
+      (next.compatibility?.unknown.arrangementConnector as {blocked?:boolean})?.blocked)
+      return fail("The connecting arrows need more space");
+  }
+  return {document:result,ok:true,status:`Spacing adjusted to ${Math.round(factor*100)}%`};
+}
+
+export function arrangementSpacingRange(document:ChemDraftDocument):{min:number;max:number} {
+  const boundary=(a:number,b:number,increasing:boolean)=>{
+    for(let i=0;i<9;i++) {const mid=(a+b)/2,ok=adjustArrangementSpacing(document,mid).ok;
+      if(ok===increasing) a=mid;else b=mid;}
+    return increasing ? Math.floor(a*100)/100 : Math.ceil(b*100)/100;
+  };
+  return {min:adjustArrangementSpacing(document,0.25).ok ? 0.25 : boundary(0.25,1,false),
+    max:adjustArrangementSpacing(document,1.5).ok ? 1.5 : boundary(1,1.5,true)};
+}
+
+export function arrangementSpacingPreviewBounds(document:ChemDraftDocument):LayoutBounds|undefined {
+  const page=selectionPage(document),items=selectedArrangementObjectIds(document).flatMap(id=>arrangementItem(page.objects,id) ?? []);
+  if(!items.length) return undefined;
+  const x=Math.min(...items.map(i=>i.bounds.x)),y=Math.min(...items.map(i=>i.bounds.y));
+  return {x,y,width:Math.max(...items.map(i=>i.bounds.x+i.bounds.width))-x,height:Math.max(...items.map(i=>i.bounds.y+i.bounds.height))-y};
+}
+
+function arrangementItem(pageObjects: readonly DocumentObject[], id: string): ArrangementArrowItem | undefined {
+    const objects = objectByIdIndex(pageObjects);
+    if (!objects.has(id) || isReactionConditionLabel(objects.get(id)!)) return undefined;
+    const members = [...expandWithAnchoredMarkIds(pageObjects, resolveGroupedDocumentObjectIds(pageObjects, [id]))]
+      .map((memberId) => objects.get(memberId))
+      .filter((object): object is DocumentObject => object !== undefined && object.type !== "group");
+    const visibleMembers = members.length > 0 ? members : [objects.get(id)!];
+    const boxes = visibleMembers.map((object) =>
+      object.type === "molecule" ? moleculeVisualBoundsForArrangement(object) : documentObjectVisualBounds(object)
+    );
+    const x = Math.min(...boxes.map((b) => b.x)), y = Math.min(...boxes.map((b) => b.y));
+    const outline = visibleMembers.flatMap((object) => {
+      if (object.type === "molecule") return moleculeOutlinePointsForArrangement(object);
+      const b = documentObjectVisualBounds(object);
+      return [{ x: b.x, y: b.y }, { x: b.x + b.width, y: b.y }, { x: b.x + b.width, y: b.y + b.height }, { x: b.x, y: b.y + b.height }];
+    });
+    const moleculeMembers=visibleMembers.filter((object):object is MoleculeObject=>object.type==="molecule");
+    const anchors=moleculeMembers.map(moleculeAnchorForArrangement);
+    const anchor=anchors.length ? {x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,
+      y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length} : undefined;
+    return { id, outline, ...(anchor ? {anchor} : {}), bounds: {
+      x, y,
+      width: Math.max(...boxes.map((b) => b.x + b.width)) - x,
+      height: Math.max(...boxes.map((b) => b.y + b.height)) - y
+    } };
+}
+
+export function arrangementConnectorEndpoints(object: DocumentObject): { fromId: string; toId: string } | undefined {
+  if (object.type !== "graphic") return undefined;
+  const value = object.compatibility?.unknown.arrangementConnector;
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return record.version === 1 && typeof record.fromId === "string" && typeof record.toId === "string"
+    ? { fromId: record.fromId, toId: record.toId } : undefined;
+}
+
+/** Persistent endpoint metadata lets a second click or layout switch replace generated arrows,
+ * while preserving hand-drawn arrows and the generated arrows' editable stroke styles. */
+function syncArrangementArrows(
+  document: ChemDraftDocument, pageId: string, itemIds: ReadonlySet<string>, plans: readonly ArrangementArrowPlan[]
+): ChemDraftDocument {
+  const page = document.pages.find((entry) => entry.id === pageId)!;
+  const existing = page.objects.filter((object): object is GraphicObject => {
+    const endpoints = arrangementConnectorEndpoints(object);
+    return object.type === "graphic" && !!endpoints && itemIds.has(endpoints.fromId) && itemIds.has(endpoints.toId);
+  });
+  const available = [...existing];
+  const retained = new Set<string>();
+  const reserved = new Set<string>();
+  const patches: DocumentPatch[] = [];
+  for (const plan of plans) {
+    const index = available.findIndex((object) => {
+      const endpoints = arrangementConnectorEndpoints(object)!;
+      return endpoints.fromId === plan.fromId && endpoints.toId === plan.toId;
+    });
+    const previous = index >= 0 ? available.splice(index, 1)[0] : undefined;
+    const id = previous?.id ?? nextObjectId(document, "arrangement_arrow", reserved);
+    reserved.add(id);
+    retained.add(id);
+    const object: GraphicObject = {
+      id, type: "graphic", graphicKind: "path", ...plan.bounds, rotation: 0,
+      style: previous?.style ?? { strokeColor: "#000000", strokeWidth: 2, strokeLineCap: "butt", fillColor: "none" },
+      data: plan.data,
+      compatibility: { ...previous?.compatibility, sourceFormat: "chemdraft-native", warnings: previous?.compatibility?.warnings ?? [],
+        unknown: { ...previous?.compatibility?.unknown, arrangementConnector: { version: 1, fromId: plan.fromId, toId: plan.toId,
+          bend: arrangementArrowBend(plan.data, arrangementItem(page.objects, plan.fromId)!.bounds, arrangementItem(page.objects, plan.toId)!.bounds,
+            arrangementItem(page.objects,plan.fromId)!.anchor,arrangementItem(page.objects,plan.toId)!.anchor),
+          attachmentKey: arrangementAttachmentKey(arrangementItem(page.objects, plan.fromId)!, arrangementItem(page.objects, plan.toId)!) } } }
+    };
+    if (!previous) patches.push({ op: "addObject", pageId, object });
+    else if (!sameArrangementArrowGeometry(previous, object)) patches.push({ op: "updateObject", objectId: id, changes: object });
+  }
+  patches.push(...existing.filter((object) => !retained.has(object.id)).map((object): DocumentPatch => ({ op: "removeObject", objectId: object.id })));
+  return patches.length ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+}
+
+function sameArrangementArrowGeometry(a: GraphicObject, b: GraphicObject): boolean {
+  const sameValue = (x: unknown, y: unknown): boolean => {
+    if (typeof x === "number" && typeof y === "number") return Math.abs(x - y) < 1e-7;
+    if (x && y && typeof x === "object" && typeof y === "object") {
+      const left = x as Record<string, unknown>, right = y as Record<string, unknown>;
+      return Object.keys(left).length === Object.keys(right).length && Object.keys(left).every((key) => sameValue(left[key], right[key]));
+    }
+    return x === y;
+  };
+  return sameValue([a.x, a.y, a.width, a.height, a.rotation, a.data, a.compatibility,a.style.tiltXDegrees,a.style.tiltYDegrees],
+    [b.x, b.y, b.width, b.height, b.rotation, b.data, b.compatibility,b.style.tiltXDegrees,b.style.tiltYDegrees]);
+}
+
+interface ReactionOffshootAttachment {
+  version:1; parentArrowId:string; side:1|-1; geometry:ReactionOffshootGeometry;
+  blocked?:boolean; savedMarkers?:Pick<GraphicObjectData,"markerStart"|"markerEnd">;
+}
+export function reactionOffshootAttachment(object:DocumentObject):ReactionOffshootAttachment|undefined {
+  if (object.type!=="graphic") return undefined;
+  const value=object.compatibility?.unknown.reactionOffshoot as Partial<ReactionOffshootAttachment>|undefined;
+  const validPoint=(p:unknown)=> !!p && typeof p==="object" &&
+    Number.isFinite((p as {along:number}).along) && Number.isFinite((p as {normal:number}).normal);
+  return value?.version===1 && typeof value.parentArrowId==="string" && (value.side===1 || value.side===-1) &&
+    (value.geometry?.contactT===undefined || (Number.isFinite(value.geometry.contactT) && value.geometry.contactT>=0 && value.geometry.contactT<=1)) &&
+    validPoint(value.geometry?.end) && validPoint(value.geometry?.middle) ? value as ReactionOffshootAttachment : undefined;
+}
+export function attachReactionOffshoot(document:ChemDraftDocument,arrowId:string,side:1|-1):{document:ChemDraftDocument;status:string} {
+  const parent=reactionConditionArrow(document,arrowId);
+  if (!parent) return {document,status:"Select an arrow to attach an offshoot"};
+  const page=document.pages.find(p=>p.objects.some(o=>o.id===parent.id))!;
+  if (page.objects.some(o=>{const a=reactionOffshootAttachment(o);return a?.parentArrowId===parent.id && a.side===side;}))
+    return {document,status:"This arrow already has an offshoot on that side. Edit its handles to adjust it."};
+  const path=graphicPathVisualEditPoints(parent)!;
+  if (Math.hypot(path.end.x-path.start.x,path.end.y-path.start.y)<1e-6)
+    return {document,status:"This arrow has no visible shaft to attach to"};
+  for (const length of [40,28,20]) {
+    const geometry={contactT:0.5,end:{along:length,normal:side*length*0.65},middle:{along:length/2,normal:side*length*0.65/4}};
+    const plan=planReactionOffshoot(path,side,geometry),b=plan.bounds;
+    if (b.x<0 || b.y<0 || b.x+b.width>page.width || b.y+b.height>page.height) continue;
+    const style={...parent.style};delete style.tiltXDegrees;delete style.tiltYDegrees;
+    const object:GraphicObject={id:nextObjectId(document,"reaction_offshoot"),type:"graphic",graphicKind:"path",
+      ...b,rotation:0,style,data:plan.data,
+      compatibility:{sourceFormat:"chemdraft-native",warnings:[],unknown:{reactionOffshoot:{version:1,parentArrowId:parent.id,side,geometry}}}};
+    return {document:applyPatches(document,[{op:"addObject",pageId:page.id,object}],{now:phase4Timestamp}),
+      status:`Attached ${side===1 ? "outside" : "inside"} offshoot`};
+  }
+  return {document,status:"No room for an offshoot on this side. Move the arrow away from the page edge."};
+}
+
+function reconcileReactionOffshoots(oldPage:DocumentPage,page:DocumentPage):DocumentPatch[] {
+  const objects=new Map(page.objects.map(o=>[o.id,o])),oldObjects=new Map(oldPage.objects.map(o=>[o.id,o]));
+  const resolved=new Map<string,DocumentObject|undefined>(),visiting=new Set<string>();
+  const resolve=(id:string,depth=0):DocumentObject|undefined=>{
+    if (resolved.has(id)) return resolved.get(id);
+    const object=objects.get(id),attachment=object && reactionOffshootAttachment(object);
+    if (!object || !attachment || object.type!=="graphic") return object;
+    if (depth>32 || visiting.has(id)) return undefined;
+    visiting.add(id);
+    const parent=resolve(attachment.parentArrowId,depth+1),oldParent=oldObjects.get(attachment.parentArrowId),oldObject=oldObjects.get(id);
+    let next:GraphicObject|undefined;
+    if (parent?.type==="graphic") {
+      const parentPath=graphicPathVisualEditPoints(parent);
+      if (parentPath) {
+        const flattened=prepareGraphicPathObjectForDirectEdit(object);
+        const manuallyEdited=oldObject?.type==="graphic" && (!sameArrangementArrowGeometry(oldObject,object) || flattened!==object);
+        const parentChanged=oldParent?.type!=="graphic" || !sameArrangementArrowGeometry(oldParent,parent);
+        const childPath=graphicPathVisualEditPoints(object);
+        const oldAttachment=oldObject && reactionOffshootAttachment(oldObject);
+        const contactChanged=oldAttachment && attachment.geometry.contactT!==oldAttachment.geometry.contactT;
+        const geometry=manuallyEdited && !parentChanged && !contactChanged && !attachment.blocked && childPath
+          ? captureReactionOffshootGeometry(parentPath,childPath,attachment.geometry.contactT ?? 0.5) : attachment.geometry;
+        const plan=planReactionOffshoot(parentPath,attachment.side,geometry);
+        const blocked=Math.hypot(parentPath.end.x-parentPath.start.x,parentPath.end.y-parentPath.start.y)<1e-6;
+        const markers=attachment.blocked && attachment.savedMarkers ? attachment.savedMarkers :
+          {markerStart:object.data.markerStart,markerEnd:object.data.markerEnd};
+        next={...object,...plan.bounds,rotation:0,style:flattened.style,data:blocked ? {artPathKind:"line",lineStart:parentPath.start,lineEnd:parentPath.start} : {...plan.data,...markers},
+          compatibility:{...object.compatibility!,unknown:{...object.compatibility!.unknown,reactionOffshoot:{...attachment,geometry,blocked,savedMarkers:markers}}}};
+      }
+    }
+    visiting.delete(id);resolved.set(id,next);return next;
+  };
+  return page.objects.flatMap((object):DocumentPatch[]=>{
+    if (!reactionOffshootAttachment(object) || object.type!=="graphic") return [];
+    const next=resolve(object.id);
+    if (!next) return [{op:"removeObject",objectId:object.id}];
+    return next.type==="graphic" && !sameArrangementArrowGeometry(object,next) ? [{op:"updateObject",objectId:object.id,changes:next}] : [];
+  });
+}
+
+interface ReactionConditionAttachment {
+  version: 1; arrowId: string; side: 1 | -1; offsetX: number; offsetY: number;
+}
+/** Semantic identity survives losing a parent arrow. Earlier branch files removed the attachment
+ * entirely; their generated native label IDs provide provenance without guessing from the text. */
+export function isReactionConditionLabel(object:DocumentObject):boolean {
+  return object.type==="text" && (!!reactionConditionAttachment(object) ||
+    object.compatibility?.unknown.reactionConditionRole===1 ||
+    (object.compatibility?.sourceFormat==="chemdraft-native" && /^reaction_conditions_\d+$/.test(object.id)));
+}
+export function reactionConditionAttachment(object: DocumentObject): ReactionConditionAttachment | undefined {
+  if (object.type !== "text") return undefined;
+  const value = object.compatibility?.unknown.reactionCondition as Partial<ReactionConditionAttachment> | undefined;
+  return value?.version === 1 && typeof value.arrowId === "string" && (value.side === 1 || value.side === -1) &&
+    Number.isFinite(value.offsetX) && Number.isFinite(value.offsetY) ? value as ReactionConditionAttachment : undefined;
+}
+export function reactionConditionArrow(document: ChemDraftDocument, objectId: string): GraphicObject | undefined {
+  const object = findDocumentObject(document, objectId);
+  const arrow = object && reactionConditionAttachment(object)
+    ? findDocumentObject(document, reactionConditionAttachment(object)!.arrowId) : object;
+  return arrow?.type === "graphic" && graphicPathEditPoints(arrow) &&
+    (arrangementConnectorEndpoints(arrow) || arrow.data.markerEnd || arrow.data.markerStart) ? arrow : undefined;
+}
+export function reactionConditionLabel(document: ChemDraftDocument, arrowId: string): TextObject | undefined {
+  return document.pages.flatMap(page => page.objects).find((o): o is TextObject =>
+    o.type === "text" && reactionConditionAttachment(o)?.arrowId === arrowId);
+}
+function arrangementAttachmentKey(from: ArrangementArrowItem, to: ArrangementArrowItem): string {
+  return JSON.stringify([from.bounds, from.outline, from.anchor, to.bounds, to.outline, to.anchor]);
+}
+function conditionLabelPoint(page: DocumentPage, arrow: GraphicObject, label: TextObject, attachment: ReactionConditionAttachment) {
+  const path = graphicPathVisualEditPoints(arrow)!;
+  const obstacles = page.objects.filter(o => o.id !== arrow.id && o.id !== label.id && o.type !== "group" &&
+      (o.type !== "graphic" || reactionOffshootAttachment(o)))
+    .flatMap(o => {
+      if (o.type==="graphic") {
+        const path=graphicPathVisualEditPoints(o);
+        return path ? reactionOffshootObstacleBounds(path,Math.max(2,typeof o.style.strokeWidth==="number" ? o.style.strokeWidth/2 : 2),
+          Math.max(6,(o.data.markerEnd?.sizePx ?? 12)/2)) : [];
+      }
+      return [o.type === "molecule" ? moleculeVisualBoundsForArrangement(o) : documentObjectVisualBounds(o)];
+    });
+  const point = planReactionConditionLabel(path, label, {x:0,y:0,width:page.width,height:page.height}, obstacles, attachment.side);
+  return {x:clamp(point.x + attachment.offsetX,0,Math.max(0,page.width-label.width)),
+    y:clamp(point.y + attachment.offsetY,0,Math.max(0,page.height-label.height))};
+}
+/** Conditions are ordinary native text: saved, exported, styled, and edited by the existing text tool. */
+export function setReactionConditions(
+  document: ChemDraftDocument, arrowId: string, text: string, side: 1 | -1 = 1, spans?: readonly TextSpan[]
+): ChemDraftDocument {
+  const arrow = reactionConditionArrow(document, arrowId);
+  if (!arrow) return document;
+  const page = document.pages.find(p => p.objects.some(o => o.id === arrow.id))!;
+  const existing = reactionConditionLabel(document, arrow.id);
+  if (!text.trim()) return existing ? applyPatches(document, [{op:"removeObject",objectId:existing.id}], {now:phase4Timestamp}) : document;
+  const style = existing?.style ?? {...textStyleToObjectStyle({fontSizePx:14,textAlign:"center"}),textBoxSizingMode:"auto"};
+  const size = nativeTextObjectSizeForText(text,style,{maxWidth:Math.min(240,page.width),maxHeight:page.height});
+  const previousAttachment = existing && reactionConditionAttachment(existing);
+  const attachment: ReactionConditionAttachment = {version:1,arrowId:arrow.id,side,
+    offsetX:previousAttachment?.side === side ? previousAttachment.offsetX : 0,
+    offsetY:previousAttachment?.side === side ? previousAttachment.offsetY : 0};
+  const label: TextObject = {...existing,id:existing?.id ?? nextObjectId(document,"reaction_conditions"),type:"text",text,
+    spans:spans?.map(s=>s.text).join("") === text ? spans.map(s=>({...s,style:{...s.style}})) :
+      textObjectSpansForTextChange(existing ?? {text:"",spans:[]},text),x:0,y:0,...size,rotation:0,style,
+    compatibility:{...existing?.compatibility,sourceFormat:"chemdraft-native",warnings:existing?.compatibility?.warnings ?? [],
+      unknown:{...existing?.compatibility?.unknown,reactionConditionRole:1,reactionCondition:attachment}}};
+  Object.assign(label,conditionLabelPoint(page,arrow,label,attachment));
+  if (existing && JSON.stringify(existing) === JSON.stringify(label)) return document;
+  return applyPatches(document,[existing ? {op:"updateObject",objectId:label.id,changes:label} : {op:"addObject",pageId:page.id,object:label}],{now:phase4Timestamp});
+}
+
+/** Shared reconciliation for previews and committed edits. Geometry changes join the original undo
+ * transaction. No work on selection-only updates; manual arrows are never attached implicitly. */
+export function reconcileReactionConnections(before: ChemDraftDocument, next: ChemDraftDocument): ChemDraftDocument {
+  if (before === next) return next;
+  let result = next;
+  for (const page of next.pages) {
+    const oldPage = before.pages.find(p => p.id === page.id);
+    if (!oldPage || oldPage.objects === page.objects) continue;
+    const patches: DocumentPatch[] = [];
+    const cache = new Map<string, ArrangementArrowItem | undefined>();
+    const oldCache = new Map<string, ArrangementArrowItem | undefined>();
+    const item = (id: string) => {if (!cache.has(id)) cache.set(id,arrangementItem(page.objects,id));return cache.get(id);};
+    const oldItem = (id: string) => {if (!oldCache.has(id)) oldCache.set(id,arrangementItem(oldPage.objects,id));return oldCache.get(id);};
+    for (const arrow of page.objects) {
+      const endpoints = arrangementConnectorEndpoints(arrow);
+      if (!endpoints || arrow.type !== "graphic") continue;
+      const from=item(endpoints.fromId),to=item(endpoints.toId);
+      if (!from || !to) {patches.push({op:"removeObject",objectId:arrow.id});continue;}
+      const previous=oldPage.objects.find(o=>o.id===arrow.id);
+      const oldFrom=oldItem(endpoints.fromId),oldTo=oldItem(endpoints.toId);
+      const stored = arrow.compatibility!.unknown.arrangementConnector as Record<string,unknown>;
+      const key=arrangementAttachmentKey(from,to);
+      const oldKey=oldFrom && oldTo ? arrangementAttachmentKey(oldFrom,oldTo) : undefined;
+      if (oldKey === key) {
+        if (previous?.type === "graphic" && !sameArrangementArrowGeometry(previous,arrow) &&
+            JSON.stringify(previous.data) !== JSON.stringify(arrow.data)) {
+          patches.push({op:"updateObject",objectId:arrow.id,changes:{compatibility:{...arrow.compatibility!,unknown:{...arrow.compatibility!.unknown,
+            arrangementConnector:{...stored,bend:arrangementArrowBend(arrow.data,from.bounds,to.bounds,from.anchor,to.anchor),attachmentKey:key}}}}});
+        }
+        continue;
+      }
+      if (stored.attachmentKey === key) continue;
+      const bend=typeof stored.bend === "number" && Number.isFinite(stored.bend) ? stored.bend :
+        previous?.type === "graphic" && oldFrom && oldTo ? arrangementArrowBend(previous.data,oldFrom.bounds,oldTo.bounds,oldFrom.anchor,oldTo.anchor) : 0;
+      const connectedIds = new Set(page.objects.flatMap(o=>{const e=arrangementConnectorEndpoints(o);return e ? [e.fromId,e.toId] : [];}));
+      const dx = oldFrom ? from.bounds.x-oldFrom.bounds.x : 0, dy = oldFrom ? from.bounds.y-oldFrom.bounds.y : 0;
+      const shifted = (entry: ArrangementArrowItem): ArrangementArrowItem => ({...entry,
+        bounds:{...entry.bounds,x:entry.bounds.x+dx,y:entry.bounds.y+dy},
+        ...(entry.anchor ? {anchor:{x:entry.anchor.x+dx,y:entry.anchor.y+dy}} : {}),
+        outline:entry.outline?.map(p=>({x:p.x+dx,y:p.y+dy}))});
+      if (previous?.type === "graphic" && oldFrom && oldTo &&
+          arrangementAttachmentKey(shifted(oldFrom),shifted(oldTo)) === key) {
+        patches.push({op:"updateObject",objectId:arrow.id,changes:{x:previous.x+dx,y:previous.y+dy,
+          width:previous.width,height:previous.height,rotation:previous.rotation,data:translateGraphicObjectData(previous.data,dx,dy),
+          compatibility:{...arrow.compatibility!,unknown:{...arrow.compatibility!.unknown,arrangementConnector:{...stored,bend,attachmentKey:key}}}}});
+        continue;
+      }
+      const plan=planFollowingArrangementArrow(from,to,bend,[...connectedIds].flatMap(id=>item(id) ?? []));
+      const center={x:from.bounds.x+from.bounds.width/2,y:from.bounds.y+from.bounds.height/2};
+      const savedMarkers = stored.savedMarkers as Pick<GraphicObjectData,"markerStart"|"markerEnd"> | undefined;
+      const markers = stored.blocked && savedMarkers ? savedMarkers : {markerStart:arrow.data.markerStart,markerEnd:arrow.data.markerEnd};
+      const data: GraphicObjectData = plan ? {...plan.data,markerStart:markers.markerStart,markerEnd:markers.markerEnd ?? {kind:"filled-arrow",sizePx:12}} :
+        {artPathKind:"line",lineStart:center,lineEnd:center};
+      patches.push({op:"updateObject",objectId:arrow.id,changes:{...(plan?.bounds ?? {x:center.x,y:center.y,width:0,height:0}),rotation:0,data,
+        compatibility:{...arrow.compatibility!,unknown:{...arrow.compatibility!.unknown,arrangementConnector:{...stored,bend,attachmentKey:key,blocked:!plan,savedMarkers:markers}}}}});
+    }
+    if (patches.length) result=applyPatches(result,patches,{now:phase4Timestamp});
+    const offshootPatches=reconcileReactionOffshoots(oldPage,result.pages.find(p=>p.id===page.id)!);
+    if (offshootPatches.length) result=applyPatches(result,offshootPatches,{now:phase4Timestamp});
+    const updatedPage=result.pages.find(p=>p.id===page.id)!;
+    const labelPatches:DocumentPatch[]=[];
+    for (const label of updatedPage.objects) {
+      if (label.type!=="text") continue;
+      const attachment=reactionConditionAttachment(label);
+      if (!attachment) {
+        if (isReactionConditionLabel(label) && label.compatibility?.unknown.reactionConditionRole!==1) {
+          labelPatches.push({op:"updateObject",objectId:label.id,changes:{compatibility:{...label.compatibility!,
+            unknown:{...label.compatibility!.unknown,reactionConditionRole:1}}}});
+        }
+        continue;
+      }
+      const arrow=updatedPage.objects.find(o=>o.id===attachment.arrowId);
+      if (!arrow || arrow.type !== "graphic") {
+        const unknown={...label.compatibility!.unknown};
+        unknown.reactionConditionRole=1;
+        delete unknown.reactionCondition;
+        labelPatches.push({op:"updateObject",objectId:label.id,changes:{compatibility:{...label.compatibility!,unknown}}});
+        continue;
+      }
+      const oldLabel=oldPage.objects.find(o=>o.id===label.id);
+      const oldArrow=oldPage.objects.find(o=>o.id===arrow.id);
+      const geometryChanged=oldArrow?.type !== "graphic" || !sameArrangementArrowGeometry(oldArrow,arrow);
+      const branchChanged=[...updatedPage.objects,...oldPage.objects].some(object=>{
+        const branch=reactionOffshootAttachment(object);
+        if (branch?.parentArrowId!==arrow.id) return false;
+        const old=oldPage.objects.find(o=>o.id===object.id),next=updatedPage.objects.find(o=>o.id===object.id);
+        return old?.type!=="graphic" || next?.type!=="graphic" || !sameArrangementArrowGeometry(old,next);
+      });
+      const resized=oldLabel?.type === "text" && (oldLabel.width !== label.width || oldLabel.height !== label.height);
+      if (geometryChanged || branchChanged || resized) {
+        const point=conditionLabelPoint(updatedPage,arrow,label,attachment);
+        if (point.x !== label.x || point.y !== label.y) labelPatches.push({op:"updateObject",objectId:label.id,changes:point});
+      } else if (oldLabel?.type === "text" && (oldLabel.x !== label.x || oldLabel.y !== label.y) &&
+          reactionConditionAttachment(oldLabel)?.offsetX === attachment.offsetX &&
+          reactionConditionAttachment(oldLabel)?.offsetY === attachment.offsetY) {
+        labelPatches.push({op:"updateObject",objectId:label.id,changes:{compatibility:{...label.compatibility!,unknown:{...label.compatibility!.unknown,
+          reactionCondition:{...attachment,offsetX:attachment.offsetX+label.x-oldLabel.x,offsetY:attachment.offsetY+label.y-oldLabel.y}}}}});
+      }
+    }
+    if (labelPatches.length) result=applyPatches(result,labelPatches,{now:phase4Timestamp});
+  }
+  return result;
+}
 
 // The top-level objects participating in the current selection — a selected group appears once as
 // its group object, not as its expanded children, so layout operations treat it as a single item.

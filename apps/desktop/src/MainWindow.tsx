@@ -175,6 +175,7 @@ import {
   smallestRingAtomIdsByBondId,
   styleColorMapValue,
   textObjectSpansForRendering,
+  nativeTextSubscriptOffsetEm,
   type PageSvgAttributeValue,
   type PageSvgElementFragment,
   type PageSvgFragment,
@@ -215,6 +216,8 @@ import {
   createLayerActions,
   createQuickActions,
   distributeModeCommandIds,
+  arrangementLayoutForCommand,
+  arrangementGridAlignmentForCommand,
   editActions,
   objectColorForCommand,
   objectEffectColorForCommand,
@@ -498,6 +501,19 @@ import {
   projectedPlaneTiltMaxRadians,
   wrapProjectedPlaneTiltVectorRadians,
   alignSelectedDocumentObjects,
+  arrangeSelectedDocumentObjects,
+  reconcileReactionConnections,
+  reactionConditionArrow,
+  wavyLineForAdjustment,
+  setWavyLineSettings,
+  adjustArrangementSpacing,
+  selectedArrangementObjectIds,
+  reactionConditionLabel,
+  reactionConditionAttachment,
+  reactionOffshootAttachment,
+  attachReactionOffshoot,
+  arrangementConnectorEndpoints,
+  setReactionConditions,
   distributeSelectedDocumentObjects,
   duplicateSelectedDocumentObjects,
   flipSelectedDocumentObjects,
@@ -683,6 +699,9 @@ import {
 } from "./editHistoryRouting";
 import { PluginManagerDialog } from "./plugins/PluginManagerDialog";
 import { revealRecognitionScreenCaptures } from "./plugins/recognitionScreenCaptures";
+import { ReactionConditionsDialog } from "./ReactionConditionsDialog";
+import { WavinessDialog } from "./WavinessDialog";
+import { ArrangementSpacingDialog } from "./ArrangementSpacingDialog";
 import { PluginPromptTextDialog } from "./plugins/PluginPromptTextDialog";
 import { PluginImageRequestDialog } from "./plugins/PluginImageRequestDialog";
 import { StructureRecognitionInstallDialog } from "./plugins/StructureRecognitionInstallDialog";
@@ -1464,7 +1483,7 @@ const GRAPHIC_HANDLE_DRAG_THRESHOLD = 1;
 const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
-const CURRENT_BUILD_STAMP = "10.4.16.00-opus";
+const CURRENT_BUILD_STAMP = "10.12.06.00-codex";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2064,6 +2083,9 @@ export function MainWindow({
     sourcePoint: ClientPoint;
     latestPoint: ClientPoint;
   } | undefined>();
+  const [reactionConditionsArrowId, setReactionConditionsArrowId] = useState<string | undefined>();
+  const [wavinessObjectId,setWavinessObjectId]=useState<string|undefined>();
+  const [spacingSource,setSpacingSource]=useState<ChemDraftDocument|undefined>();
   const [objectContextMenu, setObjectContextMenu] = useState<ObjectContextMenuState | undefined>();
   /** Page (empty-canvas) right-click menu position; undefined when the menu is closed. */
   const [pageContextMenu, setPageContextMenu] = useState<ClientPoint | undefined>();
@@ -2509,7 +2531,7 @@ export function MainWindow({
     }),
     [canRedo, canUndo, document, selectedMolecule, selectedNativeMoleculeParts]
   );
-  const layerActions = useMemo(() => createLayerActions(document), [document]);
+  const layerActions = useMemo(() => createLayerActions(document, objectContextMenu?.objectId), [document, objectContextMenu?.objectId]);
   const pageCssVars = useMemo(
     () =>
       ({
@@ -2676,7 +2698,7 @@ export function MainWindow({
 
     installDocumentHistory({
       ...currentHistory,
-      present: reconcileNativeChargeMarks(nextDocument)
+      present: reconcileReactionConnections(currentHistory.present, reconcileNativeChargeMarks(nextDocument))
     });
     return true;
   }, [installDocumentHistory]);
@@ -2692,7 +2714,7 @@ export function MainWindow({
       return false;
     }
 
-    const present = reconcileNativeChargeMarks(nextDocument);
+    const present = reconcileReactionConnections(currentHistory.present, reconcileNativeChargeMarks(nextDocument));
     if (undoLabel) {
       documentUndoLabelsRef.current.set(present, undoLabel);
     }
@@ -2716,7 +2738,7 @@ export function MainWindow({
     nextDocument: ChemDraftDocument
   ) => {
     const currentHistory = documentHistoryRef.current;
-    const present = reconcileNativeChargeMarks(nextDocument);
+    const present = reconcileReactionConnections(startDocument, reconcileNativeChargeMarks(nextDocument));
     installDocumentHistory({
       past: boundedHistoryPast([...currentHistory.past, startDocument], present),
       present,
@@ -8302,6 +8324,44 @@ export function MainWindow({
 
     layerActions.forEach((action) => {
       register(action, () => {
+        if(action.id==="layout.adjustArrangementSpacing") {setSpacingSource(documentRef.current);return;}
+        if(action.id==="art.adjustWaviness") {
+          const current=documentRef.current;
+          const targetId=objectContextMenu?.objectId ?? (current.selection.objectIds.length===1 ? current.selection.objectIds[0] : undefined);
+          if(targetId && wavyLineForAdjustment(current,targetId)) setWavinessObjectId(targetId);
+          return;
+        }
+        if (action.id === "reaction.conditions") {
+          const current = documentRef.current;
+          const targetId = objectContextMenu?.objectId ?? (current.selection.objectIds.length === 1 ? current.selection.objectIds[0] : undefined);
+          const target = targetId ? reactionConditionArrow(current, targetId) : undefined;
+          if (target) setReactionConditionsArrowId(target.id);
+          return;
+        }
+        const arrangementLayout = arrangementLayoutForCommand(action.id);
+        if (action.id === "reaction.offshoot.outside" || action.id === "reaction.offshoot.inside") {
+          const targetId=objectContextMenu?.objectId ?? (documentRef.current.selection.objectIds.length===1 ? documentRef.current.selection.objectIds[0] : undefined);
+          if (!targetId) return;
+          let message="";
+          commitDocumentChange(current=>{
+            const result=attachReactionOffshoot(current,targetId,action.id==="reaction.offshoot.inside" ? -1 : 1);
+            message=result.status; return result.document;
+          },action.title);
+          setStatus(message);
+          return;
+        }
+        if (arrangementLayout) {
+          let status = "";
+          commitDocumentChange((current) => {
+            const result = arrangeSelectedDocumentObjects(current, arrangementLayout, {
+              addArrows: true, gridAlignment: arrangementGridAlignmentForCommand(action.id)
+            });
+            status = result.status;
+            return result.document;
+          }, action.title);
+          setStatus(status);
+          return;
+        }
         if (action.id === distributeModeCommandIds.centers || action.id === distributeModeCommandIds.spacing) {
           const nextMode: DocumentDistributeMode = action.id === distributeModeCommandIds.spacing ? "spacing" : "centers";
           setDistributeMode(nextMode);
@@ -11693,7 +11753,8 @@ export function MainWindow({
         objectRotateReadoutTimeoutRef.current = undefined;
         setObjectRotateReadout(undefined);
       }, 1200);
-      if (!drag.target && findDocumentObject(drag.startDocument, drag.objectId)?.type === "graphic") {
+      if (!drag.target && findDocumentObject(drag.startDocument, drag.objectId)?.type === "graphic" &&
+          !hasFollowingReactionDependents(drag.startDocument, [drag.objectId])) {
         scheduleObjectTransformPreview({
           pointerId: drag.pointerId,
           objectIds: [drag.objectId],
@@ -15582,6 +15643,7 @@ export function MainWindow({
         ? "Move selected path node"
         : editPoints && isSemanticCircularGraphicArc(object, editPoints)
           ? handle === "middle" ? "Adjust selected arc radius" : "Adjust selected arc sweep"
+          : handle === "start" && reactionOffshootAttachment(object) ? "Slide offshoot contact along its parent arrow"
           : handle === "middle" ? "Bend selected line into a curve" : "Adjust selected line endpoint"
     );
   }, [
@@ -17584,6 +17646,32 @@ export function MainWindow({
             : hoveredNativeWarning ?? status}
         </div>
       </section>
+      {spacingSource ? <ArrangementSpacingDialog document={spacingSource} onCancel={()=>setSpacingSource(undefined)}
+        onSave={factor=>{
+          let message="",ok=false;
+          commitDocumentChange(current=>{const result=adjustArrangementSpacing(current,factor);message=result.status;ok=result.ok;return result.document;},"Adjust arrangement spacing");
+          if(ok) setSpacingSource(undefined);setStatus(message);
+        }} /> : null}
+      {wavinessObjectId && wavyLineForAdjustment(document,wavinessObjectId) ? <WavinessDialog key={wavinessObjectId}
+        object={wavyLineForAdjustment(document,wavinessObjectId)!}
+        onCancel={()=>setWavinessObjectId(undefined)}
+        onSave={(value,amplitudePx,cycles)=>{
+          commitDocumentChange(current=>setWavyLineSettings(current,wavinessObjectId,{smoothness:value,amplitudePx,cycles}),"Adjust waviness");
+          setWavinessObjectId(undefined);
+          if(value!==undefined || amplitudePx!==undefined || cycles!==undefined) setStatus("Waviness adjusted");
+        }} /> : null}
+      {reactionConditionsArrowId && reactionConditionArrow(document, reactionConditionsArrowId) ? (
+        <ReactionConditionsDialog key={reactionConditionsArrowId}
+          initialText={reactionConditionLabel(document, reactionConditionsArrowId)?.text ?? ""}
+          initialSpans={reactionConditionLabel(document, reactionConditionsArrowId)?.spans ?? []}
+          initialSide={reactionConditionLabel(document, reactionConditionsArrowId) ? reactionConditionAttachment(reactionConditionLabel(document, reactionConditionsArrowId)!)!.side : 1}
+          onCancel={() => setReactionConditionsArrowId(undefined)}
+          onSave={(text, side, spans) => {
+            commitDocumentChange(current => setReactionConditions(current, reactionConditionsArrowId, text, side, spans), "Edit reaction conditions");
+            setReactionConditionsArrowId(undefined);
+            setStatus(text.trim() ? "Reaction conditions saved" : "Reaction conditions removed");
+          }} />
+      ) : null}
       {objectContextMenu ? (
         <ObjectLayerContextMenu
           objectId={objectContextMenu.objectId}
@@ -17592,6 +17680,9 @@ export function MainWindow({
           targetKind={objectContextMenu.targetKind}
           bondDepthContext={objectContextMenu.bondDepthContext}
           atomWarning={objectContextMenu.atomWarning}
+          reactionConditionsAvailable={!!reactionConditionArrow(document, objectContextMenu.objectId)}
+          wavinessAvailable={!!wavyLineForAdjustment(document,objectContextMenu.objectId)}
+          spacingAvailable={selectedArrangementObjectIds(document).length>=2}
           arrowStyleSource={(() => {
             const menuObject = findDocumentObject(document, objectContextMenu.objectId);
             return menuObject ? nativeArrowStyleDefaultFromGraphic(menuObject) : undefined;
@@ -18808,10 +18899,22 @@ function penControlDragThreshold(scale: number): number {
   return Math.max(4, PEN_CONTROL_DRAG_THRESHOLD_PX / Math.max(scale, 0.1));
 }
 
+/** CSS-only previews cannot keep attached connections/labels in step; use document previews. */
+function hasFollowingReactionDependents(document: ChemDraftDocument, objectIds: readonly string[]): boolean {
+  return document.pages.some(page => page.objects.some(object => {
+    const endpoints = arrangementConnectorEndpoints(object);
+    const label = reactionConditionAttachment(object);
+    const offshoot = reactionOffshootAttachment(object);
+    return !!(endpoints && (objectIds.includes(endpoints.fromId) || objectIds.includes(endpoints.toId)) ||
+      label && objectIds.includes(label.arrowId) || offshoot && objectIds.includes(offshoot.parentArrowId));
+  }));
+}
+
 function graphicObjectIdsForCssDragPreview(drag: ObjectDragState): string[] | undefined {
   const objectIds = drag.groupObjectIds && drag.groupObjectIds.length > 1
     ? [...drag.groupObjectIds]
     : [drag.objectId];
+  if (hasFollowingReactionDependents(drag.startDocument, objectIds)) return undefined;
   return objectIds.every((objectId) => findDocumentObject(drag.startDocument, objectId)?.type === "graphic")
     ? objectIds
     : undefined;
@@ -20057,6 +20160,8 @@ export function nativeDeleteTargetFromSelectionPart(
 
 function isLayerCommandId(commandId: string): boolean {
   return (
+    arrangementLayoutForCommand(commandId) !== undefined ||
+    commandId === "layout.adjustArrangementSpacing" ||
     commandId === "layout.bringToFront" ||
     commandId === "layout.bringForward" ||
     commandId === "layout.sendBackward" ||
@@ -21113,6 +21218,9 @@ export function ObjectLayerContextMenu({
   bondDepthContext,
   atomWarning,
   arrowStyleSource,
+  reactionConditionsAvailable,
+  wavinessAvailable,
+  spacingAvailable,
   position,
   onInvoke
 }: {
@@ -21124,6 +21232,9 @@ export function ObjectLayerContextMenu({
   atomWarning?: ObjectContextMenuState["atomWarning"];
   /** Present when the clicked object is an arrow whose look can become the tool's default. */
   arrowStyleSource?: { title: string };
+  reactionConditionsAvailable?: boolean;
+  wavinessAvailable?: boolean;
+  spacingAvailable?: boolean;
   position: ClientPoint;
   onInvoke(commandId: string): void;
 }) {
@@ -21175,6 +21286,15 @@ export function ObjectLayerContextMenu({
         event.stopPropagation();
       }}
     >
+      {spacingAvailable ? <button type="button" role="menuitem" className="object-context-menu-item"
+        data-command-id="layout.adjustArrangementSpacing" onClick={()=>onInvoke("layout.adjustArrangementSpacing")}>Adjust arrangement spacing…</button> : null}
+      {wavinessAvailable ? <button type="button" role="menuitem" className="object-context-menu-item"
+        data-command-id="art.adjustWaviness" onClick={()=>onInvoke("art.adjustWaviness")}>Adjust waviness…</button> : null}
+      {reactionConditionsAvailable ? <button type="button" role="menuitem" className="object-context-menu-item"
+        data-command-id="reaction.conditions" onClick={() => onInvoke("reaction.conditions")}>Reaction conditions…</button> : null}
+      {reactionConditionsAvailable ? (["outside","inside"] as const).map(side=><button key={side} type="button" role="menuitem"
+        className="object-context-menu-item" data-command-id={`reaction.offshoot.${side}`}
+        onClick={()=>onInvoke(`reaction.offshoot.${side}`)}>Attach offshoot — {side==="outside" ? "top / outside" : "bottom / inside"}</button>) : null}
       {(["clipboard.cut", "clipboard.copy", "clipboard.paste"] as const).map((clipboardCommandId) => (
         <button
           type="button"
@@ -24220,7 +24340,7 @@ function DocumentObjectViewContent({
       ...(objectTextScript === "normal" ? {} : {
         fontSize: `calc(${textStyle.fontSizePx * 0.72}px * var(--page-scale))`,
         lineHeight: Math.max(1, textStyle.lineHeight),
-        paddingTop: objectTextScript === "subscript" ? `calc(${textStyle.fontSizePx * 0.3}px * var(--page-scale))` : 0,
+        paddingTop: objectTextScript === "subscript" ? `calc(${textStyle.fontSizePx * nativeTextSubscriptOffsetEm}px * var(--page-scale))` : 0,
         paddingBottom: objectTextScript === "superscript" ? `calc(${textStyle.fontSizePx * 0.28}px * var(--page-scale))` : 0
       })
     } as CSSProperties;
@@ -25933,7 +26053,8 @@ function GraphicPathEditHandles({
               : [])
           ]
         : [
-            { handle: "start", point: projectedPoints.start, label: "Adjust line start" },
+            { handle: "start", point: projectedPoints.start,
+              label: reactionOffshootAttachment(object) ? "Slide offshoot contact along parent arrow" : "Adjust line start" },
             { handle: "middle", point: projectedPoints.middle, label: "Bend line into curve" },
             { handle: "end", point: projectedPoints.end, label: "Adjust line end" }
           ];
@@ -27140,6 +27261,7 @@ function textStyleForTextRange(object: TextObject, range: NativeTextSelectionRan
 function textSpanCss(span: TextSpan): CSSProperties | undefined {
   const style = span.style;
   const css: CSSProperties = {};
+  if (span.script==="subscript") css.verticalAlign=`-${nativeTextSubscriptOffsetEm}em`;
   const color = textSpanString(style.color);
   const fontFamily = textSpanString(style.fontFamily);
   const fontSizePx = textSpanNumber(style.fontSizePx);
@@ -27751,10 +27873,9 @@ function shouldEnableArtTransformQaLayer(): boolean {
     if (params.get("artQa") === "0" || params.get("chemdraftArtQa") === "0") {
       return false;
     }
+    // Bridge access alone must not add persistent boxes that resemble selection highlights.
     return params.get("artQa") === "1" ||
       params.get("chemdraftArtQa") === "1" ||
-      params.get("agentBridge") === "1" ||
-      params.get("chemdraftAgentBridge") === "1" ||
       window.localStorage.getItem("chemdraft.artTransformQa") === "enabled";
   } catch {
     return false;
