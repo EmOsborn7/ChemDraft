@@ -756,6 +756,7 @@ import {
   createDesktopShortcutRegistry,
   createMainWindowShortcutCommands,
   detectDesktopShortcutPlatform,
+  enableWindowsLastDocumentCloseAction,
   isBrowserReloadChord
 } from "./keyboardShortcuts";
 import { decodeDocumentBytes } from "./documentText";
@@ -1624,7 +1625,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.13.11.55-opus";
+const CURRENT_BUILD_STAMP = "10.13.12.10-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2791,12 +2792,12 @@ export function MainWindow({
   const canUndo = documentHistory.past.length > 0;
   const canRedo = documentHistory.future.length > 0;
   const quickActions = useMemo(
-    () => createQuickActions(document, selectedMolecule, {
+    () => enableWindowsLastDocumentCloseAction(createQuickActions(document, selectedMolecule, {
       canUndo,
       canRedo,
       hasMultipleTabs: documentTabs.length > 1,
       hasMoleculeFragmentSelection: selectedNativeMoleculeParts.length > 0
-    }),
+    })),
     [canRedo, canUndo, document, documentTabs.length, selectedMolecule, selectedNativeMoleculeParts]
   );
   const layerActions = useMemo(() => createLayerActions(document), [document]);
