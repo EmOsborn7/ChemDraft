@@ -14,6 +14,18 @@ const DEFAULT_JPEG_QUALITY: u8 = 90;
 // fixtures/ocsr/brevetoxin-a.svg): about 106 MiB total, with room for page markup.
 const MAX_SVG_BYTES: usize = 128 * 1024 * 1024;
 
+/// Export SVGs may embed data URLs, but must never read files from the host.
+fn export_svg_options() -> usvg::Options<'static> {
+    usvg::Options {
+        fontdb: shared_fontdb(),
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RasterExportFormat {
@@ -97,10 +109,7 @@ fn rasterize_svg_impl(request: RasterExportRequest) -> Result<RasterExportRespon
         ));
     }
 
-    let options = usvg::Options {
-        fontdb: shared_fontdb(),
-        ..Default::default()
-    };
+    let options = export_svg_options();
 
     let tree = usvg::Tree::from_data(request.svg.as_bytes(), &options)
         .map_err(|error| format!("Could not parse SVG for raster export: {error}"))?;
@@ -425,6 +434,57 @@ fn warning(code: &'static str, message: String) -> RasterExportWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_images_accept_only_data_urls() {
+        let directory =
+            std::env::temp_dir().join(format!("chemdraft-export-images-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create image fixture directory");
+        let image_path = directory.join("fixture.svg");
+        std::fs::write(&image_path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#)
+            .expect("write real image fixture");
+        let mut options = export_svg_options();
+        options.resources_dir = Some(directory.clone());
+        let absolute = image_path.to_string_lossy().replace('\\', "/");
+        for href in [
+            format!("file:///{absolute}"),
+            "fixture.svg".to_string(),
+            absolute,
+        ] {
+            let escaped_href = href
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;");
+            for attribute in ["href", "xlink:href"] {
+                let svg = format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="8" height="8"><image {attribute}="{escaped_href}" width="8" height="8"/></svg>"#
+                );
+                let tree = usvg::Tree::from_data(svg.as_bytes(), &options).expect("parse SVG");
+                assert!(tree.root().children().is_empty(), "must not load {href}");
+                let response = rasterize_svg_impl(RasterExportRequest {
+                    svg,
+                    background: Some("transparent".to_string()),
+                    ..request(RasterExportFormat::Png)
+                })
+                .expect("rasterize SVG");
+                let pixels = image::load_from_memory(&response.bytes)
+                    .expect("decode PNG")
+                    .to_rgba8();
+                assert!(
+                    pixels.pixels().all(|pixel| pixel[3] == 0),
+                    "raster must not load {href}"
+                );
+            }
+        }
+
+        let embedded = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><image href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8'%3E%3Crect width='8' height='8' fill='red'/%3E%3C/svg%3E" width="8" height="8"/></svg>"#;
+        let tree =
+            usvg::Tree::from_data(embedded.as_bytes(), &options).expect("parse embedded SVG");
+        assert!(!tree.root().children().is_empty(), "data URL must load");
+        std::fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
 
     const SIMPLE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32" viewBox="0 0 64 32"><rect width="64" height="32" fill="#ffffff"/><circle cx="16" cy="16" r="8" fill="#111111"/></svg>"##;
 
