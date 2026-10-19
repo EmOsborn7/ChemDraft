@@ -13,7 +13,8 @@ import {
   type KeybindingScheme,
   type KeybindingSettings
 } from "./keybindingSettings";
-import { broadcastKeybindingSettings, broadcastSpin3dSettings } from "./window-manager";
+import { loadCompoundLayoutSettings, saveCompoundLayoutSettings } from "./compoundLayoutSettings";
+import { broadcastCompoundLayoutSettings, broadcastKeybindingSettings, broadcastSpin3dSettings } from "./window-manager";
 
 interface RadioOption<T extends string> {
   value: T;
@@ -92,6 +93,7 @@ function PreferenceRadioGroup<T extends string>({ legend, hint, name, options, v
 }
 
 export function PreferencesWindow() {
+  const [compoundLayouts, setCompoundLayouts] = useState(() => loadCompoundLayoutSettings());
   const [settings, setSettings] = useState<Spin3dSettings>(() => loadSpin3dSettings());
   const [keybindings, setKeybindings] = useState<KeybindingSettings>(() => loadKeybindingSettings());
 
@@ -133,6 +135,19 @@ export function PreferencesWindow() {
         <h1>Preferences</h1>
       </header>
 
+      <section className="preferences-section" aria-labelledby="compound-layout-tools">
+        <h2 id="compound-layout-tools">Compound layout tools</h2>
+        <label className="preferences-radio">
+          <input type="checkbox" checked={compoundLayouts.enabled} onChange={event => {
+            const next = { enabled: event.currentTarget.checked };
+            setCompoundLayouts(next);
+            saveCompoundLayoutSettings(next);
+            void broadcastCompoundLayoutSettings(next);
+          }} />
+          <span className="preferences-radio-body"><strong>Compound layout tools</strong>
+            <small>Enable circle, oval, grid, row and column layouts and a spacing preview. Off by default.</small></span>
+        </label>
+      </section>
       <PreferenceRadioGroup
         legend="Keyboard shortcuts"
         hint="Which keyboard scheme the drawing tools and hover hotkeys use. Takes effect immediately."

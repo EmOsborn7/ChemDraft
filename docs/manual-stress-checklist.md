@@ -274,3 +274,15 @@ and Art toolbars open, including at 125%/150% display scale:
   informational result boxes (OK): cancellation does not install; accepting keeps the existing download/install/session-flush flow.
 - Windows document-window close still flushes the session and quits (without a new dirty-tab
   prompt); relaunch restores every retained dirty tab. Check the same session retention on macOS.
+
+## Compound layout tools (opt-in)
+
+On macOS and Windows, verify that a fresh Settings/Preferences has Compound layout tools off and
+no layout button/flyout/context/gallery entry is visible. Enable it with a native palette open;
+Main, Art and Layout should update live. Select unequal-size compounds, optionally grouped captions,
+and open Arrange › in the selection context menu. Try Circle, Oval, all three Grid justifications,
+Row and Column; check click, hover and keyboard access to the submenu. Confirm unchanged bond lengths,
+labels and stereo, selected compounds retained, one Undo/Redo step, and no generated arrows.
+On page two, preview Adjust spacing: only that page appears and Save changes only that selection.
+Cancel/Escape makes no change. Check close/far/page limits and native save/reopen. Disable the setting
+with a preview/flyout open: it closes, controls disappear and direct commands report why unavailable.

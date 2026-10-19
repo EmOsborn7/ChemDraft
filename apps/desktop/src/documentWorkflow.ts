@@ -1,3 +1,4 @@
+import { planObjectArrangement, moleculeAnchorForArrangement, moleculeVisualBoundsForArrangement, type ArrangementLayout, type ArrangementOptions, type ArrangementItem, type LayoutBounds } from "@chemdraft/layout-engine";
 import { snapRotationDegrees } from "./rotationSnap";
 import { snapPlacementDegrees } from "./placementSnap";
 import { projectedDoubleBondSides } from "./interaction/projectedDoubleBondSides";
@@ -13525,6 +13526,104 @@ function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly Layou
     })
   );
   return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+}
+
+/** Groups are single items; their selected descendants and attached marks must not move twice. */
+export function selectedArrangementObjectIds(document: ChemDraftDocument): string[] {
+  const page = selectionPage(document);
+  const selected = selectionLayoutObjects(document);
+  const objects = objectByIdIndex(page.objects);
+  const contained = new Set<string>();
+  const includeDescendant = (id: string) => {
+    if (contained.has(id)) return;
+    contained.add(id);
+    const object = objects.get(id);
+    if (object?.type === "group") object.childObjectIds.forEach(includeDescendant);
+  };
+  selected.forEach((object) => {
+    if (object.type === "group") object.childObjectIds.forEach(includeDescendant);
+  });
+  const roots = selected.filter((object) => !contained.has(object.id) &&
+    (object.type !== "group" || resolveGroupedDocumentObjectIds(page.objects, [object.id]).length > 0));
+  const carried = cascadeCarriedAnchoredMarkIds(page.objects, new Set(roots.flatMap((object) =>
+    resolveGroupedDocumentObjectIds(page.objects, [object.id])
+  )));
+  return roots.filter((object) => !carried.has(object.id)).map((object) => object.id);
+}
+
+export function arrangeSelectedDocumentObjects(document: ChemDraftDocument, layout: ArrangementLayout,
+  options: Pick<ArrangementOptions, "gap" | "columns" | "gridAlignment"> = {}): { document: ChemDraftDocument; status: string } {
+  const page = selectionPage(document);
+  const items = selectedArrangementObjectIds(document).map(id => arrangementItem(page.objects, id)!);
+  const plan = planObjectArrangement(items, layout, { ...options, pageBounds: { x: 0, y: 0, width: page.width, height: page.height } });
+  if (!plan.ok) return { document, status: plan.reason === "selection" ? "Select at least two objects or groups" :
+    plan.reason === "page" ? "This arrangement does not fit on the page. Try a grid or a larger page." : "Cannot arrange this selection: invalid bounds or spacing." };
+  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, p.id, p.dx, p.dy)));
+  return { document: next, status: next === document ? "Selection is already arranged" : `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}` };
+}
+
+/** Change distances between item anchors by translation, with every item kept at its original size. */
+export function adjustArrangementSpacing(document:ChemDraftDocument,factor:number):{document:ChemDraftDocument;ok:boolean;status:string} {
+  const fail=(status:string)=>({document,ok:false,status});
+  if(!Number.isFinite(factor) || factor<=0) return fail("Choose a valid spacing");
+  const page=selectionPage(document),ids=selectedArrangementObjectIds(document);
+  if(ids.length<2) return fail("Select at least two compounds or groups");
+  if(Math.abs(factor-1)<1e-9) return {document,ok:true,status:"Original spacing"};
+  const items=ids.map(id=>arrangementItem(page.objects,id)!);
+  const anchors=items.map(item=>item.anchor ?? {x:item.bounds.x+item.bounds.width/2,y:item.bounds.y+item.bounds.height/2});
+  const center={x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length};
+  const deltas=anchors.map(p=>({x:(p.x-center.x)*(factor-1),y:(p.y-center.y)*(factor-1)}));
+  const placed=items.map((item,i)=>({...item,bounds:{...item.bounds,x:item.bounds.x+deltas[i].x,y:item.bounds.y+deltas[i].y},
+    ...(item.anchor ? {anchor:{x:item.anchor.x+deltas[i].x,y:item.anchor.y+deltas[i].y}} : {})}));
+  if(placed.some(({bounds:b})=>b.x<0 || b.y<0 || b.x+b.width>page.width || b.y+b.height>page.height))
+    return fail("This spacing would extend beyond the page");
+  for(let i=0;i<placed.length;i++) for(let j=i+1;j<placed.length;j++) {
+    const a=placed[i].bounds,b=placed[j].bounds;
+    if(a.x<b.x+b.width+12 && a.x+a.width>b.x-12 && a.y<b.y+b.height+12 && a.y+a.height>b.y-12)
+      return fail("The compounds need more space between them");
+  }
+  const moves=ids.flatMap((id,i)=>selectionLayoutItemMoves(page.objects,id,deltas[i].x,deltas[i].y));
+  const result=applyLayoutItemMoves(document,moves);
+  return {document:result,ok:true,status:`Spacing adjusted to ${Math.round(factor*100)}%`};
+}
+
+export function arrangementSpacingRange(document:ChemDraftDocument):{min:number;max:number} {
+  const boundary=(a:number,b:number,increasing:boolean)=>{
+    for(let i=0;i<9;i++) {const mid=(a+b)/2,ok=adjustArrangementSpacing(document,mid).ok;
+      if(ok===increasing) a=mid;else b=mid;}
+    return increasing ? Math.floor(a*100)/100 : Math.ceil(b*100)/100;
+  };
+  return {min:adjustArrangementSpacing(document,0.25).ok ? 0.25 : boundary(0.25,1,false),
+    max:adjustArrangementSpacing(document,1.5).ok ? 1.5 : boundary(1,1.5,true)};
+}
+
+export function arrangementSpacingPreviewBounds(document:ChemDraftDocument):LayoutBounds|undefined {
+  const page=selectionPage(document),items=selectedArrangementObjectIds(document).flatMap(id=>arrangementItem(page.objects,id) ?? []);
+  if(!items.length) return undefined;
+  const x=Math.min(...items.map(i=>i.bounds.x)),y=Math.min(...items.map(i=>i.bounds.y));
+  return {x,y,width:Math.max(...items.map(i=>i.bounds.x+i.bounds.width))-x,height:Math.max(...items.map(i=>i.bounds.y+i.bounds.height))-y};
+}
+
+function arrangementItem(pageObjects: readonly DocumentObject[], id: string): ArrangementItem | undefined {
+    const objects = objectByIdIndex(pageObjects);
+    if (!objects.has(id)) return undefined;
+    const members = [...expandWithAnchoredMarkIds(pageObjects, resolveGroupedDocumentObjectIds(pageObjects, [id]))]
+      .map((memberId) => objects.get(memberId))
+      .filter((object): object is DocumentObject => object !== undefined && object.type !== "group");
+    const visibleMembers = members.length > 0 ? members : [objects.get(id)!];
+    const boxes = visibleMembers.map((object) =>
+      object.type === "molecule" ? moleculeVisualBoundsForArrangement(object) : documentObjectVisualBounds(object)
+    );
+    const x = Math.min(...boxes.map((b) => b.x)), y = Math.min(...boxes.map((b) => b.y));
+    const moleculeMembers=visibleMembers.filter((object):object is MoleculeObject=>object.type==="molecule");
+    const anchors=moleculeMembers.map(moleculeAnchorForArrangement);
+    const anchor=anchors.length ? {x:anchors.reduce((sum,p)=>sum+p.x,0)/anchors.length,
+      y:anchors.reduce((sum,p)=>sum+p.y,0)/anchors.length} : undefined;
+    return { id, ...(anchor ? {anchor} : {}), bounds: {
+      x, y,
+      width: Math.max(...boxes.map((b) => b.x + b.width)) - x,
+      height: Math.max(...boxes.map((b) => b.y + b.height)) - y
+    } };
 }
 
 export function alignSelectedDocumentObjects(
