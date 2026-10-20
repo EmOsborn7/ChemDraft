@@ -9,6 +9,7 @@ use std::{
 use tauri::{ipc::Channel, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const MAX_BYTES: usize = 16 * 1024;
+const MAX_PREVIEW_BYTES: usize = 5 * 1024 * 1024;
 // Tauri 2.11.2 queues JSON >= 8192 bytes app-wide, outside receiver authentication.
 // Measure the complete delivery after JSON escaping, well below that threshold.
 const MAX_CHANNEL_BYTES: usize = 4096;
@@ -89,6 +90,102 @@ struct ExportOptions {
     pdf: PdfOptions,
     raster: RasterOptions,
     cdxml: CdxmlOptions,
+    presentation: Option<PresentationOptions>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PresentationOptions {
+    width: f64,
+    height: Option<f64>,
+    #[serde(rename = "linked")]
+    _linked: Option<bool>,
+    preset: Option<String>,
+    dpi: f64,
+    crop: String,
+    background: String,
+}
+impl PresentationOptions {
+    fn valid(&self) -> bool {
+        (1.0..=8192.0).contains(&self.width)
+            && self.width.fract() == 0.0
+            && self
+                .height
+                .is_none_or(|n| (1.0..=8192.0).contains(&n) && n.fract() == 0.0)
+            && self
+                .preset
+                .as_ref()
+                .is_none_or(|s| matches!(s.as_str(), "custom" | "slide" | "poster" | "publication"))
+            && (36.0..=1200.0).contains(&self.dpi)
+            && matches!(self.crop.as_str(), "page" | "content")
+            && matches!(self.background.as_str(), "white" | "transparent")
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrameSize {
+    width: f64,
+    height: f64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportFrame {
+    revision: Option<u64>,
+    page: FrameSize,
+    content: FrameSize,
+}
+impl ExportFrame {
+    fn valid(&self) -> bool {
+        self.revision
+            .is_none_or(|n| n > 0 && n <= 9_007_199_254_740_991)
+            && [&self.page, &self.content]
+                .iter()
+                .all(|s| valid_size(s.width, s.height, "css-px"))
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Preview {
+    url: String,
+    kind: String,
+    width: f64,
+    height: f64,
+    warnings: Vec<String>,
+}
+impl Preview {
+    fn valid(&self) -> bool {
+        let prefix = if self.kind == "pdf" {
+            "data:application/pdf;base64,"
+        } else if self.kind == "image" && self.url.starts_with("data:image/png;base64,") {
+            "data:image/png;base64,"
+        } else if self.kind == "image" && self.url.starts_with("data:image/svg+xml;base64,") {
+            "data:image/svg+xml;base64,"
+        } else if self.kind == "image" {
+            "data:image/jpeg;base64,"
+        } else {
+            return false;
+        };
+        self.url.strip_prefix(prefix).is_some_and(|s| {
+            s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c))
+        }) && (0.0..=8192.0).contains(&self.width)
+            && self.width > 0.0
+            && (0.0..=8192.0).contains(&self.height)
+            && self.height > 0.0
+            && self.warnings.len() <= 100
+            && self.warnings.iter().all(|s| bounded_text(s, 2048))
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrameReceipt {
+    status: String,
+    frame: ExportFrame,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewReceipt {
+    status: String,
+    preview: Preview,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -123,12 +220,14 @@ struct CdxmlOptions {
 struct ExportSnapshot {
     title: String,
     options: ExportOptions,
+    frame: Option<ExportFrame>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
 enum ExportAction {
     Export { options: ExportOptions },
     ChooseDestination { options: ExportOptions },
+    Preview { options: ExportOptions },
     Cancel,
 }
 #[derive(Deserialize)]
@@ -183,7 +282,11 @@ impl ExportOptions {
                 | "smd-42"
                 | "3mf-display"
                 | "3mf-printing"
-        ) && bounded_text(&self.filename, 256)
+        ) && self
+            .presentation
+            .as_ref()
+            .is_none_or(PresentationOptions::valid)
+            && bounded_text(&self.filename, 256)
             && !self.filename.trim().is_empty()
             && !self.filename.contains(['/', '\\'])
             && self
@@ -202,6 +305,14 @@ impl ExportOptions {
             && (1.0..=8192.0).contains(&self.raster.max_dimension_px)
             && bounded_text(&self.cdxml.creation_program, 256)
     }
+}
+fn valid_export_optionals(data: &Value) -> bool {
+    data.get("presentation").is_none_or(|p| {
+        p.is_object()
+            && p.get("height").is_none_or(Value::is_number)
+            && p.get("linked").is_none_or(Value::is_boolean)
+            && p.get("preset").is_none_or(Value::is_string)
+    })
 }
 fn optional_string_fields(data: &Value, names: &[&str]) -> bool {
     names
@@ -243,8 +354,18 @@ fn valid_reason(reason: &str) -> bool {
     )
 }
 impl Message {
+    fn is_preview(&self) -> bool {
+        self.dialog_kind == "export"
+            && self.message_type == "result"
+            && self.data["status"] == "preview"
+    }
     fn validate(&self) -> Result<(), String> {
-        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > MAX_BYTES
+        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len()
+            > if self.is_preview() {
+                MAX_PREVIEW_BYTES
+            } else {
+                MAX_BYTES
+            }
             || self.protocol_version != 1
             || self.owner_window_id != super::MAIN_WINDOW_LABEL
             || kind_spec(&self.dialog_kind).is_err()
@@ -262,6 +383,10 @@ impl Message {
                     !s.title.is_empty()
                         && s.title.encode_utf16().count() <= 256
                         && s.options.valid()
+                        && valid_export_optionals(&self.data["options"])
+                        && s.frame.as_ref().is_none_or(ExportFrame::valid)
+                        && self.data["frame"].get("revision").is_none_or(Value::is_u64)
+                        && self.data.get("frame").is_none_or(Value::is_object)
                         && optional_string_fields(&self.data["options"], &["destinationPath"])
                 })
             }
@@ -269,11 +394,24 @@ impl Message {
                 serde_json::from_value::<ExportAction>(self.data.clone()).is_ok_and(|a| match a {
                     ExportAction::Cancel => true,
                     ExportAction::Export { options }
-                    | ExportAction::ChooseDestination { options } => {
+                    | ExportAction::ChooseDestination { options }
+                    | ExportAction::Preview { options } => {
                         options.valid()
+                            && valid_export_optionals(&self.data["options"])
                             && optional_string_fields(&self.data["options"], &["destinationPath"])
                     }
                 })
+            }
+            "result" if self.dialog_kind == "export" && self.data["status"] == "frame" => {
+                serde_json::from_value::<FrameReceipt>(self.data.clone()).is_ok_and(|r| {
+                    r.status == "frame"
+                        && r.frame.valid()
+                        && self.data["frame"].get("revision").is_none_or(Value::is_u64)
+                })
+            }
+            "result" if self.is_preview() => {
+                serde_json::from_value::<PreviewReceipt>(self.data.clone())
+                    .is_ok_and(|r| r.status == "preview" && r.preview.valid())
             }
             "result" if self.dialog_kind == "export" => {
                 serde_json::from_value::<ExportReceipt>(self.data.clone()).is_ok_and(|r| {
@@ -411,7 +549,51 @@ fn send_owner(session: &Session, sender: &str, message: &Message) -> Result<(), 
         .send(delivery(session, sender, message)?)
         .map_err(|e| e.to_string())
 }
+// Tauri 2 sends JSON >=8192 bytes through an app-wide fetch queue keyed by sequential IDs.
+// Keep document previews on the authenticated window's direct channel, rather than exposing
+// their contents through that queue. Pack by JSON-escaped UTF-8 bytes (not character count).
+const PREVIEW_CHUNK_TEXT_BYTES: usize = 7168;
+const PREVIEW_CHANNEL_BYTES: usize = 8191;
+fn preview_delivery_chunks(text: &str, request_id: &str) -> Vec<Value> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut encoded_bytes = 0;
+    for ch in text.chars() {
+        let cost = match ch {
+            '\"' | '\\' | '\n' | '\r' | '\t' | '\u{0008}' | '\u{000c}' => 2,
+            ch if ch <= '\u{001f}' => 6,
+            ch => ch.len_utf8(),
+        };
+        if encoded_bytes + cost > PREVIEW_CHUNK_TEXT_BYTES {
+            parts.push(std::mem::take(&mut part));
+            encoded_bytes = 0;
+        }
+        part.push(ch);
+        encoded_bytes += cost;
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    let total = parts.len();
+    parts.into_iter().enumerate().map(|(index, text)| json!({ "previewChunk": { "requestId": request_id, "index": index, "total": total, "text": text } })).collect()
+}
 fn send_host(session: &Session, message: &Message) -> Result<(), String> {
+    if message.is_preview() {
+        let text = serde_json::to_string(&json!({ "senderWindowId": super::MAIN_WINDOW_LABEL, "windowLabel": session.registration.window_label, "message": message })).map_err(|e| e.to_string())?;
+        let channel = session
+            .host_channel
+            .as_ref()
+            .ok_or("Dialog host channel missing")?;
+        // Keep each authenticated private-channel delivery below Tauri's app-wide queue threshold.
+        for chunk in preview_delivery_chunks(&text, &message.request_id) {
+            if serde_json::to_vec(&chunk).map_err(|e| e.to_string())?.len() > PREVIEW_CHANNEL_BYTES
+            {
+                return Err("Preview channel chunk limit exceeded".into());
+            }
+            channel.send(chunk).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
     session
         .host_channel
         .as_ref()
@@ -426,6 +608,19 @@ fn reserve_action(session: &mut Session, message: &Message) -> Result<bool, Stri
             return Err("A dialog request ID cannot be reused for another action".into());
         }
         return Ok(false);
+    }
+    if message.data["action"] == "preview" {
+        if session.terminal_request.is_some() {
+            return Ok(false);
+        }
+        session.actions.retain(|_, m| m.data["action"] != "preview");
+        session
+            .receipts
+            .retain(|id, _| session.actions.contains_key(id));
+        session
+            .actions
+            .insert(message.request_id.clone(), message.clone());
+        return Ok(true);
     }
     let cancelling = message.data["action"] == "cancel";
     // Closing must bypass pending work and the retry limit, while still reserving the session.
@@ -692,9 +887,29 @@ pub(crate) fn dialog_publish(
         .get_mut(&host_id)
         .ok_or("Unknown dialog host")?;
     authorize(session, window.label(), true, Some(&message))?;
+    if message.message_type == "result"
+        && message.dialog_kind == "export"
+        && message.data["status"] == "frame"
+    {
+        if session.terminal_request.is_some() {
+            return Ok(());
+        }
+        return send_host(session, &message);
+    }
     if message.message_type == "result" {
         if !session.actions.contains_key(&message.request_id) {
+            if message.is_preview() {
+                return Ok(());
+            }
             return Err("Unknown dialog action receipt".into());
+        }
+        if message.is_preview()
+            && session
+                .actions
+                .get(&message.request_id)
+                .is_none_or(|m| m.data["action"] != "preview")
+        {
+            return Err("Preview receipt does not match a preview action".into());
         }
         // Acceptance and progress never complete a receipt or release its reservation.
         if message.data["status"] == "accepted"
@@ -2046,5 +2261,75 @@ mod tests {
                 true, false, expanded, false, false, true, false
             ));
         }
+    }
+    #[test]
+    fn preview_is_bounded_typed_and_does_not_reserve_export() {
+        let mut registry = Registry::default();
+        let snapshot = export_snapshot();
+        let (r, _) = register(&mut registry, snapshot.clone(), false).unwrap();
+        let session = registry.sessions.get_mut(&r.host_id).unwrap();
+        let mut action = snapshot.clone();
+        action.message_type = "action".into();
+        action.data = json!({"action":"preview","options":snapshot.data["options"]});
+        for i in 0..150 {
+            action.request_id = format!("preview-{i}");
+            assert!(action.validate().is_ok());
+            assert!(reserve_action(session, &action).unwrap());
+        }
+        assert!(session.terminal_request.is_none());
+        assert_eq!(session.actions.len(), 1);
+        let mut result = action.clone();
+        result.message_type = "result".into();
+        result.data = json!({"status":"preview","preview":{"url":format!("data:image/png;base64,{}", "A".repeat(20000)),"kind":"image","width":100,"height":100,"warnings":[]}});
+        assert!(result.validate().is_ok());
+        result.data["preview"]["url"] = json!("https://example.com/image.png");
+        assert!(result.validate().is_err());
+        result.data["preview"]["url"] = json!(format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_PREVIEW_BYTES)
+        ));
+        assert!(result.validate().is_err());
+        action.request_id = "export".into();
+        action.data["action"] = json!("export");
+        assert!(reserve_action(session, &action).unwrap());
+    }
+    #[test]
+    fn validates_frame_revision_and_presentation_types() {
+        let mut snapshot = export_snapshot();
+        let presentation = json!({"width":600,"height":400,"linked":false,"preset":"custom","dpi":300,"crop":"content","background":"white"});
+        snapshot.data["options"]["presentation"] = presentation.clone();
+        assert!(snapshot.validate().is_ok());
+        for value in [json!(0), json!(1.5), Value::Null] {
+            snapshot.data["options"]["presentation"]["width"] = value;
+            assert!(snapshot.validate().is_err());
+        }
+        snapshot.message_type = "result".into();
+        snapshot.data = json!({"status":"frame","frame":{"page":{"width":100,"height":100},"content":{"width":80,"height":80},"revision":2}});
+        assert!(snapshot.validate().is_ok());
+        snapshot.data["frame"]["revision"] = Value::Null;
+        assert!(snapshot.validate().is_err());
+    }
+    #[test]
+    fn preview_chunks_remain_private_with_worst_json_escaping() {
+        let text = format!(
+            "{}{}{}",
+            "\u{0001}".repeat(4096),
+            "??".repeat(4096),
+            "\\\"".repeat(4096)
+        );
+        let chunks = preview_delivery_chunks(&text, &"a".repeat(128));
+        assert!(chunks.len() < 10);
+        assert_eq!(
+            preview_delivery_chunks(&"A".repeat(MAX_PREVIEW_BYTES), "preview").len(),
+            MAX_PREVIEW_BYTES.div_ceil(PREVIEW_CHUNK_TEXT_BYTES)
+        );
+        assert!(chunks
+            .iter()
+            .all(|c| serde_json::to_vec(c).unwrap().len() <= PREVIEW_CHANNEL_BYTES));
+        let restored: String = chunks
+            .iter()
+            .map(|c| c["previewChunk"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(restored, text);
     }
 }

@@ -1,3 +1,4 @@
+import { useExportPreviewEnabled } from "./dialogs/useExportPreviewEnabled";
 import { acquireNativeUtilitySuspension } from "./nativeUtilitySuspension";
 import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { nativePrompt, useNativePrompt } from "./nativePrompt";
@@ -773,9 +774,10 @@ import {
 import { decodeDocumentBytes } from "./documentText";
 import { boundedHistoryPast } from "./documentHistoryBudget";
 import { ExportForm, rasterExportFormatForDialogFormat } from "./dialogs/ExportForm";
-import type { ExportDialogState, ExportOptions } from "./dialogs/exportOptions";
+import type { ExportDialogState, ExportOptions, ExportPreviewResult, ExportFrame } from "./dialogs/exportOptions";
 import { exportOptions } from "./dialogs/exportOptionsValidation";
 import type { ExportDialogResult } from "./dialogs/dialogProtocol";
+import { exportDialogHeight, exportDialogSizeError } from "./dialogs/exportPresentation";
 import { DialogCoordinator } from "./dialogs/DialogCoordinator";
 import { nativeDialogTransport } from "./dialogs/dialogTransport";
 import { PageSizeForm, formatPageSizeFieldValue, pageSizeUnitShortLabel, type PageSizeDraft } from "./dialogs/PageSizeForm";
@@ -1593,7 +1595,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.20.10.40-opus";
+const CURRENT_BUILD_STAMP = "10.20.15.05-opus";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2353,6 +2355,10 @@ export function MainWindow({
   const browserExportPendingRef = useRef(false);
   const exportGrantsRef = useRef(new Map<string, { path: string; filename: string; format: string }>());
   const exportToTabRef = useRef<(tabId: string, options: ExportOptions, live: () => boolean, progress?: (notice: string) => Promise<void>) => Promise<ExportDialogResult>>(async () => { throw new Error("Export is unavailable"); });
+  const exportPreviewEnabled = useExportPreviewEnabled(true);
+  const exportPreviewEnabledRef = useRef(exportPreviewEnabled);
+  exportPreviewEnabledRef.current = exportPreviewEnabled;
+  const previewExportRef = useRef<(tabId: string, options: ExportOptions, live: () => boolean) => Promise<ExportPreviewResult>>(async () => { throw new Error("Preview is unavailable"); });
   const chooseExportDestinationRef = useRef<(tabId: string, options: ExportOptions, live: () => boolean) => Promise<ExportDialogResult>>(async () => { throw new Error("Export is unavailable"); });
   const [pageFitPrompt, setPageFitPrompt] = useState<ImportedPageFitPromptState | undefined>();
   tabPageFitRef.current = pageFitPrompt;
@@ -8342,6 +8348,7 @@ export function MainWindow({
     const coordinator = new DialogCoordinator(nativeDialogTransport, {
       applyPageSize: (tabId, size) => applyPageSizeToTabRef.current(tabId, size), onError: setStatus,
       export: (tabId, options, live, progress) => exportToTabRef.current(tabId, options, live, progress),
+      previewExport: (tabId, options, live) => previewExportRef.current(tabId, options, live),
       chooseExportDestination: (tabId, options, live) => chooseExportDestinationRef.current(tabId, options, live),
       onSettled: (tabId, _reason, kind) => { if (kind === "export") exportGrantsRef.current.delete(tabId); }
     });
@@ -9237,7 +9244,7 @@ export function MainWindow({
       const coordinator = dialogCoordinatorRef.current;
       if (!coordinator) { setStatus("Export could not open: the dialog host is unavailable."); return; }
       const title = documentTabsRef.current.find(tab => tab.id === tabId)?.title ?? "Untitled";
-      void coordinator.openExport(tabId, { title, options: exportOptions(state) })
+      void coordinator.openExport(tabId, { title, options: exportOptions(state), frame: exportPreviewEnabledRef.current ? exportDialogFrame(documentForFlush()) : undefined })
         .catch(error => setStatus(`Export could not open: ${String(error)}`));
     } else {
       browserExportTabRef.current = tabId;
@@ -9247,6 +9254,25 @@ export function MainWindow({
     setStatus("Export ready");
   }, []);
 
+  useEffect(() => {
+    const coordinator = dialogCoordinatorRef.current;
+    if (!coordinator) return;
+    if (!exportPreviewEnabled) { coordinator.cancelExportPreviews(); return; }
+    for (const tab of documentTabs) {
+      if (!coordinator.exportSessionId(tab.id)) continue;
+      const source = tab.id === activeDocumentTabIdRef.current ? documentForFlush() : documentTabSnapshotsRef.current.get(tab.id)?.history.present;
+      if (source) void coordinator.updateExportFrame(tab.id, exportDialogFrame(source)).catch(error => setStatus(`Export preview update failed: ${String(error)}`));
+    }
+  }, [document, documentTabs, exportPreviewEnabled, activeAtomLabelEdit]);
+
+  previewExportRef.current = async (tabId, options, live) => {
+    if (!exportPreviewEnabledRef.current || !live()) throw new Error("Preview is unavailable.");
+    const source = tabId === activeDocumentTabIdRef.current ? documentForFlush() : documentTabSnapshotsRef.current.get(tabId)?.history.present;
+    if (!source) throw new Error("The originating drawing was closed.");
+    const result = await createDialogExportPreview(source, options, () => exportPreviewEnabledRef.current && live());
+    if (!exportPreviewEnabledRef.current || !live()) throw new Error("Preview was superseded.");
+    return result;
+  };
   chooseExportDestinationRef.current = async (tabId, options, live) => {
     try {
       const descriptor = getExportFormatDescriptor(options.format);
@@ -9281,6 +9307,9 @@ export function MainWindow({
       if (!source) throw new Error("The originating drawing is unavailable.");
       await progress?.("Preparing export…");
       if (!live()) throw new Error("The originating drawing was closed or replaced.");
+      // The dialog may not have received the preference change yet. The owner decides
+      // whether sizing is enabled at export time, including after the progress await.
+      if (!exportPreviewEnabledRef.current) options = { ...options, presentation: undefined };
       const result = await createDialogExportResult(source, { ...options, busy: false });
       if (!live()) throw new Error("The originating drawing was closed or replaced.");
       const filename = ensureExportFileExtension(options.filename, descriptor.extensions);
@@ -9311,6 +9340,12 @@ export function MainWindow({
       throw error;
     }
   };
+
+  const browserExportSource = exportPreviewEnabled && exportDialog
+    ? browserExportTabRef.current === activeDocumentTabIdRef.current
+      ? documentForFlush()
+      : documentTabSnapshotsRef.current.get(browserExportTabRef.current ?? "")?.history.present
+    : undefined;
 
   const chooseExportDestination = useCallback(async () => {
     if (!exportDialog || browserExportPendingRef.current) return;
@@ -19689,7 +19724,7 @@ export function MainWindow({
         {exportDialog && !isDesktopRuntime() ? (
           <div style={exportDialogBackdropStyle}>
             <div style={{ width: 480, maxWidth: "100%" }}>
-              <ExportForm state={exportDialog} onChange={setExportDialog} error={exportError} notice={exportNotice} completed={exportCompleted}
+              <ExportForm state={exportDialog} frame={browserExportSource ? exportDialogFrame(browserExportSource) : undefined} renderPreview={browserExportSource ? (options, signal) => createDialogExportPreview(browserExportSource, options, () => !signal?.aborted) : undefined} onChange={setExportDialog} error={exportError} notice={exportNotice} completed={exportCompleted}
                 title={documentTabs.find(tab => tab.id === browserExportTabRef.current)?.title}
                 onCancel={cancelExportDialog} onChooseDestination={chooseExportDestination} onSubmit={submitExportDialog} />
             </div>
@@ -29972,14 +30007,96 @@ export function formatExportStatus(
     : `Exported ${label}`;
 }
 
+// The same identity-keyed frame serves dialog renders, debounced previews and final export.
+// Weak keys release cached frames with their source documents.
+const exportContentFrames = new WeakMap<ChemDraftDocument, ChemDraftDocument>();
+function exportPresentationDocument(document: ChemDraftDocument, crop: "page" | "content"): ChemDraftDocument {
+  if (crop === "page") return document;
+  let framed = exportContentFrames.get(document);
+  if (!framed) {
+    framed = copyAsScopedDocument({ ...document, selection: { ...document.selection, objectIds: [] } });
+    exportContentFrames.set(document, framed);
+  }
+  return framed;
+}
+
+const exportFrameCache = new WeakMap<ChemDraftDocument, ExportFrame>();
+let exportFrameRevision = 0;
+export function exportDialogFrame(document: ChemDraftDocument): ExportFrame {
+  const cached = exportFrameCache.get(document);
+  if (cached) return cached;
+  const content = exportPresentationDocument(document, "content").pages[0];
+  const page = document.pages[0];
+  const frame = { page: { width: page.width, height: page.height }, content: { width: content.width, height: content.height }, revision: ++exportFrameRevision };
+  exportFrameCache.set(document, frame);
+  return frame;
+}
+
+export async function createDialogExportPreview(document: ChemDraftDocument, options: ExportOptions, live: () => boolean = () => true): Promise<ExportPreviewResult> {
+  if (!live()) throw new Error("Preview was superseded.");
+  // Webviews cannot reliably embed PDFs. Show the SVG page layout used by the PDF
+  // writer, with PDF guides and its white background, without generating PDF bytes.
+  // Preview less portable raster formats through the same native renderer as opaque PNG.
+  const state: ExportDialogState = options.format === "pdf"
+    ? { ...options, busy: false, format: "svg", svg: { includeWarnings: true, includePageGuides: options.pdf.includePageGuides },
+      presentation: options.presentation ? { ...options.presentation, background: "white" } : undefined }
+    : options.format === "tiff" || options.format === "bmp" || options.format === "gif"
+    ? { ...options, busy: false, format: "png", raster: { ...options.raster, background: "white" } }
+    : { ...options, busy: false };
+  const result = await createDialogExportResult(document, state, true);
+  // Native rasterization already in flight cannot be interrupted. Avoid
+  // base64 encoding or transporting its bytes after a newer request supersedes this one.
+  if (!live()) throw new Error("Preview was superseded.");
+  const bytes = result.kind === "text" ? new TextEncoder().encode(result.contents) : result.bytes;
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  const framed = exportPresentationDocument(document, options.presentation?.crop ?? "page").pages[0];
+  const width = options.presentation?.width ?? framed.width;
+  const height = options.presentation ? exportDialogHeight(options.presentation, framed.height / framed.width) : framed.height;
+  const scale = Math.min(1, 800 / Math.max(width, height));
+  const clipped = framed.objects.some(object => object.x < 0 || object.y < 0 || object.x + object.width > framed.width || object.y + object.height > framed.height);
+  const warnings = [...result.warnings.map(warning => warning.message), ...(clipped ? ["Objects extend beyond the export frame and may be clipped. Choose Content crop or adjust the page."] : [])];
+  const boundedWarnings = warnings.slice(0, 99).map(warning => warning.replaceAll("\0", "").slice(0, 2048));
+  if (warnings.length > 99) boundedWarnings.push("Additional warnings omitted. Review the final export warnings for details.");
+  return { url: `data:${result.mimeType};base64,${btoa(binary)}`, kind: "image",
+    width: Math.max(1, width * scale), height: Math.max(1, height * scale),
+    warnings: boundedWarnings };
+}
+
 export async function createDialogExportResult(
   document: ChemDraftDocument,
-  state: ExportDialogState
+  state: ExportDialogState,
+  preview = false
 ): Promise<ExportResult> {
   const descriptor = getExportFormatDescriptor(state.format);
+  const presentation = state.presentation ?? { width: document.pages[0].width, dpi: 96, crop: "page" as const, background: "white" as const };
+  const sized = state.presentation !== undefined;
+  if (state.format === "svg" || state.format === "pdf" || rasterExportFormatForDialogFormat(state.format)) {
+    document = exportPresentationDocument(document, presentation.crop);
+  }
+  if (sized && !preview && (state.format === "svg" || state.format === "pdf" || rasterExportFormatForDialogFormat(state.format))) {
+    const error = exportDialogSizeError(state, document.pages[0].height / document.pages[0].width);
+    if (error) throw new Error(error);
+  }
+  let width = sanitizedDialogNumber(presentation.width, 800, 1, 8192);
+  const ratio = document.pages[0].height / document.pages[0].width;
+  // Cap renderer dimensions, not just the displayed image. Keep final export sizing intact.
+  const requestedHeight = exportDialogHeight(presentation, ratio);
+  let height = Number.isFinite(requestedHeight) && requestedHeight > 0 ? requestedHeight : 800;
+  if (preview) {
+    const scale = Math.min(1, 800 / Math.max(width, height));
+    width = Math.max(1, width * scale);
+    height = Math.max(1, height * scale);
+  }
+  if (sized && height > 8192 && (state.format === "svg" || state.format === "pdf" || rasterExportFormatForDialogFormat(state.format))) throw new Error("Export height exceeds 8192 pixels. Reduce the width.");
+  const dpi = preview ? 96 : sanitizedDialogNumber(presentation.dpi, 96, 36, 1200);
 
   if (state.format === "svg") {
     const result = exportPhase4Svg(document, {
+      ...(sized || preview ? { outputWidth: preview ? width : Number((width / dpi * 25.4).toFixed(4)),
+      outputHeight: preview ? height : Number((height / dpi * 25.4).toFixed(4)),
+      outputUnit: preview ? undefined : "mm" as const } : {}),
+      ...(sized ? { background: presentation.background === "transparent" ? "transparent" as const : "#ffffff" } : {}),
       includeWarnings: state.svg.includeWarnings,
       includePageGuides: state.svg.includePageGuides
     });
@@ -29995,6 +30112,7 @@ export async function createDialogExportResult(
 
   if (state.format === "pdf") {
     return exportPhase4Pdf(document, {
+      ...(sized || preview ? { outputWidth: width / dpi * 96, outputHeight: height / dpi * 96 } : {}),
       compress: state.pdf.compress,
       includePageGuides: state.pdf.includePageGuides
     });
@@ -30023,11 +30141,13 @@ export async function createDialogExportResult(
     // The SVG must omit its white page rect for a transparent request, otherwise resvg
     // paints it over the (intentionally unfilled) pixmap and the PNG comes out opaque white.
     const svgResult = exportPhase4Svg(document, {
+      ...(sized || preview ? { outputWidth: width, outputHeight: height } : {}),
       includeWarnings: true,
       background: transparent ? "transparent" : "#ffffff"
     });
     const rasterResult = await rasterizeSvgNative(svgResult.contents, rasterFormat, {
-      scale: sanitizedDialogNumber(state.raster.scale, 1, 1, 4),
+      scale: sized || preview ? 1 : sanitizedDialogNumber(state.raster.scale, 1, 1, 4),
+      ...(sized || preview ? { cssPxPerInch: dpi } : {}),
       background: transparent ? "transparent" : "#ffffff",
       jpegQuality: sanitizedDialogNumber(state.raster.jpegQuality, 90, 1, 100),
       maxDimensionPx: sanitizedDialogNumber(state.raster.maxDimensionPx, 8192, 1, 8192)
