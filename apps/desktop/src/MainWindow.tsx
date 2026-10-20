@@ -796,8 +796,8 @@ import {
 import { applyKeybindingSchemeToCommands, chemDrawHoveredTargetHotkeyCommand } from "./keybindingScheme";
 import { isCompoundLayoutCommand } from "./compoundLayoutSettings";
 import { useCompoundLayoutTools } from "./useCompoundLayoutTools";
-import { ArrangementSpacingDialog } from "./ArrangementSpacingDialog";
-import { arrangeSelectedDocumentObjects, adjustArrangementSpacing, selectedArrangementObjectIds } from "./documentWorkflow";
+import { ArrangementSpacingDialog, arrangementSpacingPreviewSvg } from "./ArrangementSpacingDialog";
+import { arrangeSelectedDocumentObjects, adjustArrangementSpacing, arrangementSpacingRange, selectedArrangementObjectIds } from "./documentWorkflow";
 import { arrangementLayoutForCommand, arrangementGridAlignmentForCommand } from "./commands";
 import { loadKeybindingSettings, type KeybindingScheme } from "./keybindingSettings";
 import { rasterizeSvgNative, type NativeRasterExportFormat } from "./nativeRasterExport";
@@ -1632,7 +1632,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.19.13.02-codex";
+const CURRENT_BUILD_STAMP = "10.19.16.11-codex";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2815,11 +2815,14 @@ export function MainWindow({
   const compoundLayoutsEnabledRef = useRef(compoundLayoutsEnabled);
   compoundLayoutsEnabledRef.current = compoundLayoutsEnabled;
   const [spacingSource, setSpacingSource] = useState<ChemDraftDocument | undefined>();
+  const nativeSpacingSourcesRef = useRef(new Map<string, ChemDraftDocument>());
+  const openArrangementSpacingRef = useRef<() => void>(() => {});
   const layerActions = useMemo(() => createLayerActions(document, compoundLayoutsEnabled), [document, compoundLayoutsEnabled]);
   const previousCompoundLayoutsEnabled = useRef(compoundLayoutsEnabled);
   useEffect(() => {
     if (!compoundLayoutsEnabled) {
       setSpacingSource(undefined);
+      void dialogCoordinatorRef.current?.closeArrangementSpacing();
       if (previousCompoundLayoutsEnabled.current) void dismissToolsetPopovers().catch(() => undefined);
     }
     previousCompoundLayoutsEnabled.current = compoundLayoutsEnabled;
@@ -8352,10 +8355,54 @@ export function MainWindow({
     // Trigger the existing autosave of all tabs, without switching the visible drawing.
     setDocumentTabs([...documentTabsRef.current]);
   };
+  const spacingSourceForTab = (tabId: string): ChemDraftDocument => {
+    if (!compoundLayoutsEnabledRef.current) throw new Error("Enable Compound layout tools in Settings");
+    const source = nativeSpacingSourcesRef.current.get(tabId);
+    const current = tabId === activeDocumentTabIdRef.current ? documentHistoryRef.current.present
+      : documentTabSnapshotsRef.current.get(tabId)?.history.present;
+    if (!source || current !== source) throw new Error("Drawing changed. Close and reopen Adjust spacing to preview the current selection.");
+    return source;
+  };
+  const previewSpacingRef = useRef<(tabId: string, percent: number) => string>(() => "");
+  previewSpacingRef.current = (tabId, percent) => arrangementSpacingPreviewSvg(spacingSourceForTab(tabId), percent);
+  const applySpacingRef = useRef<(tabId: string, percent: number) => void>(() => {});
+  applySpacingRef.current = (tabId, percent) => {
+    const source = spacingSourceForTab(tabId);
+    if (tabId === activeDocumentTabIdRef.current && isSnapshotSessionActive()) throw new Error("Finish the current drawing gesture, then save the spacing again.");
+    const result = adjustArrangementSpacing(source, percent / 100);
+    if (!result.ok) throw new Error(result.status);
+    if (tabId === activeDocumentTabIdRef.current) {
+      commitDocumentChange(result.document, "Adjust arrangement spacing"); setStatus(result.status); return;
+    }
+    const snapshot = documentTabSnapshotsRef.current.get(tabId)!;
+    if (result.document === source) return;
+    const present = normalizeCommittedDocument(result.document);
+    documentUndoLabelsRef.current.set(present, "Adjust arrangement spacing");
+    documentTabSnapshotsRef.current.set(tabId, { ...snapshot,
+      history: { past: boundedHistoryPast([...snapshot.history.past, source], present), present, future: [] },
+      file: { ...snapshot.file, dirty: true }, status: result.status });
+    nonPristineTabsRef.current.add(tabId);
+    setDocumentTabs([...documentTabsRef.current]);
+  };
+  openArrangementSpacingRef.current = () => {
+    if (!isDesktopRuntime()) { setSpacingSource(documentRef.current); return; }
+    const coordinator = dialogCoordinatorRef.current;
+    if (!coordinator) { setStatus("Adjust spacing could not open: the dialog host is unavailable."); return; }
+    const tabId = activeDocumentTabIdRef.current;
+    const source = documentHistoryRef.current.present;
+    if (!coordinator.hasArrangementSpacing(tabId)) nativeSpacingSourcesRef.current.set(tabId, source);
+    const range = arrangementSpacingRange(source);
+    const title = documentTabsRef.current.find(tab => tab.id === tabId)?.title ?? "Untitled";
+    void coordinator.openArrangementSpacing(tabId, { title: title.slice(0, 256), minPercent: Math.round(range.min * 100), maxPercent: Math.round(range.max * 100) })
+      .catch(error => { nativeSpacingSourcesRef.current.delete(tabId); setStatus(`Adjust spacing could not open: ${String(error)}`); });
+  };
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     const coordinator = new DialogCoordinator(nativeDialogTransport, {
-      applyPageSize: (tabId, size) => applyPageSizeToTabRef.current(tabId, size), onError: setStatus
+      applyPageSize: (tabId, size) => applyPageSizeToTabRef.current(tabId, size),
+      previewArrangementSpacing: (tabId, percent) => previewSpacingRef.current(tabId, percent),
+      applyArrangementSpacing: (tabId, percent) => applySpacingRef.current(tabId, percent),
+      onSpacingSettled: tabId => { nativeSpacingSourcesRef.current.delete(tabId); }, onError: setStatus
     });
     dialogCoordinatorRef.current = coordinator;
     return () => { dialogCoordinatorRef.current = undefined; void coordinator.dispose(); };
@@ -9503,7 +9550,7 @@ export function MainWindow({
         if (isCompoundLayoutCommand(action.id)) {
           if (!compoundLayoutsEnabled) { setStatus("Enable Compound layout tools in Settings"); return; }
           if (selectedArrangementObjectIds(documentRef.current).length < 2) { setStatus("Select at least two objects or groups"); return; }
-          if (action.id === "layout.adjustArrangementSpacing") { setSpacingSource(documentRef.current); return; }
+          if (action.id === "layout.adjustArrangementSpacing") { openArrangementSpacingRef.current(); return; }
           const layout = arrangementLayoutForCommand(action.id)!;
           let operationStatus = "";
           commitDocumentChange(current => {
@@ -19624,7 +19671,7 @@ export function MainWindow({
           />
         ) : null}
       </section>
-      {spacingSource ? <ArrangementSpacingDialog document={spacingSource} onCancel={() => setSpacingSource(undefined)}
+      {!isDesktopRuntime() && spacingSource ? <ArrangementSpacingDialog document={spacingSource} onCancel={() => setSpacingSource(undefined)}
         onSave={factor => {
           if (documentRef.current !== spacingSource) {
             setSpacingSource(undefined); setStatus("Drawing changed. Reopen Adjust spacing to preview the current selection."); return;

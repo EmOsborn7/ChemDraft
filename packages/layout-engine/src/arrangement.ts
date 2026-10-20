@@ -7,7 +7,8 @@ export type ArrangementGridAlignment = typeof ArrangementGridAlignments[number];
 export interface ArrangementItem { id: string; bounds: LayoutBounds; anchor?: LayoutPoint }
 export interface ArrangementPlacement extends ArrangementItem { dx: number; dy: number }
 export interface ArrangementOptions {
-  /** Minimum empty space between visible item bounds, in document CSS pixels. */
+  /** Empty space between visible item bounds, in document CSS pixels. Explicit values are fixed.
+   * Defaults to 48; Row/Column may reduce that to 12 when needed to fit pageBounds. */
   gap?: number;
   /** Grid defaults to a roughly square number of columns. */
   columns?: number;
@@ -91,13 +92,22 @@ export function planObjectArrangement(
       width: item.bounds.width, height: item.bounds.height
     }));
   } else if (layout === "row" || layout === "column") {
+    let linearGap = gap;
+    if (options.pageBounds && options.gap === undefined) {
+      const available = layout === "row" ? options.pageBounds.width : options.pageBounds.height;
+      const occupied = ordered.reduce((sum, item) => sum + (layout === "row" ? item.bounds.width : item.bounds.height), 0);
+      // Tighten only the default spacing. Preserve a visible clearance, and round down so
+      // floating-point accumulation cannot push a fitted endpoint beyond the page edge.
+      const fittingGap = Math.floor((available - occupied) / (ordered.length - 1) * 1e6) / 1e6;
+      linearGap = Math.min(gap, Math.max(12, fittingGap));
+    }
     let cursor = 0;
     targets = ordered.map((item) => {
       const { width, height } = item.bounds;
       const bounds = layout === "row"
         ? { x: cursor, y: item.bounds.y-itemCenter(item).y, width, height }
         : { x: item.bounds.x-itemCenter(item).x, y: cursor, width, height };
-      cursor += (layout === "row" ? width : height) + gap;
+      cursor += (layout === "row" ? width : height) + linearGap;
       return bounds;
     });
   } else {

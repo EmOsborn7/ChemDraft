@@ -16,6 +16,8 @@ The desktop palette is a separate Tauri window behind `src/window-manager`. Pale
 Compound layouts are opt-in: enable **Compound layout tools** in Settings/Preferences.
 Select two or more compounds or groups, then use Arrange Selection in Main, Art or Layout;
 long-press or press Arrow Down for Circle, Oval, Grid left/center/right, Row or Column.
-Adjust spacing previews distances while retaining molecule sizes. Save is one Undo step;
+Row and Column automatically tighten their default gaps when needed to fit the page,
+keeping at least 12 document pixels between visible compound bounds and preserving molecule sizes.
+Adjust spacing opens a movable native window on desktop, previewing distances while retaining molecule sizes. Save is one Undo step;
 Cancel/Escape makes no change. Toolbar/context items are hidden and direct commands refuse
 while the setting is off. Existing drawing/export behavior is unchanged by enabling the setting.

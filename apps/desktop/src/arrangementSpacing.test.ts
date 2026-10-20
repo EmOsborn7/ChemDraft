@@ -1,9 +1,9 @@
 import {describe,expect,it} from "vitest";
-import {applyPatches} from "@chemdraft/chem-core";
+import {applyPatches, type TextObject} from "@chemdraft/chem-core";
 import {nativeSingleBondGraphSmiles} from "@chemdraft/document-workflow-core";
 import {adjustArrangementSpacing,arrangementSpacingRange,arrangementSpacingPreviewBounds,arrangeSelectedDocumentObjects,
   createPhase4Document,createNativeSingleBondMolecule,selectDocumentObjects,
-  createNativeSavePayload,openNativeDocument} from "./documentWorkflow";
+  createNativeSavePayload,openNativeDocument,setDocumentCustomPageSize} from "./documentWorkflow";
 function fixture(layout:"circle"|"oval"|"row"|"column"|"grid") {
   let doc=createPhase4Document("Spacing");
   for(let i=0;i<5;i++) doc=applyPatches(doc,[{op:"addObject",pageId:doc.pages[0].id,
@@ -12,6 +12,68 @@ function fixture(layout:"circle"|"oval"|"row"|"column"|"grid") {
   return arrangeSelectedDocumentObjects(doc,layout,{gap:100}).document;
 }
 describe("arrangement spacing with fixed molecule sizes",()=>{
+  it.each([12.2, 12.3])("matches the integer-spacing oracle for %s-pixel captions at every page edge", thickness => {
+    for (const axis of ["horizontal", "vertical"] as const) for (const edge of ["low", "high"] as const) {
+      let document = setDocumentCustomPageSize(createPhase4Document("Aligned decimal captions"), {
+        width: (axis === "horizontal" ? 1000 : 350) / 96,
+        height: (axis === "vertical" ? 1000 : 350) / 96, unit: "inch"
+      });
+      const position = edge === "low" ? 0 : 350 - thickness;
+      const captions: TextObject[] = [100, 300, 500].map((p, i) => ({
+        id: `edge-${i}`, type: "text", text: "Caption", spans: [], rotation: 0, style: {},
+        x: axis === "horizontal" ? p : position, y: axis === "horizontal" ? position : p,
+        width: axis === "horizontal" ? 60 : thickness, height: axis === "horizontal" ? thickness : 60
+      }));
+      document = applyPatches(document, captions.map(object => ({ op: "addObject" as const, pageId: document.pages[0].id, object })));
+      document = selectDocumentObjects(document, document.pages[0].id, captions.map(caption => caption.id));
+      // Exercise the same decimal coordinates after a native XML save/reopen.
+      document = openNativeDocument(createNativeSavePayload(document).contents).document!;
+      const valid = Array.from({ length: 126 }, (_, i) => i + 25).filter(percent => adjustArrangementSpacing(document, percent / 100).ok);
+      expect(valid).toEqual(Array.from({ length: 115 }, (_, i) => i + 36));
+      expect(arrangementSpacingRange(document)).toEqual({ min: Math.min(...valid) / 100, max: Math.max(...valid) / 100 });
+    }
+  });
+  it("still refuses real page overflow and retains genuine tiny page-axis movement", () => {
+    let document = setDocumentCustomPageSize(createPhase4Document("Small real movement"), { width: 1000 / 96, height: 350 / 96, unit: "inch" });
+    const captions: TextObject[] = [12.2, 12.2, 12.200002].map((height, i) => ({
+      id: `tiny-${i}`, type: "text", text: "Caption", spans: [], rotation: 0, style: {},
+      x: 100 + i * 200, y: 350 - height, width: 60, height
+    }));
+    document = applyPatches(document, captions.map(object => ({ op: "addObject" as const, pageId: document.pages[0].id, object })));
+    document = selectDocumentObjects(document, document.pages[0].id, captions.map(caption => caption.id));
+    const valid = Array.from({ length: 126 }, (_, i) => i + 25).filter(percent => adjustArrangementSpacing(document, percent / 100).ok);
+    const range = arrangementSpacingRange(document);
+    expect(range).toEqual({ min: Math.min(...valid) / 100, max: Math.max(...valid) / 100 });
+    expect(range.max).toBeLessThan(1.5);expect(adjustArrangementSpacing(document, 1.5).ok).toBe(false);
+    const overflow = applyPatches(document, [{ op: "updateObject", objectId: captions[0].id, changes: { y: captions[0].y + 0.001 } }]);
+    const result = adjustArrangementSpacing(overflow, 0.9);
+    expect(result.ok).toBe(false);expect(result.document).toBe(overflow);
+  });
+  it.each(["horizontal", "vertical"] as const)("exposes a narrow valid expansion interval for overlapping %s molecules", axis => {
+    let document = createPhase4Document("Overlapping compounds");
+    const molecules = [8.5, 47.5].map((x, i) => {
+      const molecule = createNativeSingleBondMolecule(document, { x: 40, y: 100 });
+      const oldX = molecule.x, oldWidth = molecule.width;
+      molecule.atoms = molecule.atoms.map(atom => ({ ...atom, x: x + (atom.x - oldX) * 40 / oldWidth }));
+      molecule.id = `overlap-${i}`;molecule.x = x;molecule.width = 40;
+      if (axis === "vertical") {
+        molecule.atoms = molecule.atoms.map(atom => ({ ...atom, x: atom.y, y: atom.x }));
+        const { x, y, width, height } = molecule;
+        Object.assign(molecule, { x: y, y: x, width: height, height: width });
+      }
+      return molecule;
+    });
+    document = applyPatches(document, molecules.map(object => ({ op: "addObject" as const, pageId: document.pages[0].id, object })));
+    document = setDocumentCustomPageSize(document, { width: axis === "horizontal" ? 1 : 11, height: axis === "vertical" ? 1 : 11, unit: "inch" });
+    document = selectDocumentObjects(document, document.pages[0].id, molecules.map(molecule => molecule.id));
+    const range = arrangementSpacingRange(document);
+    expect(range).toEqual({ min: 1, max: 1.43 });
+    const valid = Array.from({ length: 51 }, (_, i) => i + 100).filter(percent => adjustArrangementSpacing(document, percent / 100).ok);
+    expect(valid).toEqual([100, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143]);
+    for (const percent of valid) expect(percent / 100).toBeLessThanOrEqual(range.max);
+    expect(adjustArrangementSpacing(document, 1.35).ok).toBe(true);
+    expect(adjustArrangementSpacing(document, 1.5).ok).toBe(false);
+  });
   it.each(["circle","oval","row","column","grid"] as const)("compacts %s by translation with chemistry, sizes preserved",layout=>{
     let before=fixture(layout);
     const range=arrangementSpacingRange(before);expect(range.min).toBeLessThan(1);

@@ -223,3 +223,21 @@ download test's sandbox-denied loopback bind. Excluding only
 all remaining tests and binary/doc targets. Temporary Sparkle links and Cargo output were removed.
 Windows code and `CURRENT_BUILD_STAMP` are unchanged. Windows native compilation and both platforms'
 hands-on window checks remain unverified; rerun the full Rust suite outside the sandbox.
+
+## Compound spacing adapter
+
+`arrangementSpacing` reuses the modeless native host, with a 540 × 600 initial client and
+resizing enabled. Sessions are keyed by originating tab and kind, allowing Page Size and
+spacing to coexist. Closing/replacing a tab closes both; disabling layouts closes spacing only.
+The owner retains an immutable document snapshot and validates it again on preview/Save.
+Changes go through the owning tab's history, including when inactive, with one undo entry.
+
+The dialog receives only the title, allowed percentage range and rendered preview, never
+document objects or file paths. Nonterminal `preview` actions coalesce in the coordinator;
+Save and Cancel retain session-wide terminal reservations. Owner-only `preview` deliveries
+carry at most 2000 base64 characters, at most 1024 chunks, over the existing private channels.
+No 4096-byte delivery limit or capability family was broadened. Rust and TypeScript validate
+both kind-specific messages. The host assembles only the current request in order, with a
+bounded total and a timeout; stale/partial/error previews cannot enable Save. Native bootstrap,
+focus/ownership, monitor placement, position persistence and native-prompt suspension reuse
+the shared host unchanged. Browser builds use the same draft-only form in their fallback.

@@ -17,12 +17,22 @@ const OVERSIZED_ERROR: &str = "Dialog operation failed; error details exceeded t
 struct DialogKindSpec {
     maximizable: bool,
     resizable: bool,
+    title: &'static str,
+    size: (f64, f64),
 }
 fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
     match kind {
         "pageSize" => Ok(DialogKindSpec {
             maximizable: false,
             resizable: false,
+            title: "Custom Page Size",
+            size: (420.0, 300.0),
+        }),
+        "arrangementSpacing" => Ok(DialogKindSpec {
+            maximizable: false,
+            resizable: true,
+            title: "Adjust arrangement spacing",
+            size: (540.0, 600.0),
         }),
         _ => Err("Unknown dialog kind".into()),
     }
@@ -59,6 +69,35 @@ enum Action {
         unit: String,
     },
     Cancel,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpacingSnapshot {
+    title: String,
+    min_percent: u32,
+    max_percent: u32,
+}
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum SpacingAction {
+    Apply { percent: u32 },
+    Preview { percent: u32 },
+    Cancel,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpacingPreview {
+    percent: u32,
+    index: usize,
+    count: usize,
+    chunk: String,
+    error: Option<String>,
+}
+fn valid_percent(percent: u32) -> bool {
+    (25..=150).contains(&percent)
+}
+fn valid_title(title: &str) -> bool {
+    !title.is_empty() && title.encode_utf16().count() <= 256
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,7 +144,7 @@ impl Message {
         if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > MAX_BYTES
             || self.protocol_version != 1
             || self.owner_window_id != super::MAIN_WINDOW_LABEL
-            || self.dialog_kind != "pageSize"
+            || kind_spec(&self.dialog_kind).is_err()
             || !token(&self.document_tab_id)
             || !token(&self.session_id)
             || !token(&self.request_id)
@@ -115,20 +154,60 @@ impl Message {
             return Err("Invalid dialog envelope or payload limit exceeded".into());
         }
         let valid = match self.message_type.as_str() {
-            "snapshot" => serde_json::from_value::<Snapshot>(self.data.clone()).is_ok_and(|s| {
-                !s.title.is_empty()
-                    && s.title.encode_utf16().count() <= 256
-                    && valid_size(s.width, s.height, &s.unit)
-            }),
+            "snapshot" => {
+                if self.dialog_kind == "pageSize" {
+                    serde_json::from_value::<Snapshot>(self.data.clone()).is_ok_and(|s| {
+                        valid_title(&s.title) && valid_size(s.width, s.height, &s.unit)
+                    })
+                } else {
+                    serde_json::from_value::<SpacingSnapshot>(self.data.clone()).is_ok_and(|s| {
+                        valid_title(&s.title)
+                            && valid_percent(s.min_percent)
+                            && valid_percent(s.max_percent)
+                            && s.min_percent <= 100
+                            && s.max_percent >= 100
+                    })
+                }
+            }
             "action" => {
-                serde_json::from_value::<Action>(self.data.clone()).is_ok_and(|a| match a {
-                    Action::Cancel => true,
-                    Action::Apply {
-                        width,
-                        height,
-                        unit,
-                    } => valid_size(width, height, &unit),
-                })
+                if self.dialog_kind == "pageSize" {
+                    serde_json::from_value::<Action>(self.data.clone()).is_ok_and(|a| match a {
+                        Action::Cancel => true,
+                        Action::Apply {
+                            width,
+                            height,
+                            unit,
+                        } => valid_size(width, height, &unit),
+                    })
+                } else {
+                    serde_json::from_value::<SpacingAction>(self.data.clone()).is_ok_and(
+                        |a| match a {
+                            SpacingAction::Cancel => true,
+                            SpacingAction::Apply { percent }
+                            | SpacingAction::Preview { percent } => valid_percent(percent),
+                        },
+                    )
+                }
+            }
+            "preview" => {
+                self.dialog_kind == "arrangementSpacing"
+                    && serde_json::from_value::<SpacingPreview>(self.data.clone()).is_ok_and(|p| {
+                        valid_percent(p.percent)
+                            && p.count > 0
+                            && p.count <= 1024
+                            && p.index < p.count
+                            && p.chunk.len() <= 2000
+                            && p.chunk.bytes().all(|c| {
+                                c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=')
+                            })
+                            && self.data.get("error").is_none_or(|e| e.is_string())
+                            && p.error.is_none_or(|e| {
+                                e.encode_utf16().count() <= 256
+                                    && p.chunk.is_empty()
+                                    && p.index == 0
+                                    && p.count == 1
+                            })
+                    })
             }
             "request" | "ready" => self.data.as_object().is_some_and(|d| d.is_empty()),
             "result" => serde_json::from_value::<Receipt>(self.data.clone()).is_ok_and(|r| {
@@ -183,9 +262,13 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registr
 
 pub(crate) fn is_dialog_label(label: &str) -> bool {
     label
-        .strip_prefix("dialog-main-pageSize-")
-        .is_some_and(|slot| {
-            !slot.is_empty() && slot.len() <= 20 && slot.bytes().all(|c| c.is_ascii_digit())
+        .strip_prefix("dialog-main-")
+        .and_then(|s| s.split_once('-'))
+        .is_some_and(|(kind, slot)| {
+            kind_spec(kind).is_ok()
+                && !slot.is_empty()
+                && slot.len() <= 20
+                && slot.bytes().all(|c| c.is_ascii_digit())
         })
 }
 fn authorize(
@@ -244,6 +327,13 @@ fn send_host(session: &Session, message: &Message) -> Result<(), String> {
 }
 /// Reserve before forwarding: request-ID dedup alone cannot prevent two distinct Apply requests.
 fn reserve_action(session: &mut Session, message: &Message) -> Result<bool, String> {
+    if message.dialog_kind == "arrangementSpacing" && message.data["action"] == "preview" {
+        return if session.terminal_request.is_none() {
+            Ok(true)
+        } else {
+            Err("A terminal dialog action is already pending".into())
+        };
+    }
     if let Some(previous) = session.actions.get(&message.request_id) {
         if previous.data != message.data {
             return Err("A dialog request ID cannot be reused for another action".into());
@@ -354,14 +444,16 @@ pub(crate) async fn dialog_open(
         return Ok(registration);
     }
     let spec = kind_spec(&message.dialog_kind)?;
-    let snapshot: Snapshot = serde_json::from_value(message.data).map_err(|e| e.to_string())?;
+    let title = message.data["title"]
+        .as_str()
+        .ok_or("Missing dialog title")?;
     let builder = WebviewWindowBuilder::new(
         &app,
         &registration.window_label,
         WebviewUrl::App(format!("/?window=dialog&hostId={}", registration.host_id).into()),
     )
-    .title(format!("Custom Page Size — {}", snapshot.title))
-    .inner_size(420.0, 300.0)
+    .title(format!("{} — {}", spec.title, title))
+    .inner_size(spec.size.0, spec.size.1)
     .min_inner_size(360.0, 260.0)
     .visible(false)
     .focused(false)
@@ -384,7 +476,8 @@ pub(crate) async fn dialog_open(
             .sessions
             .remove(&registration.host_id);
         return Err(format!(
-            "Could not create native Custom Page Size window: {error}"
+            "Could not create native {} window: {error}",
+            spec.title
         ));
     }
     // Owner close/quit does not wait on the construction lock. Discard a late build whose
@@ -480,7 +573,7 @@ pub(crate) async fn dialog_send(
             super::run_on_main_thread_blocking(&window, move || reveal_on_main(&target))
                 .and_then(|result| result)
         {
-            eprintln!("Could not reveal native Custom Page Size: {error}");
+            eprintln!("Could not reveal native dialog: {error}");
             close_session(&app, &host_id, "error");
             return Err(error);
         }
@@ -495,8 +588,11 @@ pub(crate) fn dialog_publish(
     message: Message,
 ) -> Result<(), String> {
     message.validate()?;
-    if !matches!(message.message_type.as_str(), "snapshot" | "result") {
-        return Err("Owner can publish only snapshot or result".into());
+    if !matches!(
+        message.message_type.as_str(),
+        "snapshot" | "preview" | "result"
+    ) {
+        return Err("Owner can publish only snapshot, preview or result".into());
     }
     let mut registry = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
     let session = registry
@@ -519,7 +615,7 @@ pub(crate) fn dialog_publish(
         session
             .receipts
             .insert(message.request_id.clone(), message.clone());
-    } else {
+    } else if message.message_type == "snapshot" {
         session.snapshot = message.clone();
     }
     send_host(session, &message)
@@ -828,7 +924,16 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
         f64::from(frame.height) / scale,
     );
     let positions = read_positions(app);
-    let saved = positions.get("pageSize").filter(|p| {
+    let kind = REGISTRY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .sessions
+        .values()
+        .find(|s| s.registration.window_label == window.label())
+        .map(|s| s.snapshot.dialog_kind.clone())
+        .ok_or("Unknown dialog kind")?;
+    let spec = kind_spec(&kind)?;
+    let saved = positions.get(&kind).filter(|p| {
         [p.x, p.y, p.offset_x, p.offset_y]
             .iter()
             .all(|v| v.is_finite())
@@ -850,9 +955,10 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
         .unwrap_or(&work);
     // WM_DPICHANGED runs when moving between Windows monitors. Move first, set the desired
     // client size at the destination DPI, then clamp using the measured final outer frame.
-    finish_placement(
+    finish_placement_with_size(
         (x, y, destination_scale),
         destination,
+        spec.size,
         |x, y| {
             window
                 .set_position(tauri::PhysicalPosition::new(x as i32, y as i32))
@@ -873,15 +979,19 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
     mark_transient(window.label());
     Ok(())
 }
-fn finish_placement(
+fn finish_placement_with_size(
     (x, y, scale): (f64, f64, f64),
     work: &WorkArea,
+    client_size: (f64, f64),
     mut move_to: impl FnMut(f64, f64) -> Result<(), String>,
     mut resize: impl FnMut(u32, u32) -> Result<(), String>,
     mut measure: impl FnMut() -> Result<(u32, u32), String>,
 ) -> Result<(), String> {
     move_to(x, y)?;
-    resize((420.0 * scale) as u32, (300.0 * scale) as u32)?;
+    resize(
+        (client_size.0 * scale) as u32,
+        (client_size.1 * scale) as u32,
+    )?;
     let (width, height) = measure()?;
     let (x, y) = work.clamp(
         x / scale,
@@ -890,6 +1000,16 @@ fn finish_placement(
         f64::from(height) / scale,
     );
     move_to(x * scale, y * scale)
+}
+#[cfg(test)]
+fn finish_placement(
+    position: (f64, f64, f64),
+    work: &WorkArea,
+    move_to: impl FnMut(f64, f64) -> Result<(), String>,
+    resize: impl FnMut(u32, u32) -> Result<(), String>,
+    measure: impl FnMut() -> Result<(u32, u32), String>,
+) -> Result<(), String> {
+    finish_placement_with_size(position, work, (420.0, 300.0), move_to, resize, measure)
 }
 pub(crate) fn mark_transient(label: &str) {
     if let Some(session) = REGISTRY
@@ -1453,6 +1573,55 @@ mod tests {
     }
     fn snapshot() -> Message {
         serde_json::from_value(json!({"protocolVersion":1,"ownerWindowId":"main","documentTabId":"tab-1","dialogKind":"pageSize","sessionId":"session-1","requestId":"request-1","snapshotRevision":1,"type":"snapshot","data":{"title":"Drawing","width":8.5,"height":11,"unit":"inch"}})).unwrap()
+    }
+    #[test]
+    fn spacing_preview_payloads_stay_bounded_and_do_not_reserve_save() {
+        let mut message = snapshot();
+        message.dialog_kind = "arrangementSpacing".into();
+        message.data = json!({"title":"Drawing", "minPercent":25, "maxPercent":150});
+        assert!(message.validate().is_ok());
+        let mut registry = Registry::default();
+        let (registration, _) = register(&mut registry, message.clone(), false).unwrap();
+        assert!(is_dialog_label(&registration.window_label));
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        message.message_type = "action".into();
+        message.data = json!({"action":"preview", "percent":80});
+        assert!(message.validate().is_ok());
+        assert!(reserve_action(session, &message).unwrap());
+        assert!(session.terminal_request.is_none());
+        assert!(session.actions.is_empty());
+        message.request_id = "save".into();
+        message.data = json!({"action":"apply", "percent":80});
+        assert!(reserve_action(session, &message).unwrap());
+        message.request_id = "late-preview".into();
+        message.data = json!({"action":"preview", "percent":90});
+        assert!(reserve_action(session, &message).is_err());
+        message.message_type = "preview".into();
+        message.data = json!({"percent":80, "index":0, "count":1024, "chunk":"A".repeat(2000)});
+        assert!(message.validate().is_ok());
+        assert!(delivery(session, "main", &message).is_ok());
+        for data in [
+            json!({"percent":80, "index":0, "count":1, "chunk":"A".repeat(2001)}),
+            json!({"percent":80, "index":0, "count":1025, "chunk":"AA=="}),
+            json!({"percent":80, "index":1, "count":1, "chunk":"AA=="}),
+            json!({"percent":80, "index":0, "count":1, "chunk":"https://example.com"}),
+            json!({"percent":80.5, "index":0, "count":1, "chunk":"AA=="}),
+        ] {
+            message.data = data;
+            assert!(message.validate().is_err());
+        }
+    }
+    #[test]
+    fn spacing_has_its_own_window_size_and_page_size_cannot_send_preview() {
+        let spacing = kind_spec("arrangementSpacing").unwrap();
+        assert!(spacing.resizable);
+        assert_eq!(spacing.size, (540.0, 600.0));
+        let mut message = snapshot();
+        message.message_type = "action".into();
+        message.data = json!({"action":"preview", "percent":80});
+        assert!(message.validate().is_err());
+        assert!(is_dialog_label("dialog-main-arrangementSpacing-12"));
+        assert!(!is_dialog_label("dialog-main-arrangementSpacing-../main"));
     }
     #[test]
     fn validates_kind_label_owner_and_payload() {

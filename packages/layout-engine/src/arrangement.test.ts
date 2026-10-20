@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ArrangementLayouts, planObjectArrangement, type ArrangementItem } from "./arrangement";
+import { textVisualBoundsForArrangement } from "./index";
+import type { TextObject } from "@chemdraft/chem-core";
 
 function fixtures(count: number): ArrangementItem[] {
   return Array.from({ length: count }, (_, i) => ({
@@ -27,6 +29,18 @@ function expectClearance(items: ArrangementItem[], gap: number) {
 }
 
 describe("size-aware object arrangement", () => {
+  it.each([0, 90, -90, 180, 45])("measures a caption rotated by %i degrees around its rendering pivot", rotation => {
+    const caption: TextObject = { id: "caption", type: "text", text: "Caption", spans: [],
+      x: 120, y: 290, width: 400, height: 20, rotation, style: {} };
+    const bounds = textVisualBoundsForArrangement(caption);
+    const expectedWidth = rotation === 90 || rotation === -90 ? 20 : rotation === 45 ? 420 / Math.sqrt(2) : 400;
+    const expectedHeight = rotation === 90 || rotation === -90 ? 400 : rotation === 45 ? 420 / Math.sqrt(2) : 20;
+    expect(bounds.width).toBeCloseTo(expectedWidth);
+    expect(bounds.height).toBeCloseTo(expectedHeight);
+    expect(bounds.x).toBeCloseTo(320 - expectedWidth / 2);
+    expect(bounds.y).toBeCloseTo(300 - expectedHeight / 2);
+    expect(caption).toMatchObject({ x: 120, y: 290, width: 400, height: 20, rotation });
+  });
   it.each(["circle","oval"] as const)("places asymmetric visual anchors on the %s while clearing the full substituent frames",layout=>{
     const items=fixtures(5).map((item,i)=>({...item,anchor:{x:item.bounds.x+item.bounds.width*(0.2+i*0.12),y:item.bounds.y+item.bounds.height*0.8}}));
     const plan=requirePlan(items,layout);
@@ -113,6 +127,50 @@ describe("size-aware object arrangement", () => {
       expect(plan.bounds.y + plan.bounds.height).toBeLessThanOrEqual(page.height);
     }
     expect(planObjectArrangement(items, "circle", { pageBounds: { ...page, width: 50 } })).toEqual({ ok: false, reason: "page" });
+  });
+  it.each(["row", "column"] as const)("tightens default %s gaps to fit, preserving anchors, sizes and order", layout => {
+    const items = [70, 85, 65].map((size, i) => {
+      const bounds = { x: i * 100, y: i * 90, width: layout === "row" ? size : 50, height: layout === "column" ? size : 50 };
+      return { id: `fit-${i}`, bounds, anchor: { x: bounds.x + bounds.width * 0.3, y: bounds.y + bounds.height * 0.7 } };
+    });
+    const page = { x: 10, y: 20, width: layout === "row" ? 260 : 350, height: layout === "column" ? 260 : 350 };
+    const plan = planObjectArrangement(items, layout, { pageBounds: page });
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.placements.map(p => p.id)).toEqual(items.map(item => item.id));
+    expectClearance(plan.placements, 20);
+    for (let i = 0; i < items.length; i++) {
+      const placed = plan.placements[i];
+      expect(placed.bounds.width).toBe(items[i].bounds.width);
+      expect(placed.bounds.height).toBe(items[i].bounds.height);
+      expect(placed.anchor!.x).toBeCloseTo(items[i].anchor.x + placed.dx);
+      expect(placed.anchor!.y).toBeCloseTo(items[i].anchor.y + placed.dy);
+      expect(layout === "row" ? placed.anchor!.y : placed.anchor!.x)
+        .toBeCloseTo(layout === "row" ? plan.placements[0].anchor!.y : plan.placements[0].anchor!.x);
+    }
+    expect(plan.bounds.x).toBeGreaterThanOrEqual(page.x);
+    expect(plan.bounds.y).toBeGreaterThanOrEqual(page.y);
+    expect(plan.bounds.x + plan.bounds.width).toBeLessThanOrEqual(page.x + page.width);
+    expect(plan.bounds.y + plan.bounds.height).toBeLessThanOrEqual(page.y + page.height);
+    const repeat = planObjectArrangement(plan.placements, layout, { pageBounds: page });
+    if (!repeat.ok) throw new Error(repeat.reason);
+    expect(repeat.placements.every(p => Math.abs(p.dx) < 1e-7 && Math.abs(p.dy) < 1e-7)).toBe(true);
+    expect(planObjectArrangement(items, layout, { pageBounds: page, gap: 48 })).toEqual({ ok: false, reason: "page" });
+    const generous = planObjectArrangement(items, layout, { pageBounds: { ...page, width: 500, height: 500 } });
+    if (!generous.ok) throw new Error(generous.reason);
+    expectClearance(generous.placements, 48);
+  });
+  it.each(["row", "column"] as const)("keeps at least 12 pixels of clearance in a fitted %s and refuses impossible pages", layout => {
+    const items = [70, 85, 65].map((size, i) => ({ id: `minimum-${i}`, bounds: {
+      x: i * 100, y: i * 90, width: layout === "row" ? size : 50, height: layout === "column" ? size : 50
+    } }));
+    const page = { x: 0, y: 0, width: layout === "row" ? 244 : 350, height: layout === "column" ? 244 : 350 };
+    const plan = planObjectArrangement(items, layout, { pageBounds: page });
+    if (!plan.ok) throw new Error(plan.reason);
+    expectClearance(plan.placements, 12);
+    const tooShort = { ...page, ...(layout === "row" ? { width: 243 } : { height: 243 }) };
+    expect(planObjectArrangement(items, layout, { pageBounds: tooShort })).toEqual({ ok: false, reason: "page" });
+    const tooNarrow = { ...page, ...(layout === "row" ? { height: 49 } : { width: 49 }) };
+    expect(planObjectArrangement(items, layout, { pageBounds: tooNarrow })).toEqual({ ok: false, reason: "page" });
   });
   it("handles a partial last grid row and an explicit column count", () => {
     const plan = planObjectArrangement(fixtures(7), "grid", { columns: 2 });

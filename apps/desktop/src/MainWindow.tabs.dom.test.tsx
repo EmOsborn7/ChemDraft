@@ -5,14 +5,15 @@ import { readFileSync } from "node:fs";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainWindow, documentTabPathKey } from "./MainWindow";
-import { applyNativeChainTool, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
+import { applyNativeChainTool, createNativeSingleBondMolecule, arrangeSelectedDocumentObjects, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
+import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { saveKeybindingSettings } from "./keybindingSettings";
 import { createViewportState } from "@chemdraft/viewport-engine";
 import { DOM_COMMAND_EVENT, setToolbarsMenu, type ToolsetWindowState } from "./window-manager";
 import { buildDocumentSessionEnvelope, buildDocumentTabsSession, parseDocumentSessionEnvelope } from "./documentSession";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
-import type { DocumentPatch, MoleculeObject } from "@chemdraft/chem-core";
+import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import {
   ANALYSIS_WINDOW_ACTION_EVENT, type AnalysisWindowSnapshotPayload,
   broadcastAnalysisWindowSnapshot, respondToProposalDecision
@@ -23,7 +24,7 @@ import type { ChemDraftAgentBridge } from "./agentBridge";
 import * as atomLabelDraft from "./atomLabelDraft";
 import * as nativePaletteReconciliation from "./toolbars/reconcileNativePalettes";
 import type { DialogMessage } from "./dialogs/dialogProtocol";
-import type { DialogDelivery } from "./dialogs/dialogTransport";
+import { nativeDialogTransport, type DialogDelivery } from "./dialogs/dialogTransport";
 
 const native = vi.hoisted(() => ({
   desktop: true,
@@ -52,7 +53,7 @@ const native = vi.hoisted(() => ({
 }));
 vi.mock("./dialogs/dialogTransport", () => ({ nativeDialogTransport: {
   subscribe: async (handler: (delivery: DialogDelivery) => void) => { native.dialogListener = handler; return () => { native.dialogListener = undefined; }; },
-  open: async (snapshot: DialogMessage) => { native.dialogSnapshot = snapshot; return { hostId: "opaque", windowLabel: "dialog-main-pageSize-1" }; },
+  open: async (snapshot: DialogMessage) => { native.dialogSnapshot = snapshot; return { hostId: "opaque", windowLabel: `dialog-main-${snapshot.dialogKind}-1` }; },
   publish: native.dialogPublish, close: native.dialogClose
 } }));
 vi.mock("./documentWorkflow", async (original) => {
@@ -211,6 +212,62 @@ describe("documents in one window", () => {
     await act(async () => { native.dialogListener!({ senderWindowId: "dialog-main-pageSize-1", windowLabel: "dialog-main-pageSize-1",
       message: { ...native.dialogSnapshot!, type, data, requestId: crypto.randomUUID() } }); });
   }
+  async function spacingDrawing() {
+    saveCompoundLayoutSettings({ enabled: true });
+    let source = createPhase4Document("Spacing source");
+    for (let i = 0; i < 3; i++) source = applyPatches(source, [{ op: "addObject", pageId: source.pages[0].id,
+      object: createNativeSingleBondMolecule(source, { x: 200 + i * 100, y: 300 }) }]);
+    source = selectDocumentObjects(source, source.pages[0].id, source.pages[0].objects.map(o => o.id));
+    source = arrangeSelectedDocumentObjects(source, "circle", { gap: 100 }).document;
+    act(() => root!.unmount()); container.innerHTML = ""; await mount(source);
+    return bridge().snapshot().document;
+  }
+  async function spacingMessage(data: unknown, requestId = crypto.randomUUID()) {
+    const label = "dialog-main-arrangementSpacing-1";
+    await act(async () => native.dialogListener!({ senderWindowId: label, windowLabel: label,
+      message: { ...native.dialogSnapshot!, type: "action", data, requestId } }));
+  }
+  async function readySpacing() {
+    const label = "dialog-main-arrangementSpacing-1";
+    await act(async () => native.dialogListener!({ senderWindowId: label, windowLabel: label,
+      message: { ...native.dialogSnapshot!, type: "ready", data: {}, requestId: crypto.randomUUID() } }));
+  }
+  it("native spacing previews without an overlay and saves to the original inactive tab with one undo", async () => {
+    const before = await spacingDrawing(); await command("layout.adjustArrangementSpacing");
+    expect(native.dialogSnapshot).toMatchObject({ dialogKind: "arrangementSpacing", documentTabId: "initial" });
+    expect(container.querySelector('.arrangement-spacing-dialog')).toBeNull(); await readySpacing();
+    await spacingMessage({ action: "preview", percent: 80 });
+    await vi.waitFor(() => expect(native.dialogPublish).toHaveBeenCalled());
+    expect(native.dialogPublish.mock.calls.some(call => (call[1] as DialogMessage).type === "preview")).toBe(true);
+    expect(bridge().snapshot().document).toEqual(before);
+    await command("document.new"); const other = bridge().snapshot().document;
+    await spacingMessage({ action: "apply", percent: 80 });
+    expect(active()).toBe(1); expect(bridge().snapshot().document).toEqual(other);
+    await activate(0); expect(bridge().snapshot().document).not.toEqual(before);
+    expect(bridge().snapshot().document.selection).toEqual(before.selection);
+    await command("edit.undo"); expect(bridge().snapshot().document).toEqual(before);
+    await command("edit.undo"); expect(container.querySelector('[role="status"]')?.textContent).toContain("Nothing to undo");
+    saveCompoundLayoutSettings({ enabled: false });
+  });
+  it("rejects stale native spacing Save and closes its window with the originating tab", async () => {
+    await spacingDrawing(); await command("layout.adjustArrangementSpacing"); await readySpacing();
+    await command("layout.arrange.row"); const changed = bridge().snapshot().document;
+    await spacingMessage({ action: "apply", percent: 80 });
+    expect(bridge().snapshot().document).toEqual(changed);
+    expect(native.dialogPublish.mock.calls.some(call => (call[1] as DialogMessage).type === "result" && (call[1] as { data: { status: string } }).data.status === "error")).toBe(true);
+    await command("document.new"); await closeTab(0); await modalButton("Don't Save");
+    expect(native.dialogClose).toHaveBeenCalledWith("opaque", "ownerTabClose");
+    saveCompoundLayoutSettings({ enabled: false });
+  });
+  it("reports native spacing creation failure without rendering an in-page desktop fallback", async () => {
+    await spacingDrawing(); const source = bridge().snapshot().document;
+    const open = nativeDialogTransport.open;
+    const spy = vi.spyOn(nativeDialogTransport, "open").mockRejectedValueOnce(new Error("native unavailable"));
+    await command("layout.adjustArrangementSpacing");
+    expect(container.querySelector('.arrangement-spacing-dialog')).toBeNull();
+    expect(container.textContent).toContain("native unavailable"); expect(bridge().snapshot().document).toEqual(source);
+    spy.mockRestore(); expect(nativeDialogTransport.open).toBe(open); saveCompoundLayoutSettings({ enabled: false });
+  });
   it("native Page Size stays modeless and applies to its originating inactive tab with one undo entry", async () => {
     const originalLayout = bridge().snapshot().document.pages[0]!.layout;
     await command("page.setSizeCustom");

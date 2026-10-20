@@ -5288,7 +5288,21 @@ export function planMoleculeAtomLabels(
   });
 }
 
-/** Visible labels can extend beyond a molecule's stored atom frame (notably long nicknames). */
+/** Page-axis bounds of a caption's stored frame, using the same pivot as text SVG rendering. */
+export function textVisualBoundsForArrangement(object: TextObject): LayoutBounds {
+  const corners = [
+    { x: object.x, y: object.y },
+    { x: object.x + object.width, y: object.y },
+    { x: object.x + object.width, y: object.y + object.height },
+    { x: object.x, y: object.y + object.height }
+  ].map(point => transformPointForObject(object, point));
+  const x = Math.min(...corners.map(point => point.x));
+  const y = Math.min(...corners.map(point => point.y));
+  return { x, y,
+    width: Math.max(...corners.map(point => point.x)) - x,
+    height: Math.max(...corners.map(point => point.y)) - y };
+}
+
 /** Centre the visible ring system rather than a tall substituent or a long atom label.
  * Acyclic structures use their atom frame; clearance still measures every visible part. */
 export function moleculeAnchorForArrangement(object:MoleculeObject):LayoutPoint {
@@ -5300,6 +5314,7 @@ export function moleculeAnchorForArrangement(object:MoleculeObject):LayoutPoint 
   return transformPointForObject(object,point);
 }
 
+/** Visible labels can extend beyond a molecule's stored atom frame (notably long nicknames). */
 export function moleculeVisualBoundsForArrangement(object: MoleculeObject): LayoutBounds {
   const bounds = [object, ...planMoleculeAtomLabels(object).map((plan) => ({
     x: plan.anchor.x + plan.layout.bounds.x,
