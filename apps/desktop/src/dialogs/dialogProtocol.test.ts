@@ -39,4 +39,7 @@ it("validates spacing kinds, bounded preview chunks and typed actions without br
   expect(parseDialogMessage({...s,type:"action",data:{action:"preview",percent:80}})).toBeDefined();
   expect(parseDialogMessage({...snapshot(),type:"action",data:{action:"preview",percent:80}})).toBeUndefined();
   expect(parseDialogMessage({...s,type:"action",data:{action:"apply",percent:NaN}})).toBeUndefined();
+  expect(parseDialogMessage({...s,type:"result",data:{status:"accepted"}})).toBeDefined();
+  expect(parseDialogMessage({...s,type:"result",data:{status:"exported"}})).toBeUndefined();
+  expect(parseDialogMessage({...preview,dialogKind:"export"})).toBeUndefined();
 });

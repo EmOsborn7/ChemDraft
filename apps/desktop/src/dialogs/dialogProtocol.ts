@@ -1,7 +1,9 @@
 /** Internal host contract. Advance independently of the public plugin API. No document/path URLs. */
+import type { ExportOptions } from "./exportOptions";
+import { validExportOptions } from "./exportOptionsValidation";
 export const DIALOG_PROTOCOL_VERSION = 1;
 export const DIALOG_MAX_BYTES = 16 * 1024;
-export type DialogKind = "pageSize" | "arrangementSpacing";
+export type DialogKind = "pageSize" | "arrangementSpacing" | "export";
 export type DialogPlatform = "macos" | "windows" | "linux";
 export type PageUnit = "inch" | "mm" | "css-px";
 export interface PageSize { width: number; height: number; unit: PageUnit }
@@ -19,15 +21,23 @@ export interface DialogEnvelope {
   snapshotRevision: number;
 }
 export type DialogCloseReason = "apply" | "cancel" | "close" | "destroy" | "ownerTabClose" | "ownerClose" | "quit" | "error";
+export interface ExportDialogResult {
+  status: "picked" | "exported" | "cancelled" | "error";
+  destinationPath?: string;
+  filename?: string;
+  notice?: string;
+  error?: string;
+}
 export type DialogSnapshot = DialogEnvelope & (
   | { dialogKind: "pageSize"; type: "snapshot"; data: PageSize & { title: string } }
   | { dialogKind: "arrangementSpacing"; type: "snapshot"; data: SpacingSnapshot }
+  | { dialogKind: "export"; type: "snapshot"; data: { title: string; options: ExportOptions } }
 );
 export type DialogMessage = DialogSnapshot | (DialogEnvelope & (
   | { type: "request" | "ready"; data: Record<string, never> }
-  | { type: "action"; data: ({ action: "apply" } & PageSize) | { action: "apply" | "preview"; percent: number } | { action: "cancel" } }
+  | { type: "action"; data: ({ action: "apply" } & PageSize) | { action: "apply" | "preview"; percent: number } | { action: "cancel" } | { action: "export" | "chooseDestination"; options: ExportOptions } }
   | { type: "preview"; data: SpacingPreview }
-  | { type: "result"; data: { status: "applied" | "cancelled" | "error"; error?: string } }
+  | { type: "result"; data: { status: "accepted" | "applied" | "progress" | ExportDialogResult["status"]; error?: string; destinationPath?: string; filename?: string; notice?: string } }
   | { type: "closed"; data: { reason: DialogCloseReason } }
 ));
 export interface DialogRegistration { hostId: string; windowLabel: string }
@@ -47,24 +57,31 @@ export function parseDialogMessage(value: unknown): DialogMessage | undefined {
   try {
     if (new TextEncoder().encode(JSON.stringify(value)).length > DIALOG_MAX_BYTES) return undefined;
     if (!record(value) || !keys(value, ["protocolVersion", "ownerWindowId", "documentTabId", "dialogKind", "sessionId", "requestId", "snapshotRevision", "type", "data"])) return undefined;
-    if (value.protocolVersion !== 1 || value.ownerWindowId !== "main" || !["pageSize", "arrangementSpacing"].includes(String(value.dialogKind)) ||
+    if (value.protocolVersion !== 1 || value.ownerWindowId !== "main" || typeof value.dialogKind !== "string" || !["pageSize", "arrangementSpacing", "export"].includes(value.dialogKind) ||
         !token(value.documentTabId) || !token(value.sessionId) || !token(value.requestId) ||
         !Number.isSafeInteger(value.snapshotRevision) || Number(value.snapshotRevision) < 1 || !record(value.data)) return undefined;
     const d = value.data;
     let valid = false;
     switch (value.type) {
-      case "snapshot": valid = typeof d.title === "string" && d.title.length > 0 && d.title.length <= 256 && (value.dialogKind === "pageSize"
-        ? keys(d, ["title", "width", "height", "unit"]) && validPageSize(d)
-        : keys(d, ["title", "minPercent", "maxPercent"]) && validSpacingPercent(d.minPercent) && validSpacingPercent(d.maxPercent) && d.minPercent <= 100 && d.maxPercent >= 100); break;
+      case "snapshot": valid = typeof d.title === "string" && d.title.length > 0 && d.title.length <= 256 &&
+        (value.dialogKind === "pageSize" ? keys(d, ["title", "width", "height", "unit"]) && validPageSize(d) :
+          value.dialogKind === "arrangementSpacing" ? keys(d, ["title", "minPercent", "maxPercent"]) && validSpacingPercent(d.minPercent) && validSpacingPercent(d.maxPercent) && d.minPercent <= 100 && d.maxPercent >= 100 :
+          keys(d, ["title", "options"]) && validExportOptions(d.options)); break;
       case "request": case "ready": valid = keys(d, []); break;
       case "action": valid = d.action === "cancel" ? keys(d, ["action"]) : value.dialogKind === "pageSize"
         ? d.action === "apply" && keys(d, ["action", "width", "height", "unit"]) && validPageSize(d)
-        : ["apply", "preview"].includes(String(d.action)) && keys(d, ["action", "percent"]) && validSpacingPercent(d.percent); break;
+        : value.dialogKind === "arrangementSpacing" ? ["apply", "preview"].includes(String(d.action)) && keys(d, ["action", "percent"]) && validSpacingPercent(d.percent)
+        : typeof d.action === "string" && ["export", "chooseDestination"].includes(d.action) && keys(d, ["action", "options"]) && validExportOptions(d.options); break;
+      case "result": valid = keys(d, ["status"], value.dialogKind !== "export" ? ["error"] : ["error", "notice", "destinationPath", "filename"]) &&
+        typeof d.status === "string" && (value.dialogKind !== "export" ? ["accepted", "applied", "cancelled", "error"] : ["accepted", "progress", "picked", "exported", "cancelled", "error"]).includes(d.status) &&
+        (d.error === undefined || (typeof d.error === "string" && d.error.length <= 2048)) &&
+        (d.notice === undefined || (typeof d.notice === "string" && d.notice.length <= 1024)) &&
+        (d.destinationPath === undefined || (typeof d.destinationPath === "string" && d.destinationPath.length <= 1024 && !d.destinationPath.includes("\0"))) &&
+        (d.filename === undefined || (typeof d.filename === "string" && d.filename.length <= 256)); break;
       case "preview": valid = value.dialogKind === "arrangementSpacing" && keys(d, ["percent", "index", "count", "chunk"], ["error"]) && validSpacingPercent(d.percent) &&
         Number.isInteger(d.count) && Number(d.count) >= 1 && Number(d.count) <= SPACING_PREVIEW_MAX_CHUNKS && Number.isInteger(d.index) && Number(d.index) >= 0 && Number(d.index) < Number(d.count) &&
         typeof d.chunk === "string" && d.chunk.length <= SPACING_PREVIEW_CHUNK_SIZE && /^[A-Za-z0-9+/=]*$/.test(d.chunk) &&
         (d.error === undefined || (typeof d.error === "string" && d.error.length <= 256 && d.chunk === "" && d.index === 0 && d.count === 1)); break;
-      case "result": valid = keys(d, ["status"], ["error"]) && typeof d.status === "string" && ["applied", "cancelled", "error"].includes(d.status) && (d.error === undefined || (typeof d.error === "string" && d.error.length <= 2048)); break;
       case "closed": valid = keys(d, ["reason"]) && reasons.has(d.reason as DialogCloseReason); break;
     }
     return valid ? value as unknown as DialogMessage : undefined;

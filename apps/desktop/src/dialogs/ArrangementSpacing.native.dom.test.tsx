@@ -25,6 +25,7 @@ async function image(request: DialogMessage, index = 0, count = 1, chunk = "PHN2
 }
 it("assembles only complete current previews and saves the chosen percent once", async () => {
   await mount(); const initial = latestPreview();
+  expect(host.send.mock.calls.map(call => call[1] as DialogMessage).filter(message => message.type === "ready")).toHaveLength(1);
   expect(container.textContent).toContain("Drawing B"); expect(document.activeElement).toBe(container.querySelector('input'));
   const save = () => container.querySelectorAll<HTMLButtonElement>('button')[1]!;
   expect(save().disabled).toBe(true);
@@ -40,6 +41,10 @@ it("assembles only complete current previews and saves the chosen percent once",
   await act(async () => { save().click(); save().click(); });
   const applies = host.send.mock.calls.map(call=>call[1] as DialogMessage).filter(m=>m.type==='action' && m.data.action==='apply');
   expect(applies).toHaveLength(1); expect(applies[0].data).toEqual({ action: 'apply', percent: 80 });
+  await act(async () => host.receive!({ ...dialogEnvelope(applies[0]), type: "result", data: { status: "accepted" } }));
+  await act(async () => vi.advanceTimersByTimeAsync(10001));
+  expect(save().disabled).toBe(true);
+  expect(container.textContent).not.toContain("did not acknowledge");
 });
 it("rejects incomplete delivery and reports a missing preview without enabling Save", async () => {
   await mount(); const request = latestPreview();

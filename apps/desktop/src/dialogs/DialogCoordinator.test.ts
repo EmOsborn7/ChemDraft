@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DialogCoordinator } from "./DialogCoordinator";
 import { dialogEnvelope, type DialogCloseReason, type DialogMessage } from "./dialogProtocol";
 import type { DialogDelivery, DialogTransport } from "./dialogTransport";
+import { exportFixture } from "./exportTestFixtures";
 
 function host(options: { timeout?: number } = {}) {
   const calls: string[] = [];
@@ -45,7 +46,7 @@ describe("DialogCoordinator", () => {
     let finish!: () => void;
     h.owner.applyPageSize.mockImplementation(() => new Promise<void>(r => { finish = r; }));
     let published!: () => void;
-    vi.mocked(h.transport.publish).mockImplementation(() => new Promise<void>(r => { published = r; }));
+    vi.mocked(h.transport.publish).mockImplementation(async (_id, message) => { if (message.type === "result" && message.data.status !== "accepted") await new Promise<void>(r => { published = r; }); });
     const action = h.message("action", { action: "apply", width: 10, height: 15, unit: "mm" });
     const first = h.deliver(action);
     await h.deliver({ ...action, requestId: "action-2" });
@@ -81,6 +82,7 @@ describe("DialogCoordinator", () => {
     h.owner.applyPageSize.mockImplementation(() => new Promise<void>(r => { finish = r; }));
     const m = h.message("action", { action: "apply", width: 10, height: 15, unit: "mm" });
     const first = h.deliver(m); const duplicate = h.deliver(m);
+    await Promise.resolve();
     expect(h.owner.applyPageSize).toHaveBeenCalledTimes(1); finish(); await Promise.all([first, duplicate]);
     expect(h.owner.applyPageSize).toHaveBeenCalledWith("tab-1", m.data);
     expect(h.owner.onSettled).toHaveBeenCalledTimes(1);
@@ -94,7 +96,7 @@ describe("DialogCoordinator", () => {
     const m = h.message("action", { action: "apply", width: 10, height: 15, unit: "inch" });
     await h.deliver(m); await h.deliver(m);
     expect(h.owner.applyPageSize).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(h.transport.publish).mock.calls[0]![1]).toEqual(vi.mocked(h.transport.publish).mock.calls[1]![1]);
+    expect(vi.mocked(h.transport.publish).mock.calls[1]![1]).toEqual(vi.mocked(h.transport.publish).mock.calls[2]![1]);
     await h.coordinator.dispose();
   });
   it.each<DialogCloseReason>(["cancel", "close", "destroy", "ownerTabClose", "ownerClose", "quit", "error"])("settles %s exactly once", async reason => {
@@ -177,4 +179,40 @@ it("retains a preview requested before the native open reply arrives", async () 
   expect(h.owner.previewArrangementSpacing).toHaveBeenCalledExactlyOnceWith('tab-1',100);
   expect(h.transport.publish).toHaveBeenCalledWith('opaque',expect.objectContaining({type:'preview'}));
   await h.coordinator.dispose();
+});
+
+it("keeps spacing, Export and Page Size independent on the same tab", async () => {
+  const h = host();
+  vi.mocked(h.transport.open).mockImplementation(async snapshot => ({
+    hostId: snapshot.dialogKind, windowLabel: `dialog-main-${snapshot.dialogKind}-1`
+  }));
+  const exportOwner = vi.fn(async () => ({ status: "exported" as const }));
+  const coordinator = new DialogCoordinator(h.transport, { ...h.owner, export: exportOwner });
+  try {
+    await coordinator.openPageSize("tab-1", { title: "Drawing", width: 8.5, height: 11, unit: "inch" });
+    await coordinator.openArrangementSpacing("tab-1", { title: "Drawing", minPercent: 25, maxPercent: 150 });
+    await coordinator.openExport("tab-1", { title: "Drawing", options: exportFixture() });
+    const snapshots = vi.mocked(h.transport.open).mock.calls.map(call => call[0]);
+    const deliver = (snapshot: DialogMessage, type: string, data: unknown, sender = `dialog-main-${snapshot.dialogKind}-1`) => coordinator.receive({
+      message: { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type, data },
+      senderWindowId: sender, windowLabel: `dialog-main-${snapshot.dialogKind}-1`
+    });
+    for (const snapshot of snapshots) await deliver(snapshot, "ready", {});
+    const [page, spacing, exp] = snapshots;
+    await deliver(spacing, "action", { action: "apply", percent: 80 }, "dialog-main-export-1");
+    expect(h.owner.applyArrangementSpacing).not.toHaveBeenCalled();
+    await deliver(spacing, "action", { action: "preview", percent: 80 });
+    expect(h.owner.previewArrangementSpacing).toHaveBeenCalledExactlyOnceWith("tab-1", 80);
+    await coordinator.closeArrangementSpacing();
+    expect(h.transport.close).toHaveBeenCalledExactlyOnceWith("arrangementSpacing", "cancel");
+    expect(coordinator.exportSessionId("tab-1")).toBe(exp.sessionId);
+    await deliver(exp, "action", { action: "export", options: exportFixture() });
+    expect(exportOwner).toHaveBeenCalledOnce();
+    await deliver(page, "action", { action: "apply", width: 10, height: 15, unit: "inch" });
+    expect(h.owner.applyPageSize).toHaveBeenCalledExactlyOnceWith("tab-1", { action: "apply", width: 10, height: 15, unit: "inch" });
+    expect(h.transport.close).toHaveBeenCalledWith("pageSize", "apply");
+    expect(coordinator.exportSessionId("tab-1")).toBe(exp.sessionId);
+    await coordinator.closeTab("tab-1");
+    expect(h.transport.close).toHaveBeenCalledWith("export", "ownerTabClose");
+  } finally { await coordinator.dispose(); await h.coordinator.dispose(); }
 });

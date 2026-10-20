@@ -1,4 +1,5 @@
-import { dialogEnvelope, parseDialogMessage, validateDialogDelivery, type DialogCloseReason, type DialogMessage, type DialogRegistration, type PageSize, type SpacingSnapshot, SPACING_PREVIEW_CHUNK_SIZE, SPACING_PREVIEW_MAX_CHUNKS } from "./dialogProtocol";
+import { dialogEnvelope, parseDialogMessage, validateDialogDelivery, type DialogCloseReason, type DialogMessage, type DialogRegistration, type PageSize, type SpacingSnapshot, type ExportDialogResult, SPACING_PREVIEW_CHUNK_SIZE, SPACING_PREVIEW_MAX_CHUNKS } from "./dialogProtocol";
+import type { ExportOptions } from "./exportOptions";
 import type { DialogDelivery, DialogTransport } from "./dialogTransport";
 
 interface Session {
@@ -24,9 +25,16 @@ export class DialogCoordinator {
     applyArrangementSpacing?(tabId: string, percent: number): void | Promise<void>;
     previewArrangementSpacing?(tabId: string, percent: number): string | Promise<string>;
     onSpacingSettled?(tabId: string): void;
+    export?(tabId: string, options: ExportOptions, live: () => boolean, progress: (notice: string) => Promise<void>): Promise<ExportDialogResult>;
+    chooseExportDestination?(tabId: string, options: ExportOptions, live: () => boolean): Promise<ExportDialogResult>;
     onError(message: string): void;
-    onSettled?(tabId: string, reason: DialogCloseReason): void;
+    onSettled?(tabId: string, reason: DialogCloseReason, kind?: "export" | "pageSize"): void;
   }, private options: { readyTimeoutMs?: number } = {}) {}
+
+  exportSessionId(tabId: string): string | undefined {
+    const session = this.sessions.get(`${tabId}:export`);
+    return session && !session.settled ? session.snapshot.sessionId : undefined;
+  }
 
   private ensureSubscription(): Promise<() => void> {
     return this.subscription ??= this.transport.subscribe(delivery => { void this.receive(delivery).catch(e => this.owner.onError(String(e))); })
@@ -38,19 +46,25 @@ export class DialogCoordinator {
   async openArrangementSpacing(tabId: string, data: SpacingSnapshot): Promise<void> {
     return this.open(tabId, "arrangementSpacing", data);
   }
-  private async open(tabId: string, kind: DialogMessage["dialogKind"], data: PageSize & { title: string } | SpacingSnapshot): Promise<void> {
+  async openExport(tabId: string, data: { title: string; options: ExportOptions }): Promise<void> {
+    return this.open(tabId, "export", data);
+  }
+  private async open(tabId: string, kind: DialogMessage["dialogKind"], data: (PageSize & { title: string }) | SpacingSnapshot | { title: string; options: ExportOptions }): Promise<void> {
     if (this.stopped) throw new Error("The document window is closing");
     const key = `${tabId}:${kind}`;
     const existing = this.sessions.get(key);
     if (existing) {
-      if (existing.registration && !existing.terminalRequestId) await this.transport.open(existing.snapshot);
+      // Reuse the retained snapshot and native window, preserving its local draft and position.
+      const receipt = existing.terminalRequestId ? existing.receipts.get(existing.terminalRequestId) : undefined;
+      if (existing.registration && (!existing.terminalRequestId || receipt?.type === "result" && receipt.data.status === "exported")) await this.transport.open(existing.snapshot);
       return;
     }
-    const snapshot = { protocolVersion: 1, ownerWindowId: "main", documentTabId: tabId,
+    const snapshot: Session["snapshot"] = { protocolVersion: 1, ownerWindowId: "main", documentTabId: tabId,
       dialogKind: kind, sessionId: crypto.randomUUID(), requestId: crypto.randomUUID(), snapshotRevision: 1, type: "snapshot", data } as Session["snapshot"];
-    if (!parseDialogMessage(snapshot)) throw new Error("Invalid dialog snapshot");
+    const title = kind === "export" ? "Export" : kind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size";
+    if (!parseDialogMessage(snapshot)) throw new Error(`Invalid ${title} snapshot`);
     const session: Session = { snapshot, receipts: new Map(), inFlight: new Map(), settled: false, ready: false,
-      timer: setTimeout(() => { this.owner.onError("Dialog did not become ready. Open it again to try again."); void this.settle(session, "error"); }, this.options.readyTimeoutMs ?? 10000) };
+      timer: setTimeout(() => { this.owner.onError(`${title} did not become ready. Open it again to try again.`); void this.settle(session, "error"); }, this.options.readyTimeoutMs ?? 10000) };
     this.sessions.set(key, session);
     try {
       // Track the opening before the first await so tab close/dispose can cancel it.
@@ -76,7 +90,7 @@ export class DialogCoordinator {
     const message = validateDialogDelivery(parsed, delivery.senderWindowId, session.snapshot, label);
     if (!message) return;
     if (message.type === "closed") {
-      if (message.data.reason === "error") this.owner.onError("Dialog could not show its native window. Open it again to try again.");
+      if (message.data.reason === "error") this.owner.onError(`${parsed.dialogKind === "export" ? "Export" : parsed.dialogKind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size"} could not show its native window. Open it again to try again.`);
       await this.settle(session, message.data.reason, false); return;
     }
     if (message.type === "ready") { clearTimeout(session.timer); session.ready = true; return; }
@@ -90,6 +104,8 @@ export class DialogCoordinator {
       await this.preview(session, message.requestId, message.data.percent); return;
     }
     if (!session.registration) return;
+    // Cancellation invalidates owner work immediately, even while a receipt is pending.
+    if (message.data.action === "cancel") { await this.settle(session, "cancel"); return; }
     const previous = session.receipts.get(message.requestId);
     if (previous) {
       await session.inFlight.get(message.requestId);
@@ -104,11 +120,25 @@ export class DialogCoordinator {
     let finished!: () => void;
     session.inFlight.set(message.requestId, new Promise<void>(resolve => { finished = resolve; }));
     try {
+      // Acknowledge the validated reservation before any owner flush, picker, or write.
+      await this.transport.publish(session.registration.hostId, {
+        ...dialogEnvelope(message), type: "result", data: { status: "accepted" }
+      });
+      if (session.settled) return;
       if (message.data.action === "apply") {
         if ("percent" in message.data) {
           if (!this.owner.applyArrangementSpacing) throw new Error("Spacing is unavailable");
           await this.owner.applyArrangementSpacing(message.documentTabId, message.data.percent);
         } else await this.owner.applyPageSize(message.documentTabId, message.data);
+      } else if (message.data.action === "export" || message.data.action === "chooseDestination") {
+        const callback = message.data.action === "export" ? this.owner.export : this.owner.chooseExportDestination;
+        if (!callback) throw new Error("Export is unavailable in this document window.");
+        receipt.data = await callback(message.documentTabId, message.data.options, () => !session.settled, async (notice: string) => {
+          if (!session.settled) await this.transport.publish(session.registration!.hostId, {
+            ...dialogEnvelope(message), type: "result", data: { status: "progress", notice }
+          });
+        });
+        if (receipt.data.status !== "exported") session.terminalRequestId = undefined;
       }
     } catch (error) {
       session.terminalRequestId = undefined;
@@ -121,6 +151,12 @@ export class DialogCoordinator {
       session.inFlight.delete(message.requestId);
     }
     if (session.settled) return;
+    // Export warnings and success stay in the dialog until Close. Pickers and cancellation of
+    // a save panel are nonterminal; a completed export remains reserved against a second write.
+    if (message.data.action === "export" || message.data.action === "chooseDestination") {
+      await this.transport.publish(session.registration.hostId, receipt);
+      return;
+    }
     try { await this.transport.publish(session.registration.hostId, receipt); }
     finally { await this.settle(session, message.data.action === "apply" ? "apply" : "cancel"); }
   }
@@ -162,10 +198,12 @@ export class DialogCoordinator {
     const key = `${session.snapshot.documentTabId}:${session.snapshot.dialogKind}`;
     if (this.sessions.get(key) === session) this.sessions.delete(key);
     if (session.snapshot.dialogKind === "arrangementSpacing") this.owner.onSpacingSettled?.(session.snapshot.documentTabId);
-    this.owner.onSettled?.(session.snapshot.documentTabId, reason);
+    // Preserve the existing Page Size callback contract.
+    if (session.snapshot.dialogKind === "export") this.owner.onSettled?.(session.snapshot.documentTabId, reason, "export");
+    else this.owner.onSettled?.(session.snapshot.documentTabId, reason);
     if (close && session.registration) {
       try { await this.transport.close(session.registration.hostId, reason); }
-      catch (error) { this.owner.onError(`Could not close dialog: ${String(error)}`); }
+      catch (error) { this.owner.onError(`Could not close ${session.snapshot.dialogKind}: ${String(error)}`); }
     }
   }
   async closeTab(tabId: string): Promise<void> {
