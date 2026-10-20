@@ -10,6 +10,87 @@ scaling, sparse override precedence, terminal carbon labels, hidden implicit hyd
 hydrogens, fonts, save/reopen, undo/redo, Spin 3D, atom-label editor placement, SVG export, and ring
 selection after tab switching/closing.
 
+Plugin panel focus (both macOS and Windows): open/re-show a panel from Analyze or a plugin command;
+click a panel button, heading, chart, empty area and title/drag area, hover its controls and scroll.
+Buttons must run exactly once and hover feedback must work; after each ordinary click the drawing
+must have keyboard focus. On Windows at 200%, repeat with the Mass Analysis heading, table cell,
+value text, empty content, and title bar (press/release without moving, then drag). Use a 15 ms
+GetForegroundWindow logger alongside a Main toolbar button as the control: a transient panel
+foreground interval is allowed, but it must hand back to the document promptly after release,
+without a document click. Press a drawing-tool shortcut immediately after each click; foreground
+ownership alone is insufficient if keyboard focus remains in the panel's WebView2 child.
+Click a panel text/number field, textarea, select or
+editable text, type/change its value, then press Escape: the panel stays open and a drawing-tool
+shortcut works again. Single-line Enter commits and returns focus; multiline Enter stays in the
+field. Tab between inputs, then Tab out of the last (and Shift+Tab out of the first), and click back
+on the document while editing: keyboard focus returns to the drawing. Move/resize and close a panel
+(including the native close shortcut): ownership, shadow, no taskbar entry and plugin close notification
+remain intact. On Windows 10 and 11, resize from every edge and corner, including the thin
+one-DIP top grip, also on a second monitor at a different scale. Press within the rest of the
+first SM_CYFRAME client pixels: title text must receive its trusted DOM pointerdown and move
+the window rather than resize it. Windows 10 must never show a native caption above the DOM title.
+The panel must
+have a single frame like the toolbars, content reaching its edge, and no white inset or black
+left/right/bottom bands during or after resizing. Repeat after hide/show, live resize, and moving between
+100%, 150% and 200% DPI monitors (including monitors above/left of the primary). Confirm WebView2
+buttons still receive exactly one trusted pointerdown/click and return keyboard focus, and
+text/content is not clipped. Repeat ordinary content clicks after ending an input
+lease; test right/middle presses too. Hover and wheel alone must not trigger a focus hand-back.
+On Windows, rapidly click ordinary content then an input while the first hand-back IPC is delayed:
+typing must stay in the input after the old request completes. Repeat with report-text selection.
+Activate a panel button with Enter/Space (no pointerdown): its action runs once without queuing
+a pointer hand-back or ending an existing text-selection lease.
+During an input/text-selection lease, press a resize border without moving: drawing shortcuts resume.
+In both inline and Full size spectra, change frequency/comparison selects, then Escape/Enter/Tab out;
+replace the report while a select is focused and confirm drawing shortcuts work again. Without making
+the panel key, hover peaks/atoms to check linked highlighting and pan across peak hit areas (and out
+of the spectrum while captured): panning must continue until release. Programmatic `input.focus()`
+and dispatched pointer events must not start a keyboard lease. In Full size, focus a select and
+press Escape: the first closes only the overlay, preserving the report window. Drag-select report
+text and double/triple click a word/paragraph, then Cmd/Ctrl+C: paste into another app and confirm
+the report selection was copied. On Windows at 200%, log window blur/focus around pointerup
+and double-click: the activation's transient blur/focus must not clear the selected range,
+including when native acquisition replies before or after the blur and WebView2 focus recovery
+takes more than 32 ms (repeat with 100 ms and 1 s delays). Repeat for input typing and a select;
+then click the document or another app while acquisition is pending and after it settles.
+Log the generation-tagged native chemdraft://plugin-panel-focus events: a genuine native
+deactivation must end the lease even if a delayed success reply or DOM focus arrives afterward.
+The selection must clear immediately on that event; it must survive DOM blur alone.
+While the first input acquisition is delayed, click that input again and then click the document.
+The first native deactivation (or failed acquisition) must cancel the queued retry, with no focus
+stolen back. Repeat with the retry already pending when the first generation's loss arrives.
+After drag-selecting report text and copying it, press Right or Down, then M: the selection
+must clear and drawing shortcuts must resume even on WebView2, without scrolling the report.
+Repeat with Home/End/PageUp/PageDown, letters, digits, Tab, Enter and Space as the release key.
+Cmd/Ctrl+C, Cmd/Ctrl+A, Shift+arrow/Home/End and bare modifier keys must keep the selection lease;
+arrows in an editable input must keep its input lease. Check on macOS and Windows.
+Moving the range outside report text must also end the lease.
+Reload a panel webview using developer tools after several input leases; a fresh input click must
+still acquire focus. Repeat with an old acquisition pending at reload. Inject a native resize-hook
+installation failure: opening must report the error and leave no live panel window.
+A plain text click keeps drawing shortcuts active. With text
+selected, Escape or a click elsewhere in the panel/document clears selection and returns drawing
+shortcuts; report replacement must also end the lease. Script-created ranges and synthetic drags
+must not start a lease. On both platforms, with another app frontmost, click an exposed panel input
+or select text, and also switch apps before a delayed focus request executes: ChemDraft must never
+activate or come to the front. On Windows repeat with a non-client edge/corner press/resize while
+the other app is foreground; it must stay foreground and receive no phantom Alt keystroke.
+Also repeat ordinary content/title clicks and switch apps between pointer release and IPC delivery;
+the guarded hand-back must not raise ChemDraft. With two panels open, a delayed hand-back from
+one must not interrupt an input lease in the other.
+After a background request returns false, the input/selection lease must end immediately even
+without any DOM blur. Close the foreground application so Windows activates the idle panel:
+drawing shortcuts must work, with no stale lease suppressing hand-back. Then activate the document
+and click the same input again: typing works. Repeat while rapidly ending one lease and acquiring
+another: an ended lease's deactivation must never clear an independent new input/selection lease.
+An obsolete generation must likewise not clear a newer acquisition that has already settled.
+On Windows, put File Explorer (then another application) in front and close it without clicking
+ChemDraft. If Windows activates an idle panel, the document must promptly receive keyboard focus
+and the next drawing shortcut. Repeat with two panels; another panel's input lease must not be
+interrupted. Repeat with delayed activation notification/hand-back while clicking an input or
+selecting text: an active or pending lease must supersede that hand-back. Switching to a third
+application before delivery must not bring ChemDraft forward.
+
 Drawing-tool surfaces added since: each reaction-arrow kind by click and by drag (heads render per
 kind, resize handles work, rotate and flip move the arrow itself and not just its frame), both
 bracket kinds placed and resized, dagger and submenu symbol stamps, atom labels through `tool.atom`,
