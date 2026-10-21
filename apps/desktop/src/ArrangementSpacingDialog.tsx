@@ -4,6 +4,21 @@ import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import { adjustArrangementSpacing, arrangementSpacingRange, arrangementSpacingPreviewBounds } from "./documentWorkflow";
 import { ArrangementSpacingForm } from "./dialogs/ArrangementSpacingForm";
 
+export function frameArrangementSpacingPreviewSvg(svg: string, pageWidth: number, pageHeight: number): string {
+  const padding = Math.max(pageWidth, pageHeight) * 0.025;
+  const width = pageWidth + padding * 2, height = pageHeight + padding * 2;
+  const root = svg.match(/<svg\b[^>]*>/i)?.[0];
+  if (!root) throw new Error("SVG export did not contain a root element.");
+  const attributes: [string, number | string][] = [["width", width], ["height", height], ["viewBox", `${-padding} ${-padding} ${width} ${height}`]];
+  const framedRoot = attributes.reduce((tag, [name, value]) => {
+    const attribute = new RegExp(`(\\s${name}\\s*=\\s*)(?:"[^"]*"|'[^']*')`, "i");
+    if (attribute.test(tag)) return tag.replace(attribute, `$1"${value}"`);
+    return tag.replace(/\/?>(?=$)/, ` ${name}="${value}"$&`);
+  }, root);
+  return svg.replace(root, `${framedRoot}\n<rect x="${-padding}" y="${-padding}" width="${width}" height="${height}" fill="#e5e7eb" />`)
+    .replace("</svg>", `<rect data-arrangement-page-boundary="true" x="0" y="0" width="${pageWidth}" height="${pageHeight}" fill="none" stroke="#64748b" stroke-width="1" vector-effect="non-scaling-stroke" />\n</svg>`);
+}
+
 /** Runs only in the document owner; native forms receive previews, never documents. */
 export function arrangementSpacingPreviewSvg(source: ChemDraftDocument, percent: number): string {
   const result = adjustArrangementSpacing(source, percent / 100);
@@ -14,13 +29,10 @@ export function arrangementSpacingPreviewSvg(source: ChemDraftDocument, percent:
   const page = source.pages[pageIndex];
   // Keep the whole page and its scale fixed while the compounds move. These decorations belong
   // only to the preview: document geometry and ordinary exports remain untouched.
-  const padding = Math.max(page.width, page.height) * 0.025;
-  const width = page.width + padding * 2, height = page.height + padding * 2;
-  return exportDocumentToSvg(result.document, { pageIndex, includePageGuides: false, includeWarnings: false }).contents
-    .replace(/width="[^"]+" height="[^"]+" viewBox="[^"]+"/,
-      `width="${width}" height="${height}" viewBox="${-padding} ${-padding} ${width} ${height}"`)
-    .replace(/(<svg\b[^>]*>)/, `$1\n<rect x="${-padding}" y="${-padding}" width="${width}" height="${height}" fill="#e5e7eb" />`)
-    .replace("</svg>", `<rect data-arrangement-page-boundary="true" x="0" y="0" width="${page.width}" height="${page.height}" fill="none" stroke="#64748b" stroke-width="1" vector-effect="non-scaling-stroke" />\n</svg>`);
+  return frameArrangementSpacingPreviewSvg(
+    exportDocumentToSvg(result.document, { pageIndex, includePageGuides: false, includeWarnings: false }).contents,
+    page.width, page.height
+  );
 }
 
 /** Browser-only fallback. Desktop opens the same form through DialogCoordinator. */

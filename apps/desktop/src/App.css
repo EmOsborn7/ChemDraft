@@ -3076,8 +3076,13 @@ textarea:focus-visible,
   padding: 3px;
 }
 
-.toolbar-command-flyout-menu button .tool-icon-image,
-.toolbar-command-flyout-menu button > svg {
+.toolbar-command-flyout-menu button .tool-icon-image {
+  width: 18px;
+  height: 18px;
+}
+
+.toolbar-command-flyout-menu button[data-command-id^="layout.arrange."] > svg,
+.toolbar-command-flyout-menu button[data-command-id="layout.adjustArrangementSpacing"] > svg {
   width: 18px;
   height: 18px;
 }

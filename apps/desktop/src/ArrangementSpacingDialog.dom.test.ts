@@ -3,11 +3,27 @@ import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import { applyPatches, type TextObject } from "@chemdraft/chem-core";
-import { ArrangementSpacingDialog } from "./ArrangementSpacingDialog";
+import { exportDocumentToSvg } from "@chemdraft/export-engine";
+import { ArrangementSpacingDialog, frameArrangementSpacingPreviewSvg } from "./ArrangementSpacingDialog";
 import { createPhase4Document, createNativeSingleBondMolecule, selectDocumentObjects, arrangeSelectedDocumentObjects, adjustArrangementSpacing, setDocumentCustomPageSize } from "./documentWorkflow";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 describe("spacing preview selected page", () => {
+  it("frames exports regardless of root attribute order or extra attributes", () => {
+    const preview = frameArrangementSpacingPreviewSvg('<svg data-export="preview" viewBox="0 0 200 100" xmlns="http://www.w3.org/2000/svg" height="100" preserveAspectRatio="xMidYMid" width="200"><path /></svg>', 200, 100);
+    expect(preview).toBe('<svg data-export="preview" viewBox="-5 -5 210 110" xmlns="http://www.w3.org/2000/svg" height="110" preserveAspectRatio="xMidYMid" width="210">\n<rect x="-5" y="-5" width="210" height="110" fill="#e5e7eb" /><path /><rect data-arrangement-page-boundary="true" x="0" y="0" width="200" height="100" fill="none" stroke="#64748b" stroke-width="1" vector-effect="non-scaling-stroke" />\n</svg>');
+  });
+  it("keeps the current export framing unchanged", () => {
+    const source = createPhase4Document("Current export");
+    const page = source.pages[0], padding = Math.max(page.width, page.height) * 0.025;
+    const width = page.width + padding * 2, height = page.height + padding * 2;
+    const exported = exportDocumentToSvg(source, { includePageGuides: false, includeWarnings: false }).contents;
+    const expected = exported
+      .replace(/width="[^"]+" height="[^"]+" viewBox="[^"]+"/, `width="${width}" height="${height}" viewBox="${-padding} ${-padding} ${width} ${height}"`)
+      .replace(/(<svg\b[^>]*>)/, `$1\n<rect x="${-padding}" y="${-padding}" width="${width}" height="${height}" fill="#e5e7eb" />`)
+      .replace("</svg>", `<rect data-arrangement-page-boundary="true" x="0" y="0" width="${page.width}" height="${page.height}" fill="none" stroke="#64748b" stroke-width="1" vector-effect="non-scaling-stroke" />\n</svg>`);
+    expect(frameArrangementSpacingPreviewSvg(exported, page.width, page.height)).toBe(expected);
+  });
   it("lets the slider reach valid expansion beyond an initially overlapping selection", async () => {
     let source = setDocumentCustomPageSize(createPhase4Document("Overlap"), { width: 1, height: 11, unit: "inch" });
     const objects: TextObject[] = [8.5, 47.5].map((x, i) => ({ id: `caption-${i}`, type: "text", text: "Caption", spans: [],
