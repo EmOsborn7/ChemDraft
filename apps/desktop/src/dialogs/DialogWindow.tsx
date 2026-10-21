@@ -1,15 +1,20 @@
+import { useExportPreviewEnabled } from "./useExportPreviewEnabled";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { detectDialogPlatform, dialogEnvelope, sameDialog, type DialogMessage } from "./dialogProtocol";
 import { sendDialogMessage, subscribeDialogHost } from "./dialogTransport";
 import { performFocusedFieldSelectAll } from "../editHistoryRouting";
 import { ArrangementSpacingForm } from "./ArrangementSpacingForm";
 import { formatPageSizeFieldValue, PageSizeForm, type PageSizeDraft } from "./PageSizeForm";
-import type { ExportDialogState } from "./exportOptions";
+import type { ExportDialogState, ExportOptions, ExportPreviewResult, ExportFrame } from "./exportOptions";
 import { exportOptions } from "./exportOptionsValidation";
 const ExportForm = lazy(() => import("./ExportForm").then(module => ({ default: module.ExportForm })));
 
 export function DialogWindow({ hostId }: { hostId: string }) {
+  const previewEnabled = useExportPreviewEnabled();
+  const previewEnabledRef = useRef(previewEnabled);
+  previewEnabledRef.current = previewEnabled;
   const [snapshot, setSnapshot] = useState<Extract<DialogMessage, { type: "snapshot" }>>();
+  const [frame, setFrame] = useState<ExportFrame>();
   const [draft, setDraft] = useState<PageSizeDraft>();
   const [percent, setPercent] = useState(100);
   const currentPercent = useRef(percent);
@@ -23,6 +28,9 @@ export function DialogWindow({ hostId }: { hostId: string }) {
   const [exported, setExported] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const previewPending = useRef<{ id: string; resolve(value: ExportPreviewResult): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> } | undefined>(undefined);
+  const clearPreview = () => { const pending = previewPending.current; previewPending.current = undefined; if (pending) { clearTimeout(pending.timer); pending.reject(new Error("Preview superseded")); } };
+  useEffect(() => { if (!previewEnabled) clearPreview(); }, [previewEnabled]);
   const actionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const actionPending = useRef(false);
   const cancellationRequested = useRef(false);
@@ -59,7 +67,7 @@ export function DialogWindow({ hostId }: { hostId: string }) {
           setSnapshot(message);
           if (message.dialogKind === "pageSize") setDraft({ width: formatPageSizeFieldValue(message.data.width), height: formatPageSizeFieldValue(message.data.height), unit: message.data.unit });
           else if (message.dialogKind === "arrangementSpacing") { setPercent(100); setPreview(undefined); }
-          else setExportDraft({ ...message.data.options, busy: false });
+          else { setExportDraft({ ...message.data.options, busy: false }); setFrame(message.data.frame); }
           latest = message;
         }
       } else if (latest && sameDialog(message, latest) && message.type === "preview" && message.requestId === previewRequestId.current && message.data.percent === currentPercent.current && !actionPending.current) {
@@ -76,6 +84,17 @@ export function DialogWindow({ hostId }: { hostId: string }) {
           clearTimeout(previewTimer.current); setError(undefined);
           setPreview(`data:image/svg+xml;base64,${parts.chunks.join("")}`); previewParts.current = undefined;
         }
+      } else if (latest && sameDialog(message, latest) && message.type === "result" && message.data.status === "frame" && message.data.frame) {
+        // Keep the newest frame even while Choose is pending. A frame may arrive before
+        // the picker receipt releases actionPending; dropping it loses that revision forever.
+        clearPreview();
+        setFrame(message.data.frame);
+      } else if (latest && sameDialog(message, latest) && message.type === "result" && message.requestId === previewPending.current?.id) {
+        const pending = previewPending.current!;
+        previewPending.current = undefined;
+        clearTimeout(pending.timer);
+        if (message.data.status === "preview" && message.data.preview) pending.resolve(message.data.preview);
+        else pending.reject(new Error(message.data.error ?? "Preview unavailable"));
       } else if (!cancellationRequested.current && latest && sameDialog(message, latest) && message.type === "result" && message.requestId === pendingRequestId.current) {
         if (message.data.status === "accepted") {
           clearTimeout(actionTimer.current);
@@ -98,7 +117,7 @@ export function DialogWindow({ hostId }: { hostId: string }) {
         setError(message.data.error);
       }
     }).then(unlisten => { if (stopped) unlisten(); else stop = unlisten; }).catch(e => { if (!stopped) setError(String(e)); });
-    return () => { stopped = true; stop?.(); clearTimeout(actionTimer.current); clearTimeout(previewTimer.current); };
+    return () => { stopped = true; stop?.(); clearTimeout(actionTimer.current); clearTimeout(previewTimer.current); clearPreview(); };
   }, [hostId]);
   // React committed the form, including first-field focus. Hidden webviews suspend rAF: never wait for it.
   const reportReady = useCallback(() => {
@@ -120,6 +139,7 @@ export function DialogWindow({ hostId }: { hostId: string }) {
   useEffect(() => { if (snapshot?.dialogKind === "pageSize" || snapshot?.dialogKind === "arrangementSpacing") reportReady(); }, [snapshot, reportReady]);
   const sendAction = (data: Extract<DialogMessage, { type: "action" }>["data"]) => {
     if (!snapshot) return;
+    clearPreview();
     if (data.action === "cancel") {
       cancellationRequested.current = true;
       clearTimeout(actionTimer.current);
@@ -145,7 +165,22 @@ export function DialogWindow({ hostId }: { hostId: string }) {
       previewRequestId.current = undefined; previewParts.current = undefined;
       setPreview(undefined); setError(undefined); setPercent(value);
     }} onCancel={() => sendAction({ action: "cancel" })} onSave={() => sendAction({ action: "apply", percent })} />;
-  if (snapshot?.dialogKind === "export" && exportDraft) return <Suspense fallback={<p role="status">Opening Export…</p>}><ExportForm title={snapshot.data.title} onReady={reportReady}
+  const renderPreview = (options: ExportOptions, signal?: AbortSignal): Promise<ExportPreviewResult> => {
+    clearPreview();
+    if (!previewEnabledRef.current || signal?.aborted || !snapshot || actionPending.current || cancellationRequested.current) return Promise.reject(new Error("Preview unavailable"));
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { if (previewPending.current?.id === requestId) { const pending = previewPending.current; previewPending.current = undefined; pending.reject(new Error("Preview timed out")); } }, 30000);
+      const abort = () => { if (previewPending.current?.id === requestId) clearPreview(); };
+      signal?.addEventListener("abort", abort, { once: true });
+      const cleanup = () => { signal?.removeEventListener("abort", abort); clearTimeout(timer); };
+      previewPending.current = { id: requestId, resolve: value => { cleanup(); resolve(value); }, reject: error => { cleanup(); reject(error); }, timer };
+      void sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId, type: "action", data: { action: "preview", options } }).catch(error => {
+        if (previewPending.current?.id === requestId) { const pending = previewPending.current; previewPending.current = undefined; pending.reject(error); }
+      });
+    });
+  };
+  if (snapshot?.dialogKind === "export" && exportDraft) return <Suspense fallback={<p role="status">Opening Export…</p>}><ExportForm frame={frame} renderPreview={renderPreview} title={snapshot.data.title} onReady={reportReady}
     state={{ ...exportDraft, busy: busy || exported }} onChange={setExportDraft} error={error} notice={notice} completed={exported}
     onCancel={() => sendAction({ action: "cancel" })}
     onChooseDestination={() => sendAction({ action: "chooseDestination", options: exportOptions(exportDraft) })}

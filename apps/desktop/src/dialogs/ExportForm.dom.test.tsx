@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
-import { act, createElement } from "react";
+import { saveExportPreviewEnabled } from "../exportPreviewSettings";
+import { MemoryStorage } from "../testSupport/memoryStorage";
+import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExportForm, updateExportDialogFormat } from "./ExportForm";
@@ -8,6 +10,7 @@ import type { ExportDialogState } from "./exportOptions";
 
 let root: Root; let container: HTMLDivElement;
 beforeEach(() => {
+  vi.stubGlobal("localStorage", new MemoryStorage());
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
 });
@@ -83,4 +86,30 @@ it("keeps the action footer outside the scrollable form body", () => {
   expect(body.style.minHeight).toBe("0px");
   expect(body.contains(footer)).toBe(false);
   expect(footer.querySelector('button[type="submit"]')).not.toBeNull();
+});
+
+it("restores valid visual settings when switching from an invalid size draft to CDXML", () => {
+  saveExportPreviewEnabled(true);
+  const presentation = { width: 1200, dpi: 300, crop: "content" as const, background: "white" as const, preset: "custom" as const };
+  const submitted = vi.fn();
+  let selected: ExportDialogState = { ...exportFixture(), format: "svg", busy: false, presentation };
+  function Form() {
+    const [state, setState] = useState(selected);
+    selected = state;
+    return createElement(ExportForm, { state, onChange: setState, onSubmit: submitted, onCancel: vi.fn(), onChooseDestination: vi.fn() });
+  }
+  act(() => root.render(createElement(Form)));
+  const width = [...container.querySelectorAll("label")].find(label => label.textContent?.startsWith("Width (px)"))!.querySelector("input")!;
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(width, "9000");
+    width.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
+  const format = container.querySelector<HTMLSelectElement>("#chemdraft-export-format")!;
+  act(() => { format.value = "cdxml"; format.dispatchEvent(new Event("change", { bubbles: true })); });
+  expect(container.querySelector('[aria-label="Size preset"]')).toBeNull();
+  expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false);
+  expect(selected.presentation).toEqual(presentation);
+  act(() => container.querySelector("form")!.requestSubmit());
+  expect(submitted).toHaveBeenCalledTimes(1);
 });

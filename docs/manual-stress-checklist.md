@@ -10,6 +10,28 @@ scaling, sparse override precedence, terminal carbon labels, hidden implicit hyd
 hydrogens, fonts, save/reopen, undo/redo, Spin 3D, atom-label editor placement, SVG export, and ring
 selection after tab switching/closing.
 
+Document window placement (macOS and Windows): move/resize, quit, and relaunch; the window must
+reopen where it was left, without flashing at the OS cascade position. With no saved frame it
+centres. Record a normal frame, maximize, quit while maximized, then relaunch: it must come back
+maximized, and un-maximizing must return to the recorded pre-maximize frame. Repeat with the saved
+normal frame on a disconnected display: relaunch must centre then maximize, without a cascade flash.
+On Windows repeat with top/left taskbars and different display scales. On macOS also repeat fullscreen
+and Dock reopen. Cold-open a file from Finder/Explorer, relaunch after an update, and open another
+file/launch again while running: the main window must appear, preserving its live frame and maximized
+state when already visible. Repeat with session recovery and crash-report consent pending.
+
+Nested plugin workers (packaged macOS and Windows builds): install the NMR Shift Predictor package,
+select a molecule, and invoke prediction from real menu input. On Windows/WebView2, confirm the
+entry bootstrap loads with the unchanged installed-plugin CSP, the nested module imports from its
+real `http://tauri.localhost/installed-plugins/…` URL, its reference JSON resolves relative to that
+module, and prediction answers without `ERR_ABORTED` or `NMR_PROVIDER_FAILURE`. Repeat after
+disable/re-enable and uninstall/reinstall. Exercise nested worker `postMessage`, replies, name,
+credentials, error listeners, and termination; confirm blob URLs are released after module startup
+and on load failure. Probe external fetch/module imports: the installed worker and its blob child
+must still be blocked by CSP without host permission. On macOS, confirm the entry and nested
+worker still load directly from `tauri://localhost` with working prediction. In a Windows web
+preview, confirm construction remains native; classic and cross-origin calls must remain unchanged.
+
 Plugin panel focus (both macOS and Windows): open/re-show a panel from Analyze or a plugin command;
 click a panel button, heading, chart, empty area and title/drag area, hover its controls and scroll.
 Buttons must run exactly once and hover feedback must work; after each ordinary click the drawing
@@ -431,6 +453,39 @@ Native creation failure must report an error, never show an in-page desktop fall
 browser-only shared form separately. Check native prompt hide/restore and Cmd-Tab/Alt-Tab behavior.
 Cancel/Escape makes no change. Check close/far/page limits and native save/reopen. Disable the setting
 with a preview/flyout open: it closes, controls disappear and direct commands report why unavailable.
+
+- Export preview and presets (macOS and Windows): with a fresh profile, verify Preferences >
+  Export preview and size presets is unchecked. Export must show the original Scale/Max dimension
+  controls and JPEG quality slider, prefill the last destination, and let Choose work with an empty
+  filename. Confirm no preview requests, frame computations, native rasterizations or preview IPC.
+  Toggle the preference on with Export already open: the preview and presets must appear live.
+  Toggle off while rendering and while Choose is open: legacy controls return and stale previews
+  must not appear. Reopen Export and restart to verify persistence. Compare saved files with equal
+  options in both modes (fix PDF time/ID when comparing bytes). With the preference on, export molecules, text, arrows, and an
+  object crossing the page edge. Compare preview with saved SVG, PDF, and PNG; check clipping
+  warnings. Switch slide/poster/publication presets and edit linked pixel/physical dimensions.
+  The 7200 px poster preset must keep preview rendering at most 800 px on its longest side;
+  only the saved export uses the requested size. Choose content crop and transparent PNG,
+  verify JPEG numeric quality changes the preview, and check PNG density/PDF physical dimensions.
+  The PNG density hint must be absent until explicit sizing is set. Type an atom label without
+  committing it and verify the preview matches the pending edit and the final export.
+  Close during rendering and switch formats rapidly: stale previews must never replace the
+  current format, and updates remain debounced. Repeat each preset with an empty portrait
+  Letter page and a tall drawing; submit after editing pixels and physical dimensions.
+  Verify saved SVG millimeter dimensions and PDF drawing bounds match the displayed physical
+  size. Request 8190 x 4095 px at 36 DPI in PDF: a specific 14400-point limit message must
+  prevent export without clipping. Typing a filename must not rerun the content crop.
+  Verify Enter submits a valid export, unlink/relink dimensions, clear and retype numeric
+  values, and check manual edits select Custom. Navigate presets with arrow keys: dimensions
+  change only on Enter or leaving the field. Choose a file, change format/name, then cancel
+  and retry the new location picker; only explicitly chosen paths may be written, and
+  failures must show inside the dialog. Check rounded SVG units. With a ring and arrow, PDF
+  must show both in the image labelled “Preview of the PDF page layout”, with no embedded
+  PDF viewer or extra tab stop. Toggle PDF page guides and compare with the exported PDF.
+  Repeat previews for BMP, GIF and TIFF. Keep Export open while editing its source drawing,
+  including edits that preserve its bounds: the preview must refresh and keep the filename and
+  size settings. Repeat while another drawing is active and while Choose is pending, then cancel
+  Choose. The refreshed preview and final file must describe the originating drawing.
 
 ## Native Custom Page Size (macOS and Windows)
 

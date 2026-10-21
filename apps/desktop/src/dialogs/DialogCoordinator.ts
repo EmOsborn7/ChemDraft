@@ -1,5 +1,5 @@
 import { dialogEnvelope, parseDialogMessage, validateDialogDelivery, type DialogCloseReason, type DialogMessage, type DialogRegistration, type PageSize, type SpacingSnapshot, type ExportDialogResult, SPACING_PREVIEW_CHUNK_SIZE, SPACING_PREVIEW_MAX_CHUNKS } from "./dialogProtocol";
-import type { ExportOptions } from "./exportOptions";
+import type { ExportOptions, ExportFrame, ExportPreviewResult } from "./exportOptions";
 import type { DialogDelivery, DialogTransport } from "./dialogTransport";
 
 interface Session {
@@ -14,6 +14,9 @@ interface Session {
   terminalRequestId?: string;
   previewRequest?: { requestId: string; percent: number };
   previewing?: boolean;
+  previewRequestId?: string;
+  pendingFrame?: ExportFrame;
+  frameKey?: string;
 }
 /** Document-owned authority. A future modal kind can acquire an input lease here; pageSize never does. */
 export class DialogCoordinator {
@@ -26,11 +29,39 @@ export class DialogCoordinator {
     previewArrangementSpacing?(tabId: string, percent: number): string | Promise<string>;
     onSpacingSettled?(tabId: string): void;
     export?(tabId: string, options: ExportOptions, live: () => boolean, progress: (notice: string) => Promise<void>): Promise<ExportDialogResult>;
+    previewExport?(tabId: string, options: ExportOptions, live: () => boolean): Promise<ExportPreviewResult>;
     chooseExportDestination?(tabId: string, options: ExportOptions, live: () => boolean): Promise<ExportDialogResult>;
     onError(message: string): void;
     onSettled?(tabId: string, reason: DialogCloseReason, kind?: "export" | "pageSize"): void;
   }, private options: { readyTimeoutMs?: number } = {}) {}
 
+  cancelExportPreviews(): void {
+    for (const session of this.sessions.values()) {
+      if (session.snapshot.dialogKind !== "export") continue;
+      session.previewRequestId = undefined;
+      session.pendingFrame = undefined;
+      session.frameKey = undefined;
+    }
+  }
+
+  async updateExportFrame(tabId: string, frame: ExportFrame): Promise<void> {
+    const session = this.sessions.get(`${tabId}:export`);
+    if (!session || session.settled) return;
+    const frameKey = JSON.stringify(frame);
+    if (session.frameKey === frameKey) return;
+    const message: DialogMessage = { ...dialogEnvelope(session.snapshot), dialogKind: "export", type: "result", data: { status: "frame", frame } };
+    if (!parseDialogMessage(message)) throw new Error("Invalid Export frame");
+    session.frameKey = frameKey;
+    session.pendingFrame = frame;
+    session.previewRequestId = undefined;
+    await this.flushExportFrame(session);
+  }
+  private async flushExportFrame(session: Session): Promise<void> {
+    if (session.settled || session.terminalRequestId || !session.ready || !session.registration || !session.pendingFrame) return;
+    const frame = session.pendingFrame;
+    session.pendingFrame = undefined;
+    await this.transport.publish(session.registration.hostId, { ...dialogEnvelope(session.snapshot), dialogKind: "export", type: "result", data: { status: "frame", frame } });
+  }
   exportSessionId(tabId: string): string | undefined {
     const session = this.sessions.get(`${tabId}:export`);
     return session && !session.settled ? session.snapshot.sessionId : undefined;
@@ -46,10 +77,10 @@ export class DialogCoordinator {
   async openArrangementSpacing(tabId: string, data: SpacingSnapshot): Promise<void> {
     return this.open(tabId, "arrangementSpacing", data);
   }
-  async openExport(tabId: string, data: { title: string; options: ExportOptions }): Promise<void> {
+  async openExport(tabId: string, data: { title: string; options: ExportOptions; frame?: ExportFrame }): Promise<void> {
     return this.open(tabId, "export", data);
   }
-  private async open(tabId: string, kind: DialogMessage["dialogKind"], data: (PageSize & { title: string }) | SpacingSnapshot | { title: string; options: ExportOptions }): Promise<void> {
+  private async open(tabId: string, kind: DialogMessage["dialogKind"], data: (PageSize & { title: string }) | SpacingSnapshot | { title: string; options: ExportOptions; frame?: ExportFrame }): Promise<void> {
     if (this.stopped) throw new Error("The document window is closing");
     const key = `${tabId}:${kind}`;
     const existing = this.sessions.get(key);
@@ -71,6 +102,7 @@ export class DialogCoordinator {
       await this.ensureSubscription();
       if (session.settled || this.stopped) return;
       session.registration = await this.transport.open(snapshot);
+      await this.flushExportFrame(session);
       if (session.settled) await this.transport.close(session.registration.hostId, session.settledReason ?? "error");
       else if (session.ready && session.previewRequest) {
         await this.preview(session, session.previewRequest.requestId, session.previewRequest.percent);
@@ -93,7 +125,7 @@ export class DialogCoordinator {
       if (message.data.reason === "error") this.owner.onError(`${parsed.dialogKind === "export" ? "Export" : parsed.dialogKind === "arrangementSpacing" ? "Adjust arrangement spacing" : "Custom Page Size"} could not show its native window. Open it again to try again.`);
       await this.settle(session, message.data.reason, false); return;
     }
-    if (message.type === "ready") { clearTimeout(session.timer); session.ready = true; return; }
+    if (message.type === "ready") { clearTimeout(session.timer); session.ready = true; await this.flushExportFrame(session); return; }
     if (message.type === "request") {
       if (session.registration) await this.transport.publish(session.registration.hostId, session.snapshot);
       return;
@@ -106,6 +138,20 @@ export class DialogCoordinator {
     if (!session.registration) return;
     // Cancellation invalidates owner work immediately, even while a receipt is pending.
     if (message.data.action === "cancel") { await this.settle(session, "cancel"); return; }
+    if (message.data.action === "preview" && "options" in message.data) {
+      if (session.terminalRequestId || !this.owner.previewExport) return;
+      session.previewRequestId = message.requestId;
+      const live = () => !session.settled && !session.terminalRequestId && session.previewRequestId === message.requestId;
+      try {
+        const preview = await this.owner.previewExport(message.documentTabId, message.data.options, live);
+        const result: DialogMessage = { ...dialogEnvelope(message), type: "result", data: { status: "preview", preview } };
+        if (!parseDialogMessage(result)) throw new Error("Preview is too large or invalid. Reduce the content or export size and try again.");
+        if (live()) await this.transport.publish(session.registration.hostId, result);
+      } catch (error) {
+        if (live()) await this.transport.publish(session.registration.hostId, { ...dialogEnvelope(message), type: "result", data: { status: "error", error: String(error).slice(0, 2048) } });
+      }
+      return;
+    }
     const previous = session.receipts.get(message.requestId);
     if (previous) {
       await session.inFlight.get(message.requestId);
@@ -145,6 +191,7 @@ export class DialogCoordinator {
       if (session.settled) return;
       receipt.data = { status: "error", error: String(error).slice(0, 2048) };
       await this.transport.publish(session.registration.hostId, receipt);
+      await this.flushExportFrame(session);
       return;
     } finally {
       finished();
@@ -155,6 +202,7 @@ export class DialogCoordinator {
     // a save panel are nonterminal; a completed export remains reserved against a second write.
     if (message.data.action === "export" || message.data.action === "chooseDestination") {
       await this.transport.publish(session.registration.hostId, receipt);
+      await this.flushExportFrame(session);
       return;
     }
     try { await this.transport.publish(session.registration.hostId, receipt); }

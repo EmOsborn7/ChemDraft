@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { saveExportPreviewEnabled } from "../exportPreviewSettings";
+import { MemoryStorage } from "../testSupport/memoryStorage";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -15,6 +17,7 @@ import { exportFixture } from "./exportTestFixtures";
 const snapshot: Extract<DialogMessage, { type: "snapshot" }> = { protocolVersion: 1, ownerWindowId: "main", documentTabId: "tab", dialogKind: "pageSize", sessionId: "session", requestId: "request", snapshotRevision: 1, type: "snapshot", data: { title: "Drawing A", width: 8.5, height: 11, unit: "inch" } };
 let root: Root; let container: HTMLDivElement; let stopEditRouting: () => void;
 beforeEach(async () => {
+  vi.stubGlobal("localStorage", new MemoryStorage());
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.useFakeTimers(); vi.clearAllMocks(); host.send.mockResolvedValue(undefined);
   vi.stubGlobal("requestAnimationFrame", vi.fn(() => { throw new Error("hidden rAF must never be used"); }));
   stopEditRouting = installSecondaryWindowEditHistory({ forwardToMain: () => {} });
@@ -170,4 +173,24 @@ it.each(["Cancel", "Escape", "close", "Ctrl+W"])("sends %s during a pending expo
   await act(async () => host.receive!({ ...exportSnapshot, type: "result", requestId: action.requestId, data: { status: "exported", notice: "Late success" } }));
   expect(container.textContent).not.toContain("Late success");
   vi.restoreAllMocks();
+});
+
+it("refreshes preview on frame revision while preserving the user's export draft", async () => {
+  saveExportPreviewEnabled(true);
+  act(() => root.unmount()); root = createRoot(container);
+  await act(async () => root.render(createElement(DialogWindow, { hostId: "export-host" })));
+  const frame = { page: { width: 100, height: 100 }, content: { width: 80, height: 80 }, revision: 1 };
+  const exportedSnapshot: Extract<DialogMessage, { type: "snapshot" }> = { ...snapshot, dialogKind: "export", sessionId: "export-session", data: { title: "Origin", options: { ...exportFixture(), filename: "My custom name.pdf" }, frame } };
+  await act(async () => { host.receive!(exportedSnapshot); await import("./ExportForm"); });
+  await act(async () => vi.advanceTimersByTimeAsync(350));
+  const first = host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "preview").at(-1)![1] as DialogMessage;
+  expect(first).toBeDefined();
+  await act(async () => host.receive!({ ...exportedSnapshot, type: "result", data: { status: "frame", frame: { ...frame, revision: 2 } } }));
+  await act(async () => vi.advanceTimersByTimeAsync(350));
+  const previews = host.send.mock.calls.filter(([, m]) => m.type === "action" && m.data.action === "preview");
+  expect(previews).toHaveLength(2);
+  expect(previews[1]![1].requestId).not.toBe(first.requestId);
+  expect(container.querySelector<HTMLInputElement>("#chemdraft-export-filename")!.value).toBe("My custom name.pdf");
+  await act(async () => host.receive!({ ...exportedSnapshot, type: "result", requestId: first.requestId, data: { status: "preview", preview: { url: "data:image/png;base64,AAAA", kind: "image", width: 100, height: 100, warnings: [] } } }));
+  expect(container.querySelector('img[alt="Export preview"]')).toBeNull();
 });
