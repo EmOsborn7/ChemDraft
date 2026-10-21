@@ -31,7 +31,7 @@ fixed while the slider moves so the available page space remains visible. Cancel
 one Undo step. Disabling the preference closes the dialog and native popovers.
 An overlapping starting selection can still be spread into a valid range. The original 100%
 position remains available; intermediate values that still overlap show an error and cannot Save.
-Carried charge marks retain their original atom attachment through layout/spacing commits,
+Carried charge marks retain their original atom attachment when arranging compounds or adjusting spacing,
 including sticky marks positioned nearer another atom. Moving a charge mark independently still
 allows intentional reassociation.
 

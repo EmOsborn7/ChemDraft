@@ -443,8 +443,8 @@ Try initially overlapping compounds with space to expand: a feasible expansion m
 even if 150% exceeds the page. Intermediate overlap values show an error and disable Save.
 Align a row or column with a page edge using decimal coordinates, then reopen Adjust spacing:
 valid expansion/compaction remains reachable; rounding alone must not pin the slider to 100%.
-Place a sticky charge label near a neighboring atom, then arrange, adjust spacing, group-drag,
-Undo/Redo and save/reopen. The charge stays on its original atom unless the label alone is moved.
+Place a sticky charge label near a neighboring atom, then arrange, adjust spacing,
+Undo/Redo and save/reopen. Layouts and spacing keep the charge on its original atom.
 Switch tabs before Save: change only the original tab, keep it selected there, and Undo once there.
 Change the source drawing while its preview is open: stale Save must fail without an undo entry.
 Close/replace its drawing or quit during startup: no orphan or late mutation. Rapidly drag the slider:

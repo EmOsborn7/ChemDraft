@@ -1,13 +1,13 @@
 import { depictSmiles2D } from "@chemdraft/ocl-adapter";
 import { createSmilesMolecule } from "@chemdraft/document-workflow-core";
 import { describe, expect, it } from "vitest";
-import { applyPatches, serializeDocument, deserializeDocument, type ChemDraftDocument, type MoleculeObject, type TextObject, type ElectronMarkObject } from "@chemdraft/chem-core";
+import { applyPatches, serializeDocument, deserializeDocument, type ChemDraftDocument, type DocumentPatch, type MoleculeObject, type TextObject, type ElectronMarkObject } from "@chemdraft/chem-core";
 import { ArrangementLayouts, moleculeVisualBoundsForArrangement, textVisualBoundsForArrangement } from "@chemdraft/layout-engine";
 import { nativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
 import { arrangeSelectedDocumentObjects, createNativeSingleBondMolecule, createPhase4Document,
   groupSelectedDocumentObjects, selectedArrangementObjectIds, selectDocumentObjects, setDocumentCustomPageSize,
   adjustArrangementSpacing, arrangementSpacingRange, arrangementSpacingPreviewBounds,
-  normalizeCommittedDocument, reconcileNativeChargeMarks, moveDocumentObjects, alignSelectedDocumentObjects } from "./documentWorkflow";
+  normalizeCommittedDocument, reconcileNativeChargeMarks, moveDocumentObjects, alignSelectedDocumentObjects, phase4Timestamp } from "./documentWorkflow";
 import { arrangementCommandId, arrangementLayoutForCommand, arrangementGridAlignmentForCommand, arrangementIconName, createLayerActions } from "./commands";
 
 function selectedCompounds(count = 6): ChemDraftDocument {
@@ -53,11 +53,9 @@ function stickyChargeFixture(): ChemDraftDocument {
 }
 
 describe("arranging document selections", () => {
-  it.each([...ArrangementLayouts, "spacing", "group drag", "alignment"] as const)("preserves a sticky charge's atom identity through %s and commit normalization", operation => {
+  it.each([...ArrangementLayouts, "spacing"] as const)("preserves a sticky charge's atom identity through %s and commit normalization", operation => {
     const before = stickyChargeFixture();
     const moved = operation === "spacing" ? adjustArrangementSpacing(before, 1.1).document :
-      operation === "group drag" ? moveDocumentObjects(before, before.selection.objectIds, 50, 40) :
-      operation === "alignment" ? alignSelectedDocumentObjects(before, "right") :
       arrangeSelectedDocumentObjects(before, operation).document;
     expect(moved).not.toBe(before);
     const after = normalizeCommittedDocument(moved);
@@ -79,6 +77,49 @@ describe("arranging document selections", () => {
     const reopened = normalizeCommittedDocument(deserializeDocument(serializeDocument(after)));
     expect(reopened.pages[0].objects).toEqual(after.pages[0].objects);
     expect(after.selection).toEqual(before.selection);
+  });
+  // Charge stickiness for group drags and alignment is a separate change.
+  it.each(["group drag", "alignment"] as const)("keeps main's exact document behavior for %s", operation => {
+    const before = stickyChargeFixture();
+    const expected = applyPatches(before, before.pages[0].objects.flatMap<DocumentPatch>(object => {
+      const dx = operation === "group drag" ? 50 : object.id === "second" ? 0 : 300;
+      const dy = operation === "group drag" ? 40 : 0;
+      if (dx === 0 && dy === 0) return [];
+      const x = object.x + dx, y = object.y + dy;
+      if (object.type === "molecule") return [{ op: "updateObject", objectId: object.id, changes: {
+        x, y, atoms: object.atoms.map(atom => ({ ...atom, x: atom.x + dx, y: atom.y + dy }))
+      } }];
+      if (object.type === "electron-mark") return [{ op: "updateObject", objectId: object.id, changes: {
+        x, y, anchor: { ...object.anchor, kind: "point", point: { x: x + object.width / 2, y: y + object.height / 2 } }
+      } }];
+      return [];
+    }), { now: phase4Timestamp });
+    const moved = operation === "group drag" ? moveDocumentObjects(before, before.selection.objectIds, 50, 40) :
+      alignSelectedDocumentObjects(before, "right");
+    expect(moved).toEqual(expected);
+    const after = normalizeCommittedDocument(moved);
+    expect(after).toEqual(normalizeCommittedDocument(expected));
+    const molecule = after.pages[0].objects.find(object => object.id === "charged")! as MoleculeObject;
+    expect(molecule.atoms.map(atom => atom.formalCharge ?? 0)).toEqual([0, -1]);
+    expect(after.pages[0].objects.find(object => object.id === "sticky-charge"))
+      .toMatchObject({ anchor: { kind: "atom", objectId: molecule.id, atomId: molecule.atoms[1].id } });
+  });
+  it.each([...ArrangementLayouts, "spacing"] as const)("carries a selected mark with a stale atomId exactly once through %s", operation => {
+    let before = stickyChargeFixture();
+    const oldMark = before.pages[0].objects.find(object => object.id === "sticky-charge")! as ElectronMarkObject;
+    before = applyPatches(before, [{ op: "updateObject", objectId: oldMark.id,
+      changes: { anchor: { ...oldMark.anchor, atomId: "stale-atom" } } }]);
+    before = selectDocumentObjects(before, before.pages[0].id, [...before.selection.objectIds, oldMark.id]);
+    expect(selectedArrangementObjectIds(before)).toEqual(["charged", "second"]);
+    const result = operation === "spacing" ? adjustArrangementSpacing(before, 1.1) : arrangeSelectedDocumentObjects(before, operation);
+    expect(result.document).not.toBe(before);
+    const old = before.pages[0].objects.find(object => object.id === "charged")!;
+    const next = result.document.pages[0].objects.find(object => object.id === old.id)!;
+    const mark = result.document.pages[0].objects.find(object => object.id === oldMark.id)!;
+    const dx = next.x - old.x, dy = next.y - old.y;
+    expect(Math.hypot(dx, dy)).toBeGreaterThan(1);
+    expect(mark.x - oldMark.x).toBeCloseTo(dx);expect(mark.y - oldMark.y).toBeCloseTo(dy);
+    expect(result.document.selection).toEqual(before.selection);
   });
   it("still lets an independently moved charge mark attach to a different atom", () => {
     const before = stickyChargeFixture();

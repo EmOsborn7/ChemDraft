@@ -13447,9 +13447,7 @@ export function moveDocumentObjects(
   const patches = page.objects.flatMap((object) =>
     set.has(object.id)
       ? translateDocumentObjectByPatches(document, object.id, cdx, cdy, {
-          translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set),
-          preserveChargeAnchor: object.type === "electron-mark" && object.anchor.kind === "atom" &&
-            object.anchor.objectId !== undefined && set.has(object.anchor.objectId)
+          translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, set)
         })
       : []
   );
@@ -13512,7 +13510,7 @@ function selectionLayoutItemMoves(
  * so its deltas are summed here. Applying items one at a time cloned and validated the whole
  * document per object — quadratic for a large selection.
  */
-function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly LayoutItemMove[]): ChemDraftDocument {
+function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly LayoutItemMove[], preserveChargeAnchor = false): ChemDraftDocument {
   const combined = new Map<string, LayoutItemMove>();
   for (const move of moves) {
     const existing = combined.get(move.objectId);
@@ -13531,7 +13529,7 @@ function applyLayoutItemMoves(document: ChemDraftDocument, moves: readonly Layou
       ? combined.get(object.anchor.objectId) : undefined;
     return translateDocumentObjectByPatches(document, move.objectId, move.dx, move.dy, {
       translateAnchoredGeometry: move.translateAnchoredGeometry,
-      preserveChargeAnchor: anchorMove !== undefined &&
+      preserveChargeAnchor: preserveChargeAnchor && anchorMove !== undefined &&
         Math.abs(anchorMove.dx - move.dx) < 1e-9 && Math.abs(anchorMove.dy - move.dy) < 1e-9
     });
   });
@@ -13555,10 +13553,11 @@ export function selectedArrangementObjectIds(document: ChemDraftDocument): strin
   });
   const roots = selected.filter((object) => !contained.has(object.id) &&
     (object.type !== "group" || resolveGroupedDocumentObjectIds(page.objects, [object.id]).length > 0));
-  const carried = cascadeCarriedAnchoredMarkIds(page.objects, new Set(roots.flatMap((object) =>
+  const moleculeIds = roots.flatMap((object) =>
     resolveGroupedDocumentObjectIds(page.objects, [object.id])
-  )));
-  return roots.filter((object) => !carried.has(object.id)).map((object) => object.id);
+  ).filter((id) => objects.get(id)?.type === "molecule");
+  const carried = expandWithAnchoredMarkIds(page.objects, moleculeIds);
+  return roots.filter((object) => object.type !== "electron-mark" || !carried.has(object.id)).map((object) => object.id);
 }
 
 export function arrangeSelectedDocumentObjects(document: ChemDraftDocument, layout: ArrangementLayout,
@@ -13568,7 +13567,7 @@ export function arrangeSelectedDocumentObjects(document: ChemDraftDocument, layo
   const plan = planObjectArrangement(items, layout, { ...options, pageBounds: { x: 0, y: 0, width: page.width, height: page.height } });
   if (!plan.ok) return { document, status: plan.reason === "selection" ? "Select at least two objects or groups" :
     plan.reason === "page" ? "This arrangement does not fit on the page. Try a grid or a larger page." : "Cannot arrange this selection: invalid bounds or spacing." };
-  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, p.id, p.dx, p.dy)));
+  const next = applyLayoutItemMoves(document, plan.placements.flatMap(p => selectionLayoutItemMoves(page.objects, p.id, p.dx, p.dy)), true);
   return { document: next, status: next === document ? "Selection is already arranged" : `Arranged ${items.length} objects in ${layout === "oval" ? "an" : "a"} ${layout}${layout === "grid" ? ` (${options.gridAlignment ?? "center"})` : ""}` };
 }
 
@@ -13598,7 +13597,7 @@ export function adjustArrangementSpacing(document:ChemDraftDocument,factor:numbe
       return fail("The compounds need more space between them");
   }
   const moves=ids.flatMap((id,i)=>selectionLayoutItemMoves(page.objects,id,deltas[i].x,deltas[i].y));
-  const result=applyLayoutItemMoves(document,moves);
+  const result=applyLayoutItemMoves(document,moves,true);
   return {document:result,ok:true,status:`Spacing adjusted to ${Math.round(factor*100)}%`};
 }
 
