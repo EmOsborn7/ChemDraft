@@ -3,7 +3,8 @@ import { saveCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { applyPatches, type TextObject } from "@chemdraft/chem-core";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryStorage } from "./testSupport/memoryStorage";
 import { createPhase4Document, createNativeSingleBondMolecule, selectDocumentObjects } from "./documentWorkflow";
 import { MainWindow } from "./MainWindow";
 import { broadcastCompoundLayoutSettings, DOM_COMMAND_EVENT } from "./window-manager";
@@ -13,10 +14,9 @@ class TestResizeObserver { observe() {} unobserve() {} disconnect() {} }
 
 describe("auto-arrangement toolbar and history", () => {
   let container: HTMLDivElement, root: Root;
-  let resizeObserver: typeof ResizeObserver;
   beforeEach(() => {
-    resizeObserver = globalThis.ResizeObserver;
-    globalThis.ResizeObserver = TestResizeObserver;
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
     localStorage.clear();
     saveCompoundLayoutSettings({enabled:true});
     window.history.replaceState(null, "", "/?agentBridge=1");
@@ -30,7 +30,7 @@ describe("auto-arrangement toolbar and history", () => {
     localStorage.clear();
     window.history.replaceState(null, "", "/");
     delete window.__CHEMDRAFT_AGENT__;
-    globalThis.ResizeObserver = resizeObserver;
+    vi.unstubAllGlobals();
   });
   function snapshot() { return window.__CHEMDRAFT_AGENT__!.snapshot().document; }
   async function route(commandId: string) {

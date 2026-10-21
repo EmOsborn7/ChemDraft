@@ -1,15 +1,17 @@
 // @vitest-environment jsdom
 import { act, createElement, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PreferencesWindow } from "./PreferencesWindow";
 import { loadCompoundLayoutSettings } from "./compoundLayoutSettings";
 import { broadcastCompoundLayoutSettings, listenForCompoundLayoutSettings, COMPOUND_LAYOUT_SETTINGS_EVENT } from "./window-manager";
+import { MemoryStorage } from "./testSupport/memoryStorage";
 
 const native = vi.hoisted(() => ({emit: vi.fn(), listen: vi.fn(), unlisten: vi.fn()}));
 vi.mock("@tauri-apps/api/event", () => ({emit: native.emit, listen: native.listen}));
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-afterEach(() => { vi.unstubAllGlobals(); localStorage.clear(); vi.clearAllMocks(); });
+beforeEach(() => { vi.stubGlobal("localStorage", new MemoryStorage()); });
+afterEach(() => { localStorage.clear(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 describe("compound layout preference synchronization", () => {
   it("the Settings checkbox persists and broadcasts one change in StrictMode", async () => {
     localStorage.clear(); const handler=vi.fn(),stop=await listenForCompoundLayoutSettings(handler);
