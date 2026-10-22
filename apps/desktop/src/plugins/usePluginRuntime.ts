@@ -21,6 +21,7 @@ import {
 } from "./installPluginPackage";
 import { pickPluginPackage, type PickedPluginPackage } from "./pickPluginPackage";
 import { buildPluginMenuItems } from "./pluginMenuModel";
+import { buildOfficialPluginMenuItems } from "./officialPluginMenus";
 import { loadDisabledPluginIds, saveDisabledPluginIds } from "./pluginPreferences";
 import { createTauriPluginStagingFs, isTauriHost, type PluginStagingFs } from "./pluginStagingFs";
 import {
@@ -43,6 +44,8 @@ import type {
 } from "./StructureRecognitionController";
 import type { StructureRecognitionEngineStatus } from "./structureRecognitionEngine";
 import { recognitionInstallProgressStore } from "./structureRecognitionInstallProgress";
+import { mountStructureNamingHost } from "./StructureNamingInstallDialog";
+import type { DialogCoordinator } from "../dialogs/DialogCoordinator";
 
 /**
  * Extract a user-facing message from a resolved plugin-command value that is a `{ ok: false }`
@@ -63,6 +66,8 @@ export interface PluginRuntimeProviders {
    *  File > New in one session are indistinguishable to the write-binding check. */
   getActiveDocumentKey?: () => string | undefined;
   getActiveDocumentTab?: () => Pick<ProposalDocumentTab, "id">;
+  /** MainWindow's native dialog authority, when this is a desktop document window. */
+  getDialogCoordinator?: () => DialogCoordinator | undefined;
   getDocumentTabTitle?: (tabId: string) => string | undefined;
   /** `warnings`: the asking invocation's collector, or undefined for a read that should stay silent. */
   getSelection: (warnings?: string[]) => PluginSelectionSnapshot;
@@ -177,6 +182,10 @@ export function usePluginRuntime(providers: PluginRuntimeProviders): PluginRunti
   const { runtime, bundledPlugins } = ownerRef.current;
 
   const [version, bumpVersion] = useReducer((value: number) => value + 1, 0);
+  useEffect(() => mountStructureNamingHost(runtime.naming, {
+    coordinator: () => providersRef.current.getDialogCoordinator?.(),
+    documentTabId: () => providersRef.current.getActiveDocumentTab?.().id
+  }), [runtime]);
   useEffect(() => {
     const unsubscribeHost = runtime.host.subscribe(bumpVersion);
     const unsubscribePanels = runtime.panels.subscribe(bumpVersion);
@@ -401,11 +410,13 @@ export function usePluginRuntime(providers: PluginRuntimeProviders): PluginRunti
   );
   const pluginMenuItems = useStableValue(
     useMemo(
-      () =>
-        buildPluginMenuItems(
+      () => [
+        ...buildPluginMenuItems(
           runtime.host.listMenuContributions(),
           (commandId) => runtime.host.commands.get(commandId)?.enabled === true
         ),
+        ...buildOfficialPluginMenuItems((commandId) => runtime.host.commands.get(commandId))
+      ],
       [runtime, version]
     ),
     sameJson

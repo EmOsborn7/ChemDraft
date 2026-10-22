@@ -1,0 +1,89 @@
+import { describe, expect, it, vi } from "vitest";
+import { PluginStructureToNameResultSchema } from "@chemdraft/plugin-api";
+import { nameStructure, verifyNameRoundTrip } from "@chemdraft/document-workflow-core";
+import { createPhase4Document } from "../documentWorkflow";
+import { nameStructureForPlugin, namingReadBack, scopedNamingMolecule } from "./pluginStructureNaming";
+import { fakeNamingEngine, namingInstalled, namingMolecule, namingRaw } from "./structureNamingTestFixtures";
+
+describe("pluginStructureNaming uses the real naming policy", () => {
+  it("compares implicit H while passing the atom-state-verified explicit-H reference to Orthonym", async () => {
+    const molecule = { ...namingMolecule, atoms: [
+      { id: "carbon", element: "C", x: 0, y: 0, formalCharge: 0 },
+      { id: "hydrogen", element: "H", x: 10, y: 0, formalCharge: 0 }
+    ], bonds: [{ id: "ch", fromAtomId: "carbon", toAtomId: "hydrogen", order: "single" as const }] };
+    const computeStructureIdentifiers = vi.fn(async () => ({
+      smiles: "[H]C", smilesAtomOrder: [1, 0], smilesAtomStates: [
+        { element: "H", formalCharge: 0, isotope: 0, nRad: 0, hydrogenCount: 0 },
+        { element: "C", formalCharge: 0, isotope: 0, nRad: 0, hydrogenCount: 4 }
+      ]
+    }));
+    const canonicalize = vi.fn(async (_structure: string) => "C");
+    const engine = fakeNamingEngine();
+    vi.mocked(engine.name).mockResolvedValue({ ...namingRaw, name: "methane", opsinReadBack: { smiles: "C", failureReason: null } });
+    const result = await nameStructureForPlugin(molecule, engine, namingInstalled, {
+      version: "test", canonicalize, computeStructureIdentifiers
+    });
+    expect(engine.name).toHaveBeenCalledExactlyOnceWith("[H]C");
+    expect(canonicalize.mock.calls).toEqual([["[H]C"], ["C"]]);
+    expect(result).toMatchObject({ status: "named", name: "methane" });
+  });
+
+  it("passes export atom-state evidence through while canonicalizing the read-back separately", async () => {
+    const molecule = { ...namingMolecule,
+      atoms: [{ id: "radical", element: "C", x: 0, y: 0, formalCharge: 0, markRadicals: 1 }], bonds: [] };
+    const computeStructureIdentifiers = vi.fn(async () => ({
+      smiles: "[CH3]", smilesAtomOrder: [0],
+      smilesAtomStates: [{ element: "C", formalCharge: 0, isotope: 0, nRad: 1, hydrogenCount: 3 }]
+    }));
+    const canonicalize = vi.fn(async (structure: string) => structure);
+    const engine = fakeNamingEngine();
+    vi.mocked(engine.name).mockResolvedValue({ ...namingRaw, opsinReadBack: { smiles: "C", failureReason: null } });
+    const result = await nameStructureForPlugin(molecule, engine, namingInstalled, {
+      version: "test", canonicalize, computeStructureIdentifiers
+    });
+    expect(computeStructureIdentifiers).toHaveBeenCalledWith(expect.stringContaining("M  RAD"), { includeAtomStates: true });
+    expect(engine.name).toHaveBeenCalledExactlyOnceWith("[CH3]");
+    expect(canonicalize.mock.calls).toEqual([["[CH3]"], ["C"]]);
+    expect(result).toMatchObject({ status: "declined", code: "noVerifiedName" });
+  });
+
+  it("returns a named PIN with host labels and exact provenance", async () => {
+    const result = await nameStructureForPlugin(namingMolecule, fakeNamingEngine(), namingInstalled,
+      { canonicalize: async () => "CCO", version: "loaded-version" });
+    expect(result).toMatchObject({ status: "named", name: "ethanol", kindLabel: "Preferred IUPAC name",
+      engine: { commit: namingInstalled.installed!.orthonymCommit },
+      verification: { canonicalizer: { version: "loaded-version" } } });
+    expect(PluginStructureToNameResultSchema.safeParse(result).success).toBe(true);
+  });
+  it("declines the glycine zwitterion when OPSIN reads neutral glycine", async () => {
+    const engine = fakeNamingEngine();
+    vi.mocked(engine.name).mockResolvedValue({ ...namingRaw, name: "glycine", opsinReadBack: { smiles: "NCC(=O)O", failureReason: null } });
+    const result = await nameStructureForPlugin(namingMolecule, engine, namingInstalled, {
+      version: "loaded-version", canonicalize: async structure => structure === "NCC(=O)O" ? structure : "[NH3+]CC(=O)[O-]"
+    });
+    expect(result).toMatchObject({ status: "declined", code: "noVerifiedName" });
+    expect(result).not.toHaveProperty("name");
+  });
+  it("a read-back cannot be used for any other name", async () => {
+    const result = await nameStructure({ canonicalize: async () => "CCO", name: async () => namingRaw,
+      readName: async name => namingReadBack({ ...namingRaw, name: "another name" }, name) }, namingMolecule);
+    expect(result).toMatchObject({ status: "declined", code: "noVerifiedName" });
+    expect(await verifyNameRoundTrip({ drawnCanonicalSmiles: "CCO", name: "other", canonicalize: async () => "CCO",
+      readName: async name => namingReadBack(namingRaw, name) })).toMatchObject({ verified: false });
+  });
+  it("native failure stays a failure, not a chemical decline", async () => {
+    const engine = fakeNamingEngine();
+    vi.mocked(engine.name).mockRejectedValue({ code: "timeout", message: "Timed out" });
+    await expect(nameStructureForPlugin(namingMolecule, engine, namingInstalled, { canonicalize: async () => "CCO", version: "test" })).rejects.toMatchObject({ code: "timeout" });
+  });
+  it("refuses out-of-scope ids, nonmolecules and ambiguous empty selections", () => {
+    const doc = createPhase4Document();
+    doc.pages[0]!.objects = [namingMolecule];
+    expect(scopedNamingMolecule(doc, { objectIds: [], molecules: [] }, "m1")).toBe(namingMolecule);
+    expect(() => scopedNamingMolecule(doc, { objectIds: ["another"], molecules: [] }, "m1")).toThrow(/current selection/);
+    expect(() => scopedNamingMolecule(doc, undefined, "unknown")).toThrow();
+    doc.pages[0]!.objects.push({ ...namingMolecule, id: "m2" });
+    expect(() => scopedNamingMolecule(doc, undefined, "m1")).toThrow();
+    expect(scopedNamingMolecule(doc, { objectIds: ["m1"], molecules: [] }, "m1")).toBe(namingMolecule);
+  });
+});

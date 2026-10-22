@@ -19,6 +19,8 @@ import type {
   PreparedPluginUpdate
 } from "./pluginUpdates";
 import { createPluginRuntime, type DesktopPluginRuntime } from "./createPluginRuntime";
+import { fakeNamingEngine, namingManifest } from "./structureNamingTestFixtures";
+import { OFFICIAL_PLUGIN_CATALOG, type OfficialPluginCatalogEntry } from "./pluginUpdates";
 import { applyEnabledPlugins, type BundledPluginDescriptor } from "./registerBundledPlugins";
 import type {
   StructureRecognitionEngine,
@@ -69,6 +71,154 @@ const descriptors: readonly BundledPluginDescriptor[] = [
     options: { commandHandlers: { [commandId]: async () => ({ ok: true }) } }
   }
 ];
+
+describe("naming engine catalog ownership", () => {
+  it("discloses and starts the naming engine after the catalog plugin install", async () => {
+    const engine = fakeNamingEngine({ state: "notInstalled", requiredDiskBytes: 1e9, freeDiskBytes: 8e9 });
+    const runtime = createPluginRuntime({ getActiveDocument: () => undefined, structureNamingEngine: engine });
+    const official = { ...namingManifest, id: "org.chemdraft.naming.orthonym" };
+    const prepared: PreparedOfficialPluginInstall = {
+      ...pickedPackage(official), pluginId: official.id, checksumVerified: true
+    };
+    const install = vi.fn(async () => undefined);
+    mount(createElement(OfficialCatalogHarness, { runtime, prepare: async () => prepared, onInstall: install }));
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>(`[data-action="install-official-plugin"][data-plugin-id="${official.id}"]`)!.click();
+    });
+    const review = document.querySelector('[data-testid="plugin-package-engine-disclosure"]');
+    expect(review?.textContent).toContain("100 MB");
+    expect(review?.textContent).toContain("uses about 0.3 GB once installed");
+    expect(review?.textContent).toMatch(/Needs about [\d.]+ GB free while installing/);
+    expect(review?.textContent).toContain("GPL-2.0-with-Classpath-Exception");
+    expect(engine.install).not.toHaveBeenCalled();
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-action="confirm-install-package"]')!.click();
+    });
+    expect(install).toHaveBeenCalledOnce();
+    expect(engine.install).toHaveBeenCalledOnce();
+  });
+
+  it("shows a catalog-started naming install failure without reopening, even when the review's status read arrives late", async () => {
+    const notInstalled = { state: "notInstalled" as const, requiredDiskBytes: 1e9, freeDiskBytes: 8e9 };
+    const engine = fakeNamingEngine(notInstalled);
+    let resolveStaleStatus!: (status: Awaited<ReturnType<typeof engine.status>>) => void;
+    vi.mocked(engine.status).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveStaleStatus = resolve; })
+    ).mockResolvedValue(notInstalled);
+    vi.mocked(engine.install).mockRejectedValue({ code: "network", message: "The download connection was lost." });
+    const runtime = createPluginRuntime({ getActiveDocument: () => undefined, structureNamingEngine: engine });
+    const official = { ...namingManifest, id: "org.chemdraft.naming.orthonym" };
+    const prepared: PreparedOfficialPluginInstall = {
+      ...pickedPackage(official), pluginId: official.id, checksumVerified: true
+    };
+    mount(createElement(OfficialCatalogHarness, { runtime, prepare: async () => prepared }));
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>(`[data-action="install-official-plugin"][data-plugin-id="${official.id}"]`)!.click();
+    });
+    await vi.waitFor(() => expect(engine.status).toHaveBeenCalled());
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>("[data-action=confirm-install-package]")!.click();
+    });
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="naming-engine-row"]')).not.toBeNull());
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="molscribe-engine-install-error"]')?.textContent)
+      .toBe("The naming engine could not be installed: The download connection was lost."));
+
+    // The status request that began while the catalog review was open must not put a stopped run
+    // back into its final progress phase.
+    await act(async () => resolveStaleStatus({ ...notInstalled, state: "installing" }));
+    expect(document.querySelector('[data-testid="molscribe-engine-install-error"]')?.textContent)
+      .toBe("The naming engine could not be installed: The download connection was lost.");
+    expect(document.querySelector('[data-testid="recognition-install-progress"]')).toBeNull();
+  });
+
+  it("settles a catalog-started naming cancellation live when its row refreshed while installing", async () => {
+    const notInstalled = { state: "notInstalled" as const, requiredDiskBytes: 1e9, freeDiskBytes: 8e9 };
+    const installing = { ...notInstalled, state: "installing" as const };
+    const engine = fakeNamingEngine(notInstalled);
+    let status: Awaited<ReturnType<typeof engine.status>> = notInstalled;
+    let failInstall!: (error: unknown) => void;
+    let reportProgress!: Parameters<typeof engine.install>[0];
+    vi.mocked(engine.status).mockImplementation(async () => status);
+    vi.mocked(engine.install).mockImplementation((progress) => {
+      status = installing;
+      reportProgress = progress;
+      return new Promise((_resolve, reject) => { failInstall = reject; });
+    });
+    vi.mocked(engine.cancelInstall).mockImplementation(async () => {
+      status = notInstalled;
+      failInstall({ code: "cancelled", message: "Naming engine installation cancelled." });
+    });
+    const runtime = createPluginRuntime({ getActiveDocument: () => undefined, structureNamingEngine: engine });
+    const official = { ...namingManifest, id: "org.chemdraft.naming.orthonym" };
+    const prepared: PreparedOfficialPluginInstall = {
+      ...pickedPackage(official), pluginId: official.id, checksumVerified: true
+    };
+    mount(createElement(OfficialCatalogHarness, { runtime, prepare: async () => prepared }));
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>(`[data-action="install-official-plugin"][data-plugin-id="${official.id}"]`)!.click();
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>("[data-action=confirm-install-package]")!.click();
+    });
+    await vi.waitFor(() => expect(document.querySelector('[data-action="cancel-naming-engine-install"]')).not.toBeNull());
+    act(() => reportProgress({ phase: "installingPython", message: "Installing Python", bytesDone: 46e6, bytesTotal: 75e6 }));
+    expect(document.querySelector('[data-testid="recognition-install-progress"]')).not.toBeNull();
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-action="cancel-naming-engine-install"]')!.click();
+    });
+
+    expect(document.querySelector('[data-testid="naming-engine-row"]')?.textContent).toContain(
+      "Naming engine: not installed"
+    );
+    expect(document.querySelector('[data-testid="molscribe-engine-install-error"]')?.textContent).toBe(
+      "Installation was cancelled."
+    );
+    // Unmounting this component clears its elapsed-time interval, so the display cannot keep ticking.
+    expect(document.querySelector('[data-testid="recognition-install-progress"]')).toBeNull();
+  });
+
+  it("reports a cancelled naming install neutrally in the installed plugin row", async () => {
+    const engine = fakeNamingEngine({ state: "notInstalled", requiredDiskBytes: 1e9, freeDiskBytes: 8e9 });
+    let failInstall!: (error: unknown) => void;
+    vi.mocked(engine.install).mockImplementation(() => new Promise((_resolve, reject) => { failInstall = reject; }));
+    vi.mocked(engine.cancelInstall).mockImplementation(async () => {
+      failInstall({ code: "cancelled", message: "Naming engine installation cancelled." });
+    });
+    const runtime = createPluginRuntime({ getActiveDocument: () => undefined, structureNamingEngine: engine });
+    const official = { ...namingManifest, id: "org.chemdraft.naming.orthonym" };
+    mount(createElement(Harness, {
+      runtime,
+      installedPlugins: [installedEntry(official)],
+      onClose: vi.fn(),
+      onPluginsChanged: vi.fn()
+    }));
+    await vi.waitFor(() => expect(document.querySelector('[data-action="install-naming-engine"]')).not.toBeNull());
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-action="install-naming-engine"]')!.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-action="cancel-naming-engine-install"]')!.click());
+    const message = document.querySelector('[data-testid="molscribe-engine-install-error"]')!;
+    expect(message.textContent).toBe("Installation was cancelled.");
+    expect(message.className).not.toContain("is-error");
+    expect(message.getAttribute("role")).toBe("status");
+  });
+
+  it("chooses the Naming engine row by requiresEngine, including another catalog id", async () => {
+    const catalog = OFFICIAL_PLUGIN_CATALOG as OfficialPluginCatalogEntry[];
+    const alias = { ...catalog.find(entry => entry.requiresEngine === "structureNaming")!, pluginId: "org.chemdraft.test.otherNaming" };
+    catalog.push(alias);
+    onTestFinished(() => { catalog.splice(catalog.indexOf(alias), 1); });
+    const engine = fakeNamingEngine();
+    const runtime = createPluginRuntime({ getActiveDocument: () => undefined, structureNamingEngine: engine });
+    const manifest = { ...namingManifest, id: alias.pluginId };
+    mount(createElement(Harness, { runtime, installedPlugins: [installedEntry(manifest)], onClose: vi.fn(), onPluginsChanged: vi.fn() }));
+    await act(async () => { await Promise.resolve(); });
+    const row = document.querySelector('[data-testid="naming-engine-row"]');
+    expect(row?.textContent).toContain("Naming engine: installed");
+    expect(row?.querySelector('[data-action="remove-naming-engine"]')).not.toBeNull();
+    expect(row?.textContent).not.toContain("Recognition engine");
+  });
+});
 
 let container: HTMLElement | undefined;
 let root: Root | undefined;
@@ -546,7 +696,7 @@ describe("PluginManagerDialog", () => {
       "Recognition engine: not installed"
     );
     expect(document.querySelector('[data-testid="molscribe-engine-install-note"]')?.textContent).toContain(
-      "Downloads about 2.5 GB and needs 2 GB free (8 GB free now)."
+      "Downloads about 2.5 GB and uses about 2.4 GB once installed. Needs about 2.0 GB free while installing. Free now: 8.0 GB. It runs entirely on this computer."
     );
     const install = document.querySelector<HTMLButtonElement>('[data-action="install-recognition-engine"]')!;
     // A full-size button, never a small text link.
@@ -1827,9 +1977,9 @@ describe("PluginManagerDialog one-click engine install", () => {
     await reviewAndConfirmMolscribe();
     const disclosure = document.querySelector('[data-testid="plugin-package-engine-disclosure"]');
     expect(disclosure?.textContent).toContain("Also installs the local recognition engine");
-    expect(disclosure?.textContent).toContain("about 2.5 GB to download");
+    expect(disclosure?.textContent).toContain("downloads about 2.5 GB and uses about 2.4 GB once installed");
     // 3,000,000,000 bytes is 3 GB, as every other size in the flow is stated (not 2.8 "GB" of 1024³).
-    expect(disclosure?.textContent).toContain("Needs 3 GB free. Free now: 8 GB.");
+    expect(disclosure?.textContent).toContain("Needs about 3.0 GB free while installing. Free now: 8.0 GB.");
     expect(fake.engine.install).not.toHaveBeenCalled();
 
     await act(async () => {

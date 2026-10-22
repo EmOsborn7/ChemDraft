@@ -1,8 +1,8 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,15 +10,22 @@ use std::time::{Duration, Instant};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
+use super::file_ops::{self, FileOps};
 use super::pins;
-use super::platform::EnginePlatform;
 pub use super::platform::RunningChild;
+use super::platform::{EnginePlatform, InstallChild};
 use super::progress::{self, GrowthEstimator};
 use super::EngineSpec;
 use super::{InstallError, InstallPhase, InstallProgress};
 
 pub const RECEIPT_FILE: &str = "install.json";
 pub const REQUIREMENTS_FILE: &str = "requirements.txt";
+
+/// Retain enough of a failed uv invocation to make its otherwise terse exit status actionable,
+/// without allowing a broken child to retain an unbounded amount of installer memory.
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
+const STDERR_ERROR_LINES: usize = 3;
+const PIPE_READER_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct InstallPaths {
@@ -89,6 +96,11 @@ pub struct InstallContext<'a> {
 }
 
 pub trait InstallIo: Send + Sync {
+    /// A failed child wait retains this tracking slot; file cleanup must not retry until reaped.
+    fn running_child(&self) -> Option<&RunningChild> {
+        None
+    }
+
     fn download(
         &self,
         spec: Download<'_>,
@@ -103,6 +115,16 @@ pub trait InstallIo: Send + Sync {
         archive: &Path,
         destination: &Path,
     ) -> Result<(), InstallError>;
+
+    fn extract_uv_with_cancel(
+        &self,
+        platform: &dyn EnginePlatform,
+        archive: &Path,
+        destination: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<(), InstallError> {
+        self.extract_uv(platform, archive, destination)
+    }
 
     // One seam for every child process the installer starts; bundling these into a struct would
     // only move the same eight names into a type used at four call sites.
@@ -181,10 +203,98 @@ fn scrub_environment(command: &mut Command) {
     }
 }
 
+/// Drain stderr while the child is running. Keeping only the tail is important both for noisy
+/// package builds and because the installer must continue to supervise (and cancel) the child.
+fn drain_stderr(
+    mut stderr: std::process::ChildStderr,
+) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut tail = Vec::with_capacity(STDERR_TAIL_BYTES);
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stderr.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(tail);
+            }
+            tail.extend_from_slice(&buffer[..read]);
+            if tail.len() > STDERR_TAIL_BYTES {
+                let excess = tail.len() - STDERR_TAIL_BYTES;
+                tail.drain(..excess);
+            }
+        }
+    })
+}
+
+/// Descendants can inherit a pipe even after its owner exits. Never let such a reader block
+/// installation indefinitely; dropping an unfinished handle detaches the reader thread.
+pub(crate) fn finish_reader<T>(reader: std::thread::JoinHandle<T>, timeout: Duration) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    while !reader.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().ok()
+}
+
+/// uv ordinarily writes UTF-8 diagnostics. If the bounded byte tail began in the middle of a
+/// character, discard those leading continuation bytes rather than showing a replacement glyph.
+fn stderr_tail_text(bytes: &[u8]) -> String {
+    let mut start = 0;
+    while start < bytes.len() && std::str::from_utf8(&bytes[start..]).is_err() {
+        start += 1;
+    }
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    strip_ansi_colour_codes(&text)
+}
+
+/// Removes ANSI CSI colour sequences from a diagnostic before it reaches the dialog or log.
+fn strip_ansi_colour_codes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut clean = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\x1b' && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if (b'@'..=b'~').contains(&byte) {
+                    break;
+                }
+            }
+        } else {
+            let character = text[index..]
+                .chars()
+                .next()
+                .expect("character at byte index");
+            clean.push(character);
+            index += character.len_utf8();
+        }
+    }
+    clean
+}
+
+fn stderr_error_summary(tail: &str) -> Option<String> {
+    let lines: Vec<_> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(STDERR_ERROR_LINES)
+        .collect();
+    (!lines.is_empty()).then(|| lines.into_iter().rev().collect::<Vec<_>>().join(" "))
+}
+
 /// Bytes between progress events, so a 1.1 GB download sends ~1,000 events rather than ~9,000.
 const PROGRESS_STRIDE_BYTES: u64 = 1024 * 1024;
 
 impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
+    fn running_child(&self) -> Option<&RunningChild> {
+        Some(&self.running)
+    }
+
     fn download(
         &self,
         spec: Download<'_>,
@@ -212,7 +322,8 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
             }
         }
         let total = spec.size.or_else(|| response.content_length());
-        let mut file = File::create(destination).map_err(S::failed_io)?;
+        let ops = FileOps::new::<S>(Some(cancel)).with_running(self.running_child());
+        let mut file = ops.create(destination).map_err(file_ops::failed::<S>)?;
         let mut digest = Sha256::new();
         let mut done = 0_u64;
         let mut reported = 0_u64;
@@ -225,7 +336,8 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
             if read == 0 {
                 break;
             }
-            file.write_all(&buffer[..read]).map_err(S::failed_io)?;
+            ops.write_all(&mut file, destination, &buffer[..read])
+                .map_err(file_ops::failed::<S>)?;
             digest.update(&buffer[..read]);
             done += read as u64;
             if spec.size.is_some_and(|expected| done > expected) {
@@ -241,7 +353,8 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
             }
         }
         progress.report(download_progress(spec.phase, done, total));
-        file.sync_all().map_err(S::failed_io)?;
+        ops.sync(&file, destination)
+            .map_err(file_ops::failed::<S>)?;
         let actual = format!("{:x}", digest.finalize());
         pins::verify_digest(done, &actual, spec.size, spec.sha256).map_err(|detail| {
             InstallError::checksum(format!("Verification failed for {}: {detail}.", spec.url))
@@ -255,10 +368,21 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
         archive: &Path,
         destination: &Path,
     ) -> Result<(), InstallError> {
+        self.extract_uv_with_cancel(platform, archive, destination, &AtomicBool::new(false))
+    }
+
+    fn extract_uv_with_cancel(
+        &self,
+        platform: &dyn EnginePlatform,
+        archive: &Path,
+        destination: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<(), InstallError> {
+        let ops = FileOps::new::<S>(Some(cancel)).with_running(self.running_child());
         if platform.uv_asset().ends_with(".zip") {
-            extract_uv_zip::<S>(archive, destination)
+            extract_uv_zip_with_ops::<S>(archive, destination, ops)
         } else {
-            extract_uv_tar_gz::<S>(archive, destination)
+            extract_uv_tar_gz_with_ops::<S>(archive, destination, ops)
         }
     }
 
@@ -278,37 +402,48 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
         command
             .args(args)
             .envs(env.iter().cloned())
+            .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        #[cfg(windows)]
-        if _step == RunStep::RewriteVenvLaunchers {
-            command.stderr(Stdio::piped());
-        }
+            .stderr(Stdio::piped());
         platform.configure_child(&mut command);
         let mut child = command.spawn().map_err(|error| {
             InstallError::failed(format!("Could not run {}: {error}", program.display()))
         })?;
-        #[cfg(windows)]
-        if _step == RunStep::RewriteVenvLaunchers {
-            let stderr = child.stderr.take().expect("piped rewrite stderr");
-            let reader = std::thread::spawn(move || stderr_tail(stderr));
-            let outcome = self.supervise(&mut child, program, cancel, watch, None);
-            let tail = reader.join().unwrap_or_default();
-            return outcome.map_err(|mut error| {
-                if !tail.is_empty() {
-                    error.message.push_str(&format!("\nstderr: {tail}"));
+        let stderr = child.stderr.take().map(drain_stderr);
+        let outcome = self.supervise(&mut child, program, cancel, watch, None);
+        let stderr_tail = stderr
+            .and_then(|reader| finish_reader(reader, PIPE_READER_TIMEOUT))
+            .and_then(Result::ok)
+            .map(|tail| stderr_tail_text(&tail))
+            .unwrap_or_default();
+        match outcome {
+            Err(mut error) => {
+                if error.code == super::InstallErrorCode::Failed {
+                    if let Some(summary) = stderr_error_summary(&stderr_tail) {
+                        eprintln!(
+                            "{} {} stderr:\n{}",
+                            S::LOG_PREFIX,
+                            program.display(),
+                            stderr_tail.trim_end()
+                        );
+                        if error.message.ends_with('.') {
+                            error.message.pop();
+                        }
+                        error.message.push_str(": ");
+                        error.message.push_str(&summary);
+                    }
                 }
-                error
-            });
+                Err(error)
+            }
+            Ok(()) => Ok(()),
         }
-        self.supervise(&mut child, program, cancel, watch, None)
     }
 }
 
 /// Drain the pipe while retaining only the final 8 KiB, so a chatty uv cannot block or
 /// grow memory without bound and recovery failures include the useful diagnostic tail.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub(super) fn stderr_tail(mut reader: impl Read) -> String {
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -375,9 +510,16 @@ impl<S: EngineSpec> ProbeIo for SystemInstallIo<S> {
             Some(Instant::now() + PROBE_TIMEOUT),
         );
         let text = reader
-            .map(|reader| reader.join().unwrap_or_else(|_| Ok(Vec::new())))
+            .map(|reader| {
+                finish_reader(reader, PIPE_READER_TIMEOUT).unwrap_or_else(|| Ok(Vec::new()))
+            })
             .transpose()
-            .map_err(S::failed_io)?
+            .map_err(|error| {
+                file_ops::failed::<S>(io::Error::new(
+                    error.kind(),
+                    format!("could not read stdout from {}: {error}", program.display()),
+                ))
+            })?
             .unwrap_or_default();
         outcome?;
         Ok(String::from_utf8_lossy(&text).into_owned())
@@ -387,9 +529,9 @@ impl<S: EngineSpec> ProbeIo for SystemInstallIo<S> {
 impl<S: EngineSpec> SystemInstallIo<S> {
     /// Waits for `child`, killing its whole tree on cancel (or past `deadline`), and sampling a
     /// step's progress estimate while it runs.
-    fn supervise(
+    pub(crate) fn supervise(
         &self,
-        child: &mut Child,
+        child: &mut impl InstallChild,
         program: &Path,
         cancel: &AtomicBool,
         mut watch: Option<RunWatch<'_>>,
@@ -400,9 +542,7 @@ impl<S: EngineSpec> SystemInstallIo<S> {
         loop {
             let timed_out = deadline.is_some_and(|deadline| Instant::now() >= deadline);
             if cancel.load(Ordering::SeqCst) || timed_out {
-                self.running.kill_tree();
-                let _ = child.kill();
-                let _ = child.wait();
+                self.running.kill_and_wait(child);
                 if timed_out && !cancel.load(Ordering::SeqCst) {
                     return Err(InstallError::failed(format!(
                         "{} did not finish within {} seconds.",
@@ -439,14 +579,30 @@ impl<S: EngineSpec> SystemInstallIo<S> {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(error) => {
+                    // Reap before either caller waits for a pipe reader. In particular, an
+                    // inspection error does not imply that the process or its pipes exited.
+                    self.running.kill_and_wait(child);
                     return Err(InstallError::failed(format!(
                         "Could not inspect {}: {error}",
                         program.display()
-                    )))
+                    )));
                 }
             }
         }
     }
+}
+
+pub(crate) fn pip_install_args<S: EngineSpec>(
+    python: OsString,
+    requirements: PathBuf,
+) -> Vec<OsString> {
+    let mut args = os_args(["pip", "install", "--python"]);
+    args.push(python);
+    args.push("--require-hashes".into());
+    args.extend(S::pip_install_args());
+    args.push("--requirement".into());
+    args.push(requirements.into_os_string());
+    args
 }
 
 pub fn install<S: EngineSpec>(
@@ -466,13 +622,16 @@ pub fn install<S: EngineSpec>(
         return Err(S::insufficient_disk(free_bytes));
     }
     check_cancel::<S>(cancel)?;
-    fs::create_dir_all(&paths.app_data).map_err(S::failed_io)?;
+    let ops = FileOps::new::<S>(Some(cancel)).with_running(io.running_child());
+    ops.create_dir_all(&paths.app_data)
+        .map_err(file_ops::failed::<S>)?;
     let partial = paths.partial_dir_for::<S>();
     if partial.exists() {
-        fs::remove_dir_all(&partial).map_err(S::failed_io)?;
+        ops.remove_dir_all(&partial)
+            .map_err(file_ops::failed::<S>)?;
     }
-    fs::create_dir(&partial).map_err(S::failed_io)?;
-    let mut guard = PartialGuard::new(partial.clone());
+    ops.create_dir(&partial).map_err(file_ops::failed::<S>)?;
+    let mut guard = PartialGuard::new(partial.clone(), ops);
 
     progress.report(message(
         InstallPhase::DownloadingUv,
@@ -491,13 +650,14 @@ pub fn install<S: EngineSpec>(
         progress,
     )?;
     let uv = platform.uv_executable(&partial);
-    io.extract_uv(platform, &uv_archive, &uv)?;
+    io.extract_uv_with_cancel(platform, &uv_archive, &uv, cancel)?;
     check_cancel::<S>(cancel)?;
 
     let python_install_dir = partial.join("python");
     let cache_dir = partial.join("download-cache");
     let temp_dir = partial.join("temp");
-    fs::create_dir_all(&temp_dir).map_err(S::failed_io)?;
+    ops.create_dir_all(&temp_dir)
+        .map_err(file_ops::failed::<S>)?;
     let environment = uv_environment(&partial);
     progress.report(message(
         InstallPhase::InstallingPython,
@@ -554,7 +714,12 @@ pub fn install<S: EngineSpec>(
         InstallPhase::InstallingPackages,
         S::packages_message(),
     ));
-    let requirements = fs::read(&paths.requirements).map_err(S::failed_io)?;
+    let requirements = ops
+        .run(
+            format!("read file {}", paths.requirements.display()),
+            || fs::read(&paths.requirements),
+        )
+        .map_err(file_ops::failed::<S>)?;
     let requirements_sha256 = pins::text_sha256(&requirements);
     if requirements_sha256 != S::requirements().1 {
         return Err(InstallError::checksum(format!(
@@ -563,7 +728,8 @@ pub fn install<S: EngineSpec>(
         )));
     }
     let installed_requirements = partial.join(REQUIREMENTS_FILE);
-    fs::write(&installed_requirements, &requirements).map_err(S::failed_io)?;
+    ops.write(&installed_requirements, &requirements)
+        .map_err(file_ops::failed::<S>)?;
     let venv_python = platform.venv_python(&partial).into_os_string();
     // Every package, transitive ones included, is pinned with hashes; `--require-hashes` makes uv
     // refuse anything unpinned, unhashed, or whose archive does not match.
@@ -571,15 +737,7 @@ pub fn install<S: EngineSpec>(
         platform,
         RunStep::InstallPackages,
         &uv,
-        &[
-            OsString::from("pip"),
-            OsString::from("install"),
-            OsString::from("--python"),
-            venv_python.clone(),
-            OsString::from("--require-hashes"),
-            OsString::from("--requirement"),
-            installed_requirements.into_os_string(),
-        ],
+        &pip_install_args::<S>(venv_python.clone(), installed_requirements),
         &environment,
         cancel,
         Some(RunWatch {
@@ -600,17 +758,20 @@ pub fn install<S: EngineSpec>(
         "Verifying the installed engine.",
     ));
     check_cancel::<S>(cancel)?;
-    fs::remove_file(&uv_archive).map_err(S::failed_io)?;
+    ops.remove_file(&uv_archive)
+        .map_err(file_ops::failed::<S>)?;
     if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir).map_err(S::failed_io)?;
+        ops.remove_dir_all(&cache_dir)
+            .map_err(file_ops::failed::<S>)?;
     }
     if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).map_err(S::failed_io)?;
+        ops.remove_dir_all(&temp_dir)
+            .map_err(file_ops::failed::<S>)?;
     }
     S::verify_layout(&partial, platform)?;
     // The receipt is NOT written here: it is the last thing written, into the final location, once
     // the engine has proved it works there (see `commit_staged_tree`).
-    let disk_bytes = directory_size(&partial).map_err(S::failed_io)?;
+    let disk_bytes = directory_size(&partial, ops).map_err(file_ops::failed::<S>)?;
     let receipt = S::receipt(platform, disk_bytes);
     check_cancel::<S>(cancel)?;
 
@@ -662,11 +823,8 @@ pub(crate) fn rewrite_venv_launchers<S: EngineSpec>(
     // replacing launchers; restore it briefly and leave an existing recovery temp tree alone.
     let temp = root.join("temp");
     let had_temp = temp.exists();
-    fs::create_dir_all(&temp).map_err(|error| {
-        InstallError::failed(format!(
-            "Could not prepare the venv launcher rewrite: {error}"
-        ))
-    })?;
+    let ops = FileOps::new::<S>(Some(cancel)).with_running(io.running_child());
+    ops.create_dir_all(&temp).map_err(file_ops::failed::<S>)?;
     let result = io.run(
         platform,
         RunStep::RewriteVenvLaunchers,
@@ -687,9 +845,9 @@ pub(crate) fn rewrite_venv_launchers<S: EngineSpec>(
         None,
     );
     if !had_temp {
-        let _ = fs::remove_dir_all(&temp);
+        let _ = ops.remove_dir_all(&temp);
     }
-    let _ = fs::remove_dir_all(root.join("download-cache"));
+    let _ = ops.remove_dir_all(&root.join("download-cache"));
     result.map_err(|error| InstallError {
         code: error.code,
         message: format!(
@@ -743,9 +901,10 @@ fn commit_staged_tree<S: EngineSpec>(
     platform: &dyn EnginePlatform,
     io: &dyn InstallIo,
     cancel: &AtomicBool,
-    guard: &mut PartialGuard,
+    guard: &mut PartialGuard<'_>,
     receipt: &S::Receipt,
 ) -> Result<(), InstallError> {
+    let ops = FileOps::new::<S>(Some(cancel)).with_running(io.running_child());
     let partial = paths.partial_dir_for::<S>();
     let final_dir = paths.final_dir_for::<S>();
     let previous = paths.previous_dir_for::<S>();
@@ -775,23 +934,26 @@ fn commit_staged_tree<S: EngineSpec>(
             S::LOG_PREFIX,
             error.message
         );
-        remove_tree::<S>(&paths.app_data, &previous).map_err(S::failed_io)?;
-        remove_tree::<S>(&paths.app_data, &final_dir).map_err(S::failed_io)?;
+        remove_tree_with_ops::<S>(&paths.app_data, &previous, ops)
+            .map_err(file_ops::failed::<S>)?;
+        remove_tree_with_ops::<S>(&paths.app_data, &final_dir, ops)
+            .map_err(file_ops::failed::<S>)?;
     }
-    remove_tree::<S>(&paths.app_data, &previous).map_err(S::failed_io)?;
+    remove_tree_with_ops::<S>(&paths.app_data, &previous, ops).map_err(file_ops::failed::<S>)?;
     let had_previous = final_dir.exists();
     if had_previous {
-        fs::rename(&final_dir, &previous).map_err(S::failed_io)?;
+        ops.rename(&final_dir, &previous)
+            .map_err(file_ops::failed::<S>)?;
     }
-    if let Err(error) = fs::rename(&partial, &final_dir) {
+    if let Err(error) = ops.rename(&partial, &final_dir) {
         restore_previous::<S>(&final_dir, &previous, had_previous, platform, io, cancel);
-        return Err(S::failed_io(error));
+        return Err(file_ops::failed::<S>(error));
     }
     // From here the staging tree is gone; a failure retires the new tree instead.
     guard.commit();
 
-    let outcome = relocate_staged_tree(&final_dir, &rebases)
-        .map_err(S::relocation_error)
+    let outcome = relocate_staged_tree_with_ops(&final_dir, &rebases, ops)
+        .map_err(file_ops::relocation_failed::<S>)
         .and_then(|()| rewrite_venv_launchers::<S>(&final_dir, platform, io, cancel))
         .and_then(|()| S::verify_layout(&final_dir, platform))
         .and_then(|()| {
@@ -807,10 +969,12 @@ fn commit_staged_tree<S: EngineSpec>(
         })
         .and_then(|()| check_cancel::<S>(cancel))
         // Last: from this write on, `engine/` is a verified install.
-        .and_then(|()| S::write_receipt(&final_dir.join(RECEIPT_FILE), receipt));
+        .and_then(|()| {
+            S::write_receipt_with_cancel(&final_dir.join(RECEIPT_FILE), receipt, cancel)
+        });
     match outcome {
         Ok(()) => {
-            if let Err(error) = remove_tree::<S>(&paths.app_data, &previous) {
+            if let Err(error) = remove_tree_with_ops::<S>(&paths.app_data, &previous, ops) {
                 eprintln!(
                     "{} could not set aside the replaced engine at {}: {error}",
                     S::LOG_PREFIX,
@@ -822,7 +986,7 @@ fn commit_staged_tree<S: EngineSpec>(
         Err(error) => {
             // Rename the failed tree away before restoring, never delete it in place: a quit
             // mid-delete would leave a half-deleted tree where the engine belongs.
-            match retire_tree::<S>(&paths.app_data, &final_dir) {
+            match retire_tree_with_ops::<S>(&paths.app_data, &final_dir, ops) {
                 Ok(discarded) => {
                     restore_previous::<S>(
                         &final_dir,
@@ -833,7 +997,7 @@ fn commit_staged_tree<S: EngineSpec>(
                         cancel,
                     );
                     if let Some(discarded) = discarded {
-                        delete_discarded::<S>(&discarded);
+                        delete_discarded::<S>(&discarded, ops);
                     }
                 }
                 // The failed tree has no receipt, so it reads as not installed, and the next
@@ -857,8 +1021,9 @@ fn restore_previous<S: EngineSpec>(
     io: &dyn InstallIo,
     cancel: &AtomicBool,
 ) {
+    let ops = FileOps::new::<S>(Some(cancel)).with_running(io.running_child());
     if had_previous && !final_dir.exists() {
-        if let Err(error) = fs::rename(previous, final_dir) {
+        if let Err(error) = ops.rename(previous, final_dir) {
             eprintln!(
                 "{} could not restore the previous engine from {}: {error}",
                 S::LOG_PREFIX,
@@ -897,20 +1062,29 @@ fn discard_path<S: EngineSpec>(app_data: &Path) -> PathBuf {
 
 /// Atomically renames `tree` to a fresh discard directory and returns where it went, or `None`
 /// if there was nothing to move. On error `tree` is untouched and still whole.
+#[cfg(test)]
 pub fn retire_tree<S: EngineSpec>(app_data: &Path, tree: &Path) -> io::Result<Option<PathBuf>> {
+    retire_tree_with_ops::<S>(app_data, tree, FileOps::new::<S>(None))
+}
+
+fn retire_tree_with_ops<S: EngineSpec>(
+    app_data: &Path,
+    tree: &Path,
+    ops: FileOps<'_>,
+) -> io::Result<Option<PathBuf>> {
     if fs::symlink_metadata(tree).is_err() {
         return Ok(None);
     }
     let discarded = discard_path::<S>(app_data);
-    fs::rename(tree, &discarded)?;
+    ops.rename(tree, &discarded)?;
     Ok(Some(discarded))
 }
 
 /// Deletes a retired tree, receipt first. A failure is logged and left for the next launch's
 /// sweep; the tree is already out of every place ChemDraft reads an engine from.
-fn delete_discarded<S: EngineSpec>(discarded: &Path) -> bool {
-    let _ = fs::remove_file(discarded.join(RECEIPT_FILE));
-    match fs::remove_dir_all(discarded) {
+fn delete_discarded<S: EngineSpec>(discarded: &Path, ops: FileOps<'_>) -> bool {
+    let _ = ops.remove_file(&discarded.join(RECEIPT_FILE));
+    match ops.remove_dir_all(discarded) {
         Ok(()) => true,
         Err(error) => {
             eprintln!(
@@ -926,8 +1100,16 @@ fn delete_discarded<S: EngineSpec>(discarded: &Path) -> bool {
 /// Removes `tree` rename-first: it is renamed to a discard directory, then deleted there. An
 /// error means the rename failed and `tree` is still whole in place.
 pub fn remove_tree<S: EngineSpec>(app_data: &Path, tree: &Path) -> io::Result<()> {
-    if let Some(discarded) = retire_tree::<S>(app_data, tree)? {
-        delete_discarded::<S>(&discarded);
+    remove_tree_with_ops::<S>(app_data, tree, FileOps::new::<S>(None))
+}
+
+fn remove_tree_with_ops<S: EngineSpec>(
+    app_data: &Path,
+    tree: &Path,
+    ops: FileOps<'_>,
+) -> io::Result<()> {
+    if let Some(discarded) = retire_tree_with_ops::<S>(app_data, tree, ops)? {
+        delete_discarded::<S>(&discarded, ops);
     }
     Ok(())
 }
@@ -958,6 +1140,7 @@ pub(crate) fn discard_dirs<S: EngineSpec>(app_data: &Path) -> Vec<PathBuf> {
 pub fn remove_engine_trees<S: EngineSpec>(
     paths: &InstallPaths,
 ) -> Result<(), (PathBuf, io::Error)> {
+    let ops = FileOps::new::<S>(None);
     for tree in [
         paths.partial_dir_for::<S>(),
         paths.previous_dir_for::<S>(),
@@ -966,7 +1149,7 @@ pub fn remove_engine_trees<S: EngineSpec>(
         remove_tree::<S>(&paths.app_data, &tree).map_err(|error| (tree, error))?;
     }
     for discarded in discard_dirs::<S>(&paths.app_data) {
-        delete_discarded::<S>(&discarded);
+        delete_discarded::<S>(&discarded, ops);
     }
     Ok(())
 }
@@ -981,34 +1164,37 @@ fn reconcile_previous<S: EngineSpec>(
     io: &dyn InstallIo,
     cancel: &AtomicBool,
 ) -> Result<bool, InstallError> {
+    let ops = FileOps::new::<S>(Some(cancel)).with_running(io.running_child());
     let final_dir = paths.final_dir_for::<S>();
     let previous = paths.previous_dir_for::<S>();
     if !previous.exists() {
         return Ok(false);
     }
     if is_healthy::<S>(&final_dir, platform) {
-        return Ok(match retire_tree::<S>(&paths.app_data, &previous) {
-            Ok(discarded) => {
-                if let Some(discarded) = discarded {
-                    delete_discarded::<S>(&discarded);
+        return Ok(
+            match retire_tree_with_ops::<S>(&paths.app_data, &previous, ops) {
+                Ok(discarded) => {
+                    if let Some(discarded) = discarded {
+                        delete_discarded::<S>(&discarded, ops);
+                    }
+                    true
                 }
-                true
-            }
-            Err(error) => {
-                eprintln!(
-                    "{} could not set aside the stale {}: {error}",
-                    S::LOG_PREFIX,
-                    previous.display()
-                );
-                false
-            }
-        });
+                Err(error) => {
+                    eprintln!(
+                        "{} could not set aside the stale {}: {error}",
+                        S::LOG_PREFIX,
+                        previous.display()
+                    );
+                    false
+                }
+            },
+        );
     }
     if !S::is_restorable(&previous, platform) {
         return Ok(false);
     }
     check_cancel::<S>(cancel)?;
-    let discarded = match retire_tree::<S>(&paths.app_data, &final_dir) {
+    let discarded = match retire_tree_with_ops::<S>(&paths.app_data, &final_dir, ops) {
         Ok(discarded) => discarded,
         Err(error) => {
             eprintln!(
@@ -1019,11 +1205,12 @@ fn reconcile_previous<S: EngineSpec>(
             return Ok(false);
         }
     };
-    let outcome = fs::rename(&previous, &final_dir)
-        .map_err(S::failed_io)
+    let outcome = ops
+        .rename(&previous, &final_dir)
+        .map_err(file_ops::failed::<S>)
         .and_then(|()| {
-            relocate_staged_tree(&final_dir, &[(previous.clone(), final_dir.clone())])
-                .map_err(S::relocation_error)
+            relocate_staged_tree_with_ops(&final_dir, &[(previous.clone(), final_dir.clone())], ops)
+                .map_err(file_ops::relocation_failed::<S>)
         })
         .and_then(|()| rewrite_venv_launchers::<S>(&final_dir, platform, io, cancel))
         .and_then(|()| check_cancel::<S>(cancel));
@@ -1035,7 +1222,7 @@ fn reconcile_previous<S: EngineSpec>(
         );
         // Keep the only verified tree for another recovery attempt if refreshing it failed.
         if final_dir.exists() && !previous.exists() {
-            if let Err(error) = fs::rename(&final_dir, &previous) {
+            if let Err(error) = ops.rename(&final_dir, &previous) {
                 eprintln!(
                     "{} could not set the previous engine back: {error}",
                     S::LOG_PREFIX
@@ -1043,7 +1230,7 @@ fn reconcile_previous<S: EngineSpec>(
             }
         }
         if let Some(discarded) = discarded {
-            if let Err(error) = fs::rename(discarded, &final_dir) {
+            if let Err(error) = ops.rename(&discarded, &final_dir) {
                 eprintln!(
                     "{} could not restore the interrupted tree: {error}",
                     S::LOG_PREFIX
@@ -1058,7 +1245,7 @@ fn reconcile_previous<S: EngineSpec>(
         previous.display()
     );
     if let Some(discarded) = discarded {
-        delete_discarded::<S>(&discarded);
+        delete_discarded::<S>(&discarded, ops);
     }
     // Restored, not removed: the engine is still on disk, now as `engine/`.
     Ok(false)
@@ -1097,7 +1284,16 @@ pub(super) fn normalize_verbatim_path(path: &Path) -> PathBuf {
 
 /// Rewrites every symlink or junction under `root` whose target lies under an old prefix, and the `home`
 /// entry of `venv/pyvenv.cfg`, so both point at the same place under the new prefix.
+#[cfg(test)]
 pub fn relocate_staged_tree(root: &Path, rebases: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    relocate_staged_tree_with_ops(root, rebases, FileOps::for_tests())
+}
+
+fn relocate_staged_tree_with_ops(
+    root: &Path,
+    rebases: &[(PathBuf, PathBuf)],
+    ops: FileOps<'_>,
+) -> io::Result<()> {
     let rebase = |target: &Path| {
         let target = normalize_verbatim_path(target);
         rebases.iter().find_map(|(old, new)| {
@@ -1109,17 +1305,45 @@ pub fn relocate_staged_tree(root: &Path, rebases: &[(PathBuf, PathBuf)]) -> io::
     };
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
+        for entry in ops.run(format!("read directory {}", directory.display()), || {
+            fs::read_dir(&directory)
+        })? {
+            let entry = ops.context(format!("read entry in {}", directory.display()), entry)?;
             let path = entry.path();
-            let file_type = entry.file_type()?;
+            let file_type = ops.run(format!("inspect {}", path.display()), || entry.file_type())?;
             let is_link = file_type.is_symlink();
-            let junction = if is_link { is_junction(&path)? } else { false };
+            let junction = if is_link {
+                ops.run(format!("inspect junction {}", path.display()), || {
+                    is_junction(&path)
+                })?
+            } else {
+                false
+            };
             if junction || is_link {
-                let target = fs::read_link(&path)?;
+                let target = ops.run(format!("read link {}", path.display()), || {
+                    fs::read_link(&path)
+                })?;
                 if let Some(rebased) = rebase(&target) {
-                    fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))?;
-                    create_link(&rebased, &path, junction)?;
+                    // Windows directory links must be removed as directories. Unix symlinks,
+                    // even those targeting directories, are removed as files.
+                    #[cfg(windows)]
+                    let directory_link = {
+                        use std::os::windows::fs::FileTypeExt;
+                        junction || file_type.is_symlink_dir()
+                    };
+                    #[cfg(not(windows))]
+                    let directory_link = false;
+                    if directory_link {
+                        ops.run(format!("remove directory link {}", path.display()), || {
+                            fs::remove_dir(&path)
+                        })?;
+                    } else {
+                        ops.remove_file(&path)?;
+                    }
+                    ops.context(
+                        format!("create link {} to {}", path.display(), rebased.display()),
+                        create_link_with_ops(&rebased, &path, junction, ops),
+                    )?;
                 }
             } else if file_type.is_dir() {
                 pending.push(path);
@@ -1129,28 +1353,48 @@ pub fn relocate_staged_tree(root: &Path, rebases: &[(PathBuf, PathBuf)]) -> io::
 
     let config = root.join("venv").join("pyvenv.cfg");
     if config.is_file() {
-        let mut text = fs::read_to_string(&config)?;
+        let mut text = ops.run(format!("read file {}", config.display()), || {
+            fs::read_to_string(&config)
+        })?;
         for (old, new) in rebases {
             text = text.replace(
                 old.to_string_lossy().as_ref(),
                 new.to_string_lossy().as_ref(),
             );
         }
-        fs::write(&config, text)?;
+        ops.write(&config, text.as_bytes())?;
     }
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) fn create_link(target: &Path, link: &Path, junction: bool) -> io::Result<()> {
+    create_link_with_ops(target, link, junction, FileOps::for_tests())
+}
+
 #[cfg(unix)]
-pub(super) fn create_link(target: &Path, link: &Path, _junction: bool) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
+fn create_link_with_ops(
+    target: &Path,
+    link: &Path,
+    _junction: bool,
+    ops: FileOps<'_>,
+) -> io::Result<()> {
+    ops.run(
+        format!("create link {} to {}", link.display(), target.display()),
+        || std::os::unix::fs::symlink(target, link),
+    )
 }
 
 // A real Windows install confirmed uv's minor-version directory is a junction. Replacing it
 // with symlink_dir failed with error 1314 for an ordinary user. Preserve the reparse-point kind:
 // junction creation needs no symlink privilege (see docs/architecture/ocsr-engine.md).
 #[cfg(windows)]
-pub(super) fn create_link(target: &Path, link: &Path, junction: bool) -> io::Result<()> {
+fn create_link_with_ops(
+    target: &Path,
+    link: &Path,
+    junction: bool,
+    ops: FileOps<'_>,
+) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -1205,47 +1449,75 @@ pub(super) fn create_link(target: &Path, link: &Path, junction: bool) -> io::Res
         {
             data.extend(unit.to_le_bytes());
         }
-        fs::create_dir(link)?;
+        ops.create_dir(link)?;
         let result = (|| {
-            let directory = fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-                .open(link)?;
+            let directory = ops.run(format!("open junction {}", link.display()), || {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(link)
+            })?;
             let mut returned = 0;
             // SAFETY: the owned handle stays open; data holds a complete mount-point buffer;
             // this synchronous call uses no output buffer or OVERLAPPED structure.
-            let ok = unsafe {
-                DeviceIoControl(
-                    directory.as_raw_handle(),
-                    FSCTL_SET_REPARSE_POINT,
-                    data.as_ptr().cast(),
-                    data.len() as u32,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+            ops.run(
+                format!("set junction {} to {}", link.display(), target.display()),
+                || {
+                    let ok = unsafe {
+                        DeviceIoControl(
+                            directory.as_raw_handle(),
+                            FSCTL_SET_REPARSE_POINT,
+                            data.as_ptr().cast(),
+                            data.len() as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            &mut returned,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if ok == 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
         })();
         if result.is_err() {
-            let _ = fs::remove_dir(link);
+            let _ = ops.run(format!("remove junction {}", link.display()), || {
+                fs::remove_dir(link)
+            });
         }
         return result;
     }
     if target.is_dir() {
-        std::os::windows::fs::symlink_dir(target, link)
+        ops.run(
+            format!(
+                "create directory link {} to {}",
+                link.display(),
+                target.display()
+            ),
+            || std::os::windows::fs::symlink_dir(target, link),
+        )
     } else {
-        std::os::windows::fs::symlink_file(target, link)
+        ops.run(
+            format!(
+                "create file link {} to {}",
+                link.display(),
+                target.display()
+            ),
+            || std::os::windows::fs::symlink_file(target, link),
+        )
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(super) fn create_link(_target: &Path, _link: &Path, _junction: bool) -> io::Result<()> {
+fn create_link_with_ops(
+    _target: &Path,
+    _link: &Path,
+    _junction: bool,
+    _ops: FileOps<'_>,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "symlinks are unsupported on this platform",
@@ -1321,10 +1593,11 @@ pub fn remove_stale_staging<S: EngineSpec>(
     io: &dyn InstallIo,
     cancel: &AtomicBool,
 ) -> Vec<PathBuf> {
+    let ops = FileOps::new::<S>(Some(cancel)).with_running(io.running_child());
     let mut removed = Vec::new();
     let partial = paths.partial_dir_for::<S>();
     if partial.exists() {
-        match remove_tree::<S>(&paths.app_data, &partial) {
+        match remove_tree_with_ops::<S>(&paths.app_data, &partial, ops) {
             Ok(()) => removed.push(partial),
             Err(error) => eprintln!(
                 "{} could not remove the stale {}: {error}",
@@ -1344,7 +1617,7 @@ pub fn remove_stale_staging<S: EngineSpec>(
     }
     let final_dir = paths.final_dir_for::<S>();
     if final_dir.is_dir() && fs::symlink_metadata(final_dir.join(RECEIPT_FILE)).is_err() {
-        match remove_tree::<S>(&paths.app_data, &final_dir) {
+        match remove_tree_with_ops::<S>(&paths.app_data, &final_dir, ops) {
             Ok(()) => removed.push(final_dir),
             Err(error) => eprintln!(
                 "{} could not set aside the incomplete {}: {error}",
@@ -1354,7 +1627,7 @@ pub fn remove_stale_staging<S: EngineSpec>(
         }
     }
     for discarded in discard_dirs::<S>(&paths.app_data) {
-        if delete_discarded::<S>(&discarded) {
+        if delete_discarded::<S>(&discarded, ops) {
             removed.push(discarded);
         }
     }
@@ -1405,18 +1678,37 @@ pub(crate) fn message(phase: InstallPhase, message: &str) -> InstallProgress {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extract_uv_tar_gz<S: EngineSpec>(
     archive: &Path,
     destination: &Path,
 ) -> Result<(), InstallError> {
-    let file = File::open(archive).map_err(S::failed_io)?;
+    extract_uv_tar_gz_with_ops::<S>(archive, destination, FileOps::new::<S>(None))
+}
+
+fn extract_uv_tar_gz_with_ops<S: EngineSpec>(
+    archive: &Path,
+    destination: &Path,
+    ops: FileOps<'_>,
+) -> Result<(), InstallError> {
+    let archive_path = archive;
+    let file = ops
+        .run(format!("open archive {}", archive.display()), || {
+            File::open(archive)
+        })
+        .map_err(file_ops::failed::<S>)?;
     let mut archive = GzDecoder::new(file);
     loop {
         let mut header = [0_u8; 512];
         match archive.read_exact(&mut header) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(S::failed_io(error)),
+            Err(error) => {
+                return Err(file_ops::failed::<S>(io::Error::new(
+                    error.kind(),
+                    format!("could not read archive {}: {error}", archive_path.display()),
+                )))
+            }
         }
         if header.iter().all(|byte| *byte == 0) {
             break;
@@ -1429,16 +1721,23 @@ pub(crate) fn extract_uv_tar_gz<S: EngineSpec>(
         let name = String::from_utf8_lossy(&header[..name_end]);
         let is_regular = matches!(header[156], 0 | b'0');
         if Path::new(name.as_ref()).file_name() == Some(OsStr::new("uv")) && is_regular {
-            let mut output = File::create(destination).map_err(S::failed_io)?;
-            let copied = io::copy(&mut Read::by_ref(&mut archive).take(size), &mut output)
-                .map_err(S::failed_io)?;
+            let mut output = ops.create(destination).map_err(file_ops::failed::<S>)?;
+            let copied = ops
+                .copy(
+                    &mut Read::by_ref(&mut archive).take(size),
+                    archive_path,
+                    &mut output,
+                    destination,
+                )
+                .map_err(file_ops::failed::<S>)?;
             if copied != size {
                 return Err(InstallError::failed(
                     "The uv tar archive ended inside the executable.".to_string(),
                 ));
             }
-            output.sync_all().map_err(S::failed_io)?;
-            make_executable::<S>(destination)?;
+            ops.sync(&output, destination)
+                .map_err(file_ops::failed::<S>)?;
+            make_executable::<S>(destination, ops)?;
             return Ok(());
         }
         let padded = size.saturating_add(511) / 512 * 512;
@@ -1446,7 +1745,12 @@ pub(crate) fn extract_uv_tar_gz<S: EngineSpec>(
             &mut Read::by_ref(&mut archive).take(padded),
             &mut io::sink(),
         )
-        .map_err(S::failed_io)?;
+        .map_err(|error| {
+            file_ops::failed::<S>(io::Error::new(
+                error.kind(),
+                format!("could not read archive {}: {error}", archive_path.display()),
+            ))
+        })?;
         if skipped != padded {
             return Err(InstallError::failed(
                 "The uv tar archive ended inside an entry.".to_string(),
@@ -1458,11 +1762,24 @@ pub(crate) fn extract_uv_tar_gz<S: EngineSpec>(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn extract_uv_zip<S: EngineSpec>(
     archive: &Path,
     destination: &Path,
 ) -> Result<(), InstallError> {
-    let bytes = fs::read(archive).map_err(S::failed_io)?;
+    extract_uv_zip_with_ops::<S>(archive, destination, FileOps::new::<S>(None))
+}
+
+fn extract_uv_zip_with_ops<S: EngineSpec>(
+    archive: &Path,
+    destination: &Path,
+    ops: FileOps<'_>,
+) -> Result<(), InstallError> {
+    let bytes = ops
+        .run(format!("read archive {}", archive.display()), || {
+            fs::read(archive)
+        })
+        .map_err(file_ops::failed::<S>)?;
     let eocd = bytes
         .windows(4)
         .rposition(|window| window == b"PK\x05\x06")
@@ -1508,12 +1825,19 @@ pub(crate) fn extract_uv_zip<S: EngineSpec>(
             let compressed = bytes
                 .get(data_start..data_end)
                 .ok_or_else(|| InstallError::failed("The uv zip entry is truncated."))?;
-            let mut output = File::create(destination).map_err(S::failed_io)?;
+            let mut output = ops.create(destination).map_err(file_ops::failed::<S>)?;
             let written = match method {
-                0 => io::copy(&mut io::Cursor::new(compressed), &mut output),
-                8 => io::copy(
-                    &mut flate2::read::DeflateDecoder::new(io::Cursor::new(compressed)),
+                0 => ops.copy(
+                    &mut io::Cursor::new(compressed),
+                    archive,
                     &mut output,
+                    destination,
+                ),
+                8 => ops.copy(
+                    &mut flate2::read::DeflateDecoder::new(io::Cursor::new(compressed)),
+                    archive,
+                    &mut output,
+                    destination,
                 ),
                 other => {
                     return Err(InstallError::failed(format!(
@@ -1521,13 +1845,14 @@ pub(crate) fn extract_uv_zip<S: EngineSpec>(
                     )))
                 }
             }
-            .map_err(S::failed_io)?;
+            .map_err(file_ops::failed::<S>)?;
             if written != uncompressed_size as u64 {
                 return Err(InstallError::failed(format!(
                     "The uv zip produced {written} bytes; expected {uncompressed_size}."
                 )));
             }
-            output.sync_all().map_err(S::failed_io)?;
+            ops.sync(&output, destination)
+                .map_err(file_ops::failed::<S>)?;
             return Ok(());
         }
         cursor = name_end
@@ -1563,25 +1888,37 @@ fn zip_u32<S: EngineSpec>(bytes: &[u8], offset: usize) -> Result<u32, InstallErr
 }
 
 #[cfg(unix)]
-fn make_executable<S: EngineSpec>(path: &Path) -> Result<(), InstallError> {
+fn make_executable<S: EngineSpec>(path: &Path, ops: FileOps<'_>) -> Result<(), InstallError> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).map_err(S::failed_io)?.permissions();
+    let mut permissions = ops
+        .run(format!("inspect file {}", path.display()), || {
+            fs::metadata(path)
+        })
+        .map_err(file_ops::failed::<S>)?
+        .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).map_err(S::failed_io)
+    ops.run(format!("set permissions on {}", path.display()), || {
+        fs::set_permissions(path, permissions.clone())
+    })
+    .map_err(file_ops::failed::<S>)
 }
 
 #[cfg(not(unix))]
-fn make_executable<S: EngineSpec>(_path: &Path) -> Result<(), InstallError> {
+fn make_executable<S: EngineSpec>(_path: &Path, _ops: FileOps<'_>) -> Result<(), InstallError> {
     Ok(())
 }
 
-fn directory_size(root: &Path) -> std::io::Result<u64> {
+fn directory_size(root: &Path, ops: FileOps<'_>) -> std::io::Result<u64> {
     let mut total = 0_u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
+        for entry in ops.run(format!("read directory {}", path.display()), || {
+            fs::read_dir(&path)
+        })? {
+            let entry = ops.context(format!("read entry in {}", path.display()), entry)?;
+            let metadata = ops.run(format!("inspect {}", entry.path().display()), || {
+                entry.metadata()
+            })?;
             if metadata.is_dir() {
                 pending.push(entry.path());
             } else if metadata.is_file() {
@@ -1592,14 +1929,16 @@ fn directory_size(root: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-struct PartialGuard {
+struct PartialGuard<'a> {
+    ops: FileOps<'a>,
     path: PathBuf,
     committed: bool,
 }
 
-impl PartialGuard {
-    fn new(path: PathBuf) -> Self {
+impl<'a> PartialGuard<'a> {
+    fn new(path: PathBuf, ops: FileOps<'a>) -> Self {
         Self {
+            ops,
             path,
             committed: false,
         }
@@ -1610,10 +1949,10 @@ impl PartialGuard {
     }
 }
 
-impl Drop for PartialGuard {
+impl Drop for PartialGuard<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = self.ops.remove_dir_all(&self.path);
         }
     }
 }

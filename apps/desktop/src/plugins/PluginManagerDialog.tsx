@@ -1,3 +1,4 @@
+import { NAMING_ENGINE_DISCLOSURE, NAMING_INSTALL_PROFILE } from "./StructureNamingInstallDialog";
 import { useNativePrompt } from "../nativePrompt";
 import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -22,6 +23,7 @@ import type {
   PreparedPluginUpdate
 } from "./pluginUpdates";
 import { EXPERIMENTAL_PLUGIN_NOTICE, isOfficialPluginExperimental, OFFICIAL_PLUGIN_CATALOG } from "./pluginUpdates";
+import { installSpaceStatement } from "../dialogs/engineInstallText";
 import { RecognitionInstallProgress } from "./RecognitionInstallProgress";
 import { applyEnabledPlugins, type BundledPluginDescriptor } from "./registerBundledPlugins";
 import type { StructureRecognitionInstallRun } from "./StructureRecognitionController";
@@ -45,13 +47,12 @@ export function escapeBelongsToAnotherDialog(event: Pick<KeyboardEvent, "target"
 
 /** Whether the official catalog says this plugin needs the host-managed recognition engine. The
  *  catalog entry is the only authority; nothing here keys on a particular plugin id. */
+function requiredEngine(pluginId: string | undefined) {
+  return OFFICIAL_PLUGIN_CATALOG.find(entry => entry.pluginId === pluginId)?.requiresEngine;
+}
+
 function requiresRecognitionEngine(pluginId: string | undefined): boolean {
-  return (
-    pluginId !== undefined &&
-    OFFICIAL_PLUGIN_CATALOG.some(
-      (entry) => entry.pluginId === pluginId && entry.requiresEngine === "structureRecognition"
-    )
-  );
+  return requiredEngine(pluginId) === "structureRecognition";
 }
 
 export interface PluginManagerDialogProps {
@@ -189,6 +190,7 @@ export function PluginManagerDialog({
 
   // Keep the checkboxes truthful even when a registration changes outside this dialog.
   useEffect(() => runtime.host.subscribe(refreshFromHost), [runtime]);
+  useEffect(() => runtime.naming.subscribe(refreshFromHost), [runtime]);
 
   // A row's button swaps label mid-operation (Install -> Downloading…, Install engine -> Cancel
   // install, Uninstall -> Removing…) by becoming disabled; keep the keyboard on this dialog instead
@@ -317,7 +319,10 @@ export function PluginManagerDialog({
 
   const engineInstalling =
     recognitionEngineInstall?.running === true || recognitionEngineStatus?.state === "installing";
-  const pendingNeedsEngine = requiresRecognitionEngine(pendingOfficialPluginId);
+  const pendingEngine = requiredEngine(pendingOfficialPluginId);
+  const pendingNeedsEngine = pendingEngine !== undefined;
+  const namingStatus = runtime.naming.getStatus();
+  const namingRun = runtime.naming.getInstallRun();
 
   const installPending = (): Promise<void> =>
     run({ kind: "installPackage" }, async () => {
@@ -333,13 +338,14 @@ export function PluginManagerDialog({
       // shows in the plugin's row; a failure leaves the plugin installed with an Install engine
       // button, because the plugin itself installed fine.
       if (
-        pendingNeedsEngine &&
+        pendingEngine === "structureRecognition" &&
         onInstallRecognitionEngine &&
         recognitionEngineStatus?.state !== "installed" &&
         recognitionEngineStatus?.state !== "unsupported"
       ) {
         void onInstallRecognitionEngine();
       }
+      if (pendingEngine === "structureNaming" && namingStatus?.state !== "installed" && namingStatus?.state !== "unsupported") void runtime.naming.installEngine();
     });
 
   const prepareOfficialInstall = (pluginId: string, pluginName: string): Promise<void> => {
@@ -353,7 +359,8 @@ export function PluginManagerDialog({
         setPendingOfficialPluginId(pluginId);
         setPending(prepared);
         // The review states the engine's size against the free space now, so read it fresh.
-        if (requiresRecognitionEngine(pluginId)) onRefreshRecognitionEngineStatus?.().catch(() => undefined);
+        if (requiredEngine(pluginId) === "structureRecognition") onRefreshRecognitionEngineStatus?.().catch(() => undefined);
+        if (requiredEngine(pluginId) === "structureNaming") void runtime.naming.refreshStatus().catch(() => undefined);
       })
       .catch((cause: unknown) => {
         setOfficialInstallErrors((current) => new Map(current).set(pluginId, messageOf(cause)));
@@ -567,6 +574,14 @@ export function PluginManagerDialog({
                       <p className="plugin-manager-update-status">Included with ChemDraft — updated with the app.</p>
                     ) : null}
                     {installed && updateResult ? <PluginUpdateStatus result={updateResult} /> : null}
+                    {installed && requiredEngine(manifest.id) === "structureNaming" ? (
+                      <RecognitionEngineRow naming status={namingStatus} run={namingRun}
+                        disabled={busy}
+                        onRefresh={async () => { await runtime.naming.refreshStatus(); }}
+                        onInstall={() => runtime.naming.installEngine()}
+                        onCancel={() => runtime.naming.cancelEngineInstall()}
+                        onUninstall={() => runtime.naming.uninstall()} />
+                    ) : null}
                     {installed && requiresRecognitionEngine(manifest.id) ? (
                       <RecognitionEngineRow
                         status={recognitionEngineStatus}
@@ -701,7 +716,7 @@ export function PluginManagerDialog({
         ) : pending ? (
           <PackageReview
             busy={busy}
-            engine={pendingNeedsEngine ? { status: recognitionEngineStatus } : undefined}
+            engine={pendingNeedsEngine ? { kind: pendingEngine, status: pendingEngine === "structureNaming" ? namingStatus : recognitionEngineStatus } : undefined}
             mode="install"
             subject={pending}
             onCancel={() => {
@@ -753,7 +768,10 @@ export function PluginManagerDialog({
   );
 }
 
+type EngineRowStatus = Omit<StructureRecognitionEngineStatus, "installed"> & { installed?: { diskBytes: number } };
+
 function RecognitionEngineRow({
+  naming = false,
   status,
   run,
   disabled,
@@ -762,8 +780,9 @@ function RecognitionEngineRow({
   onCancel,
   onUninstall
 }: {
-  status?: StructureRecognitionEngineStatus | null;
-  run?: StructureRecognitionInstallRun;
+  naming?: boolean;
+  status?: EngineRowStatus | null;
+  run?: Omit<StructureRecognitionInstallRun, "phaseStartedAt"> & { phaseStartedAt?: number };
   disabled: boolean;
   onRefresh?: () => Promise<void>;
   onInstall?: () => Promise<boolean>;
@@ -794,7 +813,11 @@ function RecognitionEngineRow({
   // A run this window did not start (or started before it was reopened) is still this install.
   // `status` is checked with `!= null` throughout: a status must never be null, but a null one must
   // degrade to "checking…" rather than take the whole window down in render.
-  const installing = run?.running === true || status?.state === "installing";
+  // A stopped run is the authoritative outcome for an install the runtime observed. In particular,
+  // the catalog path mounts this row only after it starts the engine, so its first status refresh can
+  // legitimately report `installing`; that response must not keep the progress timer alive after a
+  // later cancellation, failure, or success settles the run.
+  const installing = run ? run.running : status?.state === "installing";
   const installed = !installing && status?.state === "installed";
   // The one-time check of an engine already on disk after an app update. It is not an install: there
   // is nothing to cancel (cancelling it marked the engine broken and offered a 2.5 GB download), and it
@@ -829,26 +852,32 @@ function RecognitionEngineRow({
   const runError = !installing ? run?.error : undefined;
   // A followed check that did not pass already says why in the host's words; "could not be installed"
   // would misname it, since nothing was being installed.
+  const cancelled = runError?.code === "cancelled";
   const runErrorText =
     runError && status
       ? run?.engineCheck && runError.code === "failed"
         ? runError.message
-        : recognitionInstallErrorMessage(runError, status)
+        : cancelled
+          ? "Installation was cancelled."
+          : naming
+            ? `The naming engine could not be installed: ${runError.message}`
+            : recognitionInstallErrorMessage(runError, status)
       : undefined;
   // The host's plain reason, such as an engine from an older ChemDraft that no longer matches — unless
   // the run error above already says exactly that.
   const hostDetail = !installing && status?.state === "broken" ? status.detail?.trim() : undefined;
   const brokenDetail = hostDetail && hostDetail !== runError?.message ? hostDetail : undefined;
   return (
-    <div className="plugin-manager-engine" data-testid="molscribe-engine-row">
+    <div className="plugin-manager-engine" data-testid={naming ? "naming-engine-row" : "molscribe-engine-row"}>
       <p className="plugin-manager-update-status" data-testid="molscribe-engine-state">
-        {engineCheck ? "Checking the recognition engine…" : `Recognition engine: ${stateText}`}
+        {engineCheck ? "Checking the recognition engine…" : `${naming ? "Naming" : "Recognition"} engine: ${stateText}`}
       </p>
       {installing && !engineCheck ? (
         <RecognitionInstallProgress
           progress={run?.progress ?? status?.progress}
           startedAt={run?.startedAt}
           phaseStartedAt={run?.phaseStartedAt}
+          profile={naming ? NAMING_INSTALL_PROFILE : undefined}
         />
       ) : null}
       {brokenDetail ? (
@@ -857,21 +886,20 @@ function RecognitionEngineRow({
         </p>
       ) : null}
       {runErrorText ? (
-        <p className="plugin-manager-update-status is-error" data-testid="molscribe-engine-install-error" role="alert">
+        <p className={`plugin-manager-update-status${cancelled ? "" : " is-error"}`} data-testid="molscribe-engine-install-error" role={cancelled ? "status" : "alert"}>
           {runErrorText}
         </p>
       ) : null}
       {canInstall && status && onInstall ? (
         <p className="plugin-manager-update-status" data-testid="molscribe-engine-install-note">
-          Downloads about 2.5 GB and needs {formatDiskBytes(status.requiredDiskBytes)} free (
-          {formatDiskBytes(status.freeDiskBytes)} free now). It runs entirely on this computer.
+          Downloads about {naming ? "100 MB" : "2.5 GB"} and uses about {naming ? "0.3 GB" : "2.4 GB"} once installed. {installSpaceStatement(status.requiredDiskBytes, status.freeDiskBytes)} It runs entirely on this computer.
         </p>
       ) : null}
       <div className="plugin-manager-package-actions">
         {installing && !engineCheck && onCancel ? (
           <button
             className="plugin-manager-button"
-            data-action="cancel-recognition-engine-install"
+            data-action={naming ? "cancel-naming-engine-install" : "cancel-recognition-engine-install"}
             disabled={working}
             onClick={() => perform(onCancel, "The install could not be cancelled")}
             type="button"
@@ -882,7 +910,7 @@ function RecognitionEngineRow({
         {installed && onUninstall ? (
           <button
             className="plugin-manager-button"
-            data-action="remove-recognition-engine"
+            data-action={naming ? "remove-naming-engine" : "remove-recognition-engine"}
             disabled={disabled || working}
             onClick={() => perform(onUninstall, "The engine could not be removed")}
             type="button"
@@ -893,7 +921,7 @@ function RecognitionEngineRow({
         {canInstall && onInstall ? (
           <button
             className="plugin-manager-button"
-            data-action="install-recognition-engine"
+            data-action={naming ? "install-naming-engine" : "install-recognition-engine"}
             disabled={disabled || working || starting}
             onClick={() => startInstall(onInstall)}
             type="button"
@@ -953,7 +981,20 @@ function RecognitionScreenCapturesRow({ onShow }: { onShow: () => Promise<void> 
 }
 
 /** What installing an engine-requiring plugin also downloads, stated before the user confirms. */
-function RecognitionEngineDisclosure({ status }: { status?: StructureRecognitionEngineStatus | null }) {
+function NamingEngineDisclosure({ status }: { status?: EngineRowStatus }) {
+  return <div className="plugin-manager-engine-disclosure" data-testid="plugin-package-engine-disclosure">
+    {status?.state === "installed" ? <p>Its naming engine is already installed on this computer.</p> :
+      status?.state === "unsupported" ? <p role="alert">This computer cannot run the local naming engine. The plugin will install, but it cannot name structures here.</p> :
+      <><strong>Also installs the local naming engine.</strong>
+        <p>{NAMING_ENGINE_DISCLOSURE}</p>
+        <p>{status ? installSpaceStatement(status.requiredDiskBytes, status.freeDiskBytes) : "Free space: checking…"}</p>
+        {status && status.freeDiskBytes < status.requiredDiskBytes ? <p role="alert">There isn’t enough free space for the engine. Free up space, then use Install engine.</p> : null}
+      </>}
+    {status?.detail ? <p>{status.detail}</p> : null}
+  </div>;
+}
+
+function RecognitionEngineDisclosure({ status }: { status?: EngineRowStatus | null }) {
   if (status?.state === "installed") {
     return (
       <p className="plugin-manager-engine-disclosure" data-testid="plugin-package-engine-disclosure">
@@ -972,14 +1013,13 @@ function RecognitionEngineDisclosure({ status }: { status?: StructureRecognition
   const shortOfSpace = status != null && status.freeDiskBytes < status.requiredDiskBytes;
   return (
     <div className="plugin-manager-engine-disclosure" data-testid="plugin-package-engine-disclosure">
+      {/* Measured 2026-10-21 on macOS arm64: du of the installed ocsr-engine directory was 2.4 GB. */}
       <p>
         <strong>Also installs the local recognition engine:</strong> a private Python, PyTorch and the MolScribe
-        model — about 2.5 GB to download. It runs entirely on this computer; images never leave it.
+        model — downloads about 2.5 GB and uses about 2.4 GB once installed. It runs entirely on this computer; images
+        never leave it.
       </p>
-      <p>
-        Needs {formatDiskBytes(status?.requiredDiskBytes ?? 3e9)} free.{" "}
-        {status != null ? `Free now: ${formatDiskBytes(status.freeDiskBytes)}.` : "Free space: checking…"}
-      </p>
+      <p>{status != null ? installSpaceStatement(status.requiredDiskBytes, status.freeDiskBytes) : "Free space: checking…"}</p>
       {shortOfSpace ? (
         <p className="plugin-manager-unavailable" role="alert">
           There isn’t enough free space for the engine. The plugin will still install; free up space, then use
@@ -1008,7 +1048,7 @@ function PackageReview({
   busy: boolean;
   currentVersion?: string;
   /** Present when installing this plugin also installs the recognition engine. */
-  engine?: { status?: StructureRecognitionEngineStatus };
+  engine?: { kind?: "structureRecognition" | "structureNaming"; status?: EngineRowStatus };
   mode: "install" | "update";
   subject: Pick<PickedPluginPackage, "inspection" | "checksumVerified">;
   onCancel: () => void;
@@ -1043,7 +1083,7 @@ function PackageReview({
 
         <PermissionList permissions={manifest.permissions} />
 
-        {engine ? <RecognitionEngineDisclosure status={engine.status} /> : null}
+        {engine?.kind === "structureNaming" ? <NamingEngineDisclosure status={engine.status} /> : engine ? <RecognitionEngineDisclosure status={engine.status} /> : null}
 
         {unavailablePermissions.length > 0 ? (
           <p className="plugin-manager-unavailable" data-testid="plugin-package-unavailable" role="alert">

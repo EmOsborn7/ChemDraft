@@ -7,6 +7,7 @@ mod local_engine;
 #[cfg(target_os = "macos")]
 mod macos_quit;
 mod main_window_placement;
+mod naming_engine;
 mod ocsr_engine;
 mod opsin;
 mod panel_window;
@@ -264,6 +265,8 @@ impl<R: Runtime> QuitHost for tauri::AppHandle<R> {
     fn force_exit(&self, waited: Duration, reason: QuitReason) {
         eprintln!("{}", forced_exit_message(reason, waited));
         self.state::<ocsr_engine::OcsrEngineState>()
+            .kill_for_forced_exit();
+        self.state::<naming_engine::NamingEngineState>()
             .kill_for_forced_exit();
         // TerminateProcess, not std::process::exit: ExitProcess runs every DLL's detach, and
         // WebView2's spent about 3 s tearing down there (once raising a dialog), so a forced exit
@@ -606,8 +609,14 @@ const MENU_COMMAND_IDS: &[&str] = &[
 struct PluginMenuItemInput {
     id: String,
     label: String,
+    #[serde(default = "default_plugin_menu_location")]
+    location: String,
     #[serde(default = "default_menu_item_enabled")]
     enabled: bool,
+}
+
+fn default_plugin_menu_location() -> String {
+    "analyze".to_owned()
 }
 
 fn default_menu_item_enabled() -> bool {
@@ -870,6 +879,7 @@ pub fn run() {
         .manage(panel_window::PanelFocusState::default())
         .manage(Engine3dSidecarSessions::default())
         .manage(ocsr_engine::OcsrEngineState::default())
+        .manage(naming_engine::NamingEngineState::default())
         .manage(ToolsetWindowDirectory::default())
         .manage(PluginNativeMenuItems::default())
         .manage(ToolbarsMenuModel::default())
@@ -985,6 +995,9 @@ pub fn run() {
                         APP_QUITTING.store(true, Ordering::SeqCst);
                         dialog_windows::dismiss_owned(window.app_handle(), "quit");
                         window.state::<ocsr_engine::OcsrEngineState>().shutdown();
+                        window
+                            .state::<naming_engine::NamingEngineState>()
+                            .shutdown();
                     }
                     WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
                         // Frames changed by quit teardown are not the user's; skip like palettes do.
@@ -1154,6 +1167,9 @@ pub fn run() {
             let ocsr = app.state::<ocsr_engine::OcsrEngineState>();
             ocsr.start_idle_reaper();
             ocsr.remove_stale_staging(app);
+            let naming = app.state::<naming_engine::NamingEngineState>();
+            naming.start_idle_reaper();
+            naming.remove_stale_staging(app);
             // The Toolbars menu starts empty and is filled by JS (set_toolbars_menu) once the main
             // window loads; Rust no longer parses the manifest or applies customization for it.
             // Activation policy is a macOS Dock concept; other platforms have no equivalent.
@@ -1260,6 +1276,12 @@ pub fn run() {
             agent_bridge_status,
             opsin::opsin_status,
             opsin::opsin_name_to_structure,
+            naming_engine::naming_engine_status,
+            naming_engine::naming_engine_install,
+            naming_engine::naming_engine_cancel_install,
+            naming_engine::naming_engine_uninstall,
+            naming_engine::name_structure_raw,
+            naming_engine::naming_cancel,
             ocsr_engine::ocsr_engine_status,
             ocsr_engine::ocsr_engine_install,
             ocsr_engine::ocsr_engine_cancel_install,
@@ -1299,6 +1321,7 @@ pub fn run() {
                 } else {
                     APP_QUITTING.store(true, Ordering::SeqCst);
                     app.state::<ocsr_engine::OcsrEngineState>().shutdown();
+                    app.state::<naming_engine::NamingEngineState>().shutdown();
                 }
             }
             RunEvent::Exit => {
@@ -1307,6 +1330,7 @@ pub fn run() {
                 // AppKit quit still reach this final, non-blocking cleanup as before.
                 APP_QUITTING.store(true, Ordering::SeqCst);
                 app.state::<ocsr_engine::OcsrEngineState>().shutdown();
+                app.state::<naming_engine::NamingEngineState>().shutdown();
             }
             // Dock-icon click with no visible windows; a macOS-only event.
             #[cfg(target_os = "macos")]
@@ -5586,7 +5610,7 @@ impl Default for ViewMenuState {
     }
 }
 
-/// Sync the webview's plugin Analyze menu items into the native menu (ADR-0016): store them, then
+/// Sync the webview's plugin menu items into the native menu (ADR-0016): store them, then
 /// rebuild + reinstall the app menu so they appear natively. Clicks route back by the `plugin.`
 /// prefix through the existing native→webview command bridge.
 #[tauri::command]
@@ -5742,6 +5766,7 @@ fn build_analyze_submenu<R: Runtime>(
     let separator = PredefinedMenuItem::separator(app)?;
     let plugin_menu_items = plugin_items
         .iter()
+        .filter(|item| item.location == "analyze")
         .map(|item| {
             MenuItem::with_id(
                 app,
@@ -5798,6 +5823,51 @@ fn create_app_menu_for_toolsets<R: Runtime>(
     let native_app_menu = create_native_app_menu(app)?;
     let page_setup_menu = create_page_setup_menu(app)?;
     let view_menu = create_view_menu(app, entries, view_state)?;
+    let structure_menu = Submenu::with_items(
+        app,
+        "Structure",
+        true,
+        &[
+            &MenuItem::with_id(
+                app,
+                "structure.cleanup2d",
+                "Clean up Structure 2D",
+                true,
+                Some("CmdOrCtrl+Shift+K"),
+            )?,
+            &MenuItem::with_id(
+                app,
+                "text.convertToAtomLabel",
+                "Convert Text to Atom Label",
+                true,
+                None::<&str>,
+            )?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
+                "structure.openInteractive3d",
+                "Interactive 3D Workspace...",
+                true,
+                None::<&str>,
+            )?,
+        ],
+    )?;
+    let structure_plugin_items = plugin_items
+        .iter()
+        .filter(|item| item.location == "structure")
+        .collect::<Vec<_>>();
+    if !structure_plugin_items.is_empty() {
+        structure_menu.append(&PredefinedMenuItem::separator(app)?)?;
+        for item in structure_plugin_items {
+            structure_menu.append(&MenuItem::with_id(
+                app,
+                item.id.as_str(),
+                item.label.as_str(),
+                item.enabled,
+                None::<&str>,
+            )?)?;
+        }
+    }
     let analyze_menu = build_analyze_submenu(app, plugin_items)?;
     let plugins_menu = Submenu::with_items(
         app,
@@ -5974,35 +6044,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                 ],
             )?,
             &view_menu,
-            &Submenu::with_items(
-                app,
-                "Structure",
-                true,
-                &[
-                    &MenuItem::with_id(
-                        app,
-                        "structure.cleanup2d",
-                        "Clean up Structure 2D",
-                        true,
-                        Some("CmdOrCtrl+Shift+K"),
-                    )?,
-                    &MenuItem::with_id(
-                        app,
-                        "text.convertToAtomLabel",
-                        "Convert Text to Atom Label",
-                        true,
-                        None::<&str>,
-                    )?,
-                    &PredefinedMenuItem::separator(app)?,
-                    &MenuItem::with_id(
-                        app,
-                        "structure.openInteractive3d",
-                        "Interactive 3D Workspace...",
-                        true,
-                        None::<&str>,
-                    )?,
-                ],
-            )?,
+            &structure_menu,
             &analyze_menu,
             &plugins_menu,
             &Submenu::with_items(
@@ -8167,6 +8209,7 @@ mod tests {
         send_sync::<QuitFlow>();
         send_sync::<tauri::AppHandle<tauri::Wry>>();
         send_sync::<ocsr_engine::OcsrEngineState>();
+        send_sync::<naming_engine::NamingEngineState>();
     }
 
     #[test]
