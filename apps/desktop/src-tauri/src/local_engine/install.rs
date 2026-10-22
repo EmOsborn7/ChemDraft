@@ -4,9 +4,10 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::network_error::{self, download_tls_policy, DownloadPlatform};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
@@ -144,6 +145,10 @@ pub trait InstallIo: Send + Sync {
 pub struct SystemInstallIo<S: EngineSpec> {
     spec: std::marker::PhantomData<S>,
     client: Option<reqwest::blocking::Client>,
+    // The blocking client executes redirects on its runtime thread. Serialize sends so its
+    // diagnostic observer cannot mix destinations from concurrent downloads on this client.
+    request_gate: Mutex<()>,
+    redirect_url: Arc<Mutex<Option<reqwest::Url>>>,
     pub(crate) running: Arc<RunningChild>,
 }
 
@@ -153,6 +158,8 @@ impl<S: EngineSpec> SystemInstallIo<S> {
         Self {
             spec: std::marker::PhantomData,
             client: None,
+            request_gate: Mutex::new(()),
+            redirect_url: Arc::default(),
             running,
         }
     }
@@ -170,17 +177,33 @@ impl<S: EngineSpec> SystemInstallIo<S> {
         // not to the whole transfer, so this is a stall timeout: a 1.1 GB model on a slow link
         // still completes, while a dead connection fails — and a cancel is noticed — within a
         // minute.
+        let policy = download_tls_policy(DownloadPlatform::current());
+        let redirect_url = Arc::new(Mutex::new(None));
+        let observed_url = Arc::clone(&redirect_url);
         let client = builder
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // Observe the proposed HTTP destination, delegating ALL redirect decisions to
+                // the default policy. Policy errors keep their own URL below. reqwest 0.12.28
+                // otherwise attaches the INITIAL URL to redirected transport errors.
+                if matches!(attempt.url().scheme(), "http" | "https") {
+                    *observed_url.lock().unwrap() = Some(attempt.url().clone());
+                }
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }))
+            .tls_built_in_webpki_certs(policy.webpki_roots)
+            .tls_built_in_native_certs(policy.native_roots)
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
             .user_agent(S::USER_AGENT)
             .build()
             .map_err(|error| {
-                InstallError::network(format!("Could not prepare downloads: {error}"))
+                InstallError::network(network_error::download_error_message(&error))
             })?;
         Ok(Self {
             spec: std::marker::PhantomData,
             client: Some(client),
+            request_gate: Mutex::new(()),
+            redirect_url,
             running: Arc::default(),
         })
     }
@@ -303,25 +326,51 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
         progress: &dyn ProgressReporter,
     ) -> Result<(), InstallError> {
         check_cancel::<S>(cancel)?;
+        let request_guard = self.request_gate.lock().unwrap();
+        *self.redirect_url.lock().unwrap() = None;
         let mut response = self
             .client
             .as_ref()
             .ok_or_else(|| InstallError::network("Downloads are disabled during engine recovery"))?
             .get(spec.url)
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| {
-                InstallError::network(format!("Could not download {}: {error}", spec.url))
+            .map_err(|mut error| {
+                // Prefer reqwest's URL, except its known initial-URL fallback after a followed
+                // redirect. Keep redirect-policy errors' own URLs and status errors unchanged.
+                if !error.is_redirect() && error.url().is_none_or(|url| url.as_str() == spec.url) {
+                    if let Some(url) = self.redirect_url.lock().unwrap().take() {
+                        error = error.with_url(url);
+                    }
+                }
+                let fallback_host = reqwest::Url::parse(spec.url).ok();
+                InstallError::network(network_error::log_failure(network_error::classify_error(
+                    &error,
+                    error
+                        .url()
+                        .and_then(|url| url.host_str())
+                        .or_else(|| fallback_host.as_ref().and_then(|url| url.host_str()))
+                        .unwrap_or("download server"),
+                )))
             })?;
+        *self.redirect_url.lock().unwrap() = None;
+        drop(request_guard);
+        response = response.error_for_status().map_err(|error| {
+            InstallError::network(network_error::download_error_message(&error))
+        })?;
         if let (Some(expected), Some(reported)) = (spec.size, response.content_length()) {
             if expected != reported {
                 return Err(InstallError::checksum(format!(
                     "{} reported {reported} bytes; expected {expected}.",
-                    spec.url
+                    network_error::redact_url(spec.url)
                 )));
             }
         }
         let total = spec.size.or_else(|| response.content_length());
+        let download_host = response
+            .url()
+            .host_str()
+            .unwrap_or("download server")
+            .to_owned();
         let ops = FileOps::new::<S>(Some(cancel)).with_running(self.running_child());
         let mut file = ops.create(destination).map_err(file_ops::failed::<S>)?;
         let mut digest = Sha256::new();
@@ -331,7 +380,10 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
         loop {
             check_cancel::<S>(cancel)?;
             let read = response.read(&mut buffer).map_err(|error| {
-                InstallError::network(format!("Download interrupted for {}: {error}", spec.url))
+                InstallError::network(network_error::log_failure(network_error::classify_error(
+                    &error,
+                    &download_host,
+                )))
             })?;
             if read == 0 {
                 break;
@@ -343,7 +395,7 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
             if spec.size.is_some_and(|expected| done > expected) {
                 return Err(InstallError::checksum(format!(
                     "{} sent more than the pinned {} bytes.",
-                    spec.url,
+                    network_error::redact_url(spec.url),
                     spec.size.unwrap_or_default()
                 )));
             }
@@ -357,7 +409,10 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
             .map_err(file_ops::failed::<S>)?;
         let actual = format!("{:x}", digest.finalize());
         pins::verify_digest(done, &actual, spec.size, spec.sha256).map_err(|detail| {
-            InstallError::checksum(format!("Verification failed for {}: {detail}.", spec.url))
+            InstallError::checksum(format!(
+                "Verification failed for {}: {detail}.",
+                network_error::redact_url(spec.url)
+            ))
         })?;
         Ok(())
     }
