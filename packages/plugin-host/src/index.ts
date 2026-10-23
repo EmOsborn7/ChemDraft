@@ -2,8 +2,9 @@
 // into this package's dist so no `@chemdraft/chem-core` dependency ships (ADR-0031). `ChemDraftDocument`,
 // however, is taken from `@chemdraft/plugin-api` so a consumer using both SDK packages sees ONE canonical
 // document type — not a second, structurally-identical copy inlined here.
-import type { ApplyPatchOptions } from "@chemdraft/chem-core";
+import type { ApplyPatchOptions, DocumentPatch } from "@chemdraft/chem-core";
 import { applyPatch } from "@chemdraft/chem-core";
+import { AssistantCapabilityPermissions, type PluginAssistantAPI } from "@chemdraft/plugin-api";
 import type { ChemDraftDocument } from "@chemdraft/plugin-api";
 import type {
   AppliedPatchReceipt,
@@ -109,6 +110,8 @@ export interface CommandDefinition {
 export interface CommandInvocationContext {
   pluginId?: string;
   permissions?: ReadonlySet<PluginPermission>;
+  /** Host-supplied selection captured at Send, instead of reading the live selection. */
+  writeSelection?: PluginSelectionSnapshot;
 }
 
 export type CommandHandler<Result = unknown> = (
@@ -264,12 +267,21 @@ export const PermissionsForbiddenToRecognizers = [
 ] as const satisfies readonly PluginPermission[];
 
 /**
- * The only patch ops `documents.applyPatch` accepts. The direct-write exception (API 0.1.4, AGENTS.md
- * §7) covers deterministic INSERTION of what the user supplied; changing or removing chemistry that is
- * already in the document is not insertion and must go through proposal review. Both ops refuse an id
- * that already exists, so neither can overwrite an object.
+ * Direct writes may insert, or change objects in the command's fixed write scope.
+ * Recognition remains proposal-only.
  */
-export const DirectWritePatchOps = ["addObject", "addAnnotation"] as const;
+export const DirectWritePatchOps = [
+  "addObject", "addAnnotation", "updateObject", "removeObject", "moveObject", "setObjectOrder"
+] as const;
+
+/** Flatten a validated flat batch for scope checks and touched-object tracking. */
+export function writePatchOps(patch: DocumentPatch): Exclude<DocumentPatch, { op: "batch" }>[] {
+  if (patch.op !== "batch") return [patch];
+  if (patch.patches.length < 1 || patch.patches.length > 256 || patch.patches.some((op) => op.op === "batch")) {
+    throw new PluginHostError("A batch must contain 1..256 patches and no nested batch.");
+  }
+  return patch.patches as Exclude<DocumentPatch, { op: "batch" }>[];
+}
 
 /**
  * Review cut points on the engine's overall confidence score, used when the embedding host supplies no
@@ -310,7 +322,14 @@ export interface PluginHostExternalTools {
   cancelAllForPlugin(pluginId: string): void;
 }
 
+export type PluginHostAssistant = {
+  [K in keyof PluginAssistantAPI]: (
+    plugin: { id: string; name: string }, ...args: Parameters<PluginAssistantAPI[K]>
+  ) => ReturnType<PluginAssistantAPI[K]>;
+} & { closeAllForPlugin(pluginId: string): void };
+
 export interface PluginHostOptions {
+  assistant?: PluginHostAssistant;
   commandRegistry?: CommandRegistry;
   getActiveDocument?: () => ChemDraftDocument | undefined | Promise<ChemDraftDocument | undefined>;
   /**
@@ -388,6 +407,7 @@ export class PluginHost {
   private readonly showPanelReport?: PluginHostOptions["showPanelReport"];
   private readonly promptText?: PluginHostOptions["promptText"];
   private readonly externalTools?: PluginHostOptions["externalTools"];
+  private readonly assistant?: PluginHostAssistant;
   private readonly requestImage?: PluginHostOptions["requestImage"];
   private readonly recognizeStructure?: PluginHostOptions["recognizeStructure"];
   private readonly applyDocumentPatch?: PluginHostOptions["applyDocumentPatch"];
@@ -428,6 +448,7 @@ export class PluginHost {
     this.showPanelReport = options.showPanelReport;
     this.promptText = options.promptText;
     this.externalTools = options.externalTools;
+    this.assistant = options.assistant;
     this.requestImage = options.requestImage;
     this.recognizeStructure = options.recognizeStructure;
     this.applyDocumentPatch = options.applyDocumentPatch;
@@ -485,6 +506,7 @@ export class PluginHost {
     this.cancelOpenTextPrompt(pluginId);
     this.cancelOpenImageRequests(pluginId);
     this.externalTools?.cancelAllForPlugin(pluginId);
+    this.assistant?.closeAllForPlugin(pluginId);
     for (const command of plugin.manifest.contributes.commands) {
       this.commands.unregisterOwnedByPlugin(command.id, pluginId);
     }
@@ -493,7 +515,10 @@ export class PluginHost {
     this.notifySubscribers();
   }
 
-  async invokeCommand<Result = unknown>(commandId: string): Promise<Result> {
+  async invokeCommand<Result = unknown>(
+    commandId: string,
+    options: { writeSelection?: PluginSelectionSnapshot } = {}
+  ): Promise<Result> {
     const definition = this.commands.get(commandId);
     if (!definition) {
       throw new CommandRegistryError(`Command "${commandId}" is not registered.`);
@@ -506,7 +531,8 @@ export class PluginHost {
     const plugin = this.requireRegisteredPlugin(definition.pluginId);
     return await this.commands.invoke<Result>(commandId, {
       pluginId: definition.pluginId,
-      permissions: plugin.permissions
+      permissions: plugin.permissions,
+      writeSelection: options.writeSelection
     });
   }
 
@@ -578,6 +604,20 @@ export class PluginHost {
 
   createCommandContext(pluginId: string, invocationToken?: symbol): PluginCommandContext {
     const plugin = this.requireRegisteredPlugin(pluginId);
+    const assistantCall = <K extends keyof PluginAssistantAPI>(method: K, args: Parameters<PluginAssistantAPI[K]>): ReturnType<PluginAssistantAPI[K]> => {
+      for (const permission of AssistantCapabilityPermissions) this.requirePermission(pluginId, permission);
+      if (!this.assistant) throw new PluginHostError("This host provides no assistant tools.");
+      const fn = this.assistant[method] as unknown as (plugin: { id: string; name: string }, ...args: Parameters<PluginAssistantAPI[K]>) => ReturnType<PluginAssistantAPI[K]>;
+      return fn.call(this.assistant, { id: pluginId, name: plugin.manifest.name }, ...args);
+    };
+    const assistant: PluginAssistantAPI | undefined = AssistantCapabilityPermissions.every(p => this.hasPermission(pluginId, p)) ? {
+      listTools: async () => assistantCall("listTools", []),
+      callTool: async r => assistantCall("callTool", [r]),
+      beginRequest: async r => assistantCall("beginRequest", [r]),
+      endRequest: async r => assistantCall("endRequest", [r]),
+      createToolSession: async r => assistantCall("createToolSession", [r]),
+      closeToolSession: async r => assistantCall("closeToolSession", [r])
+    } : undefined;
     const storage = this.hasPermission(pluginId, "plugin.storage") ? this.getStorage(pluginId) : undefined;
     const selection: PluginSelectionAPI | undefined = this.hasPermission(pluginId, "selection.read")
       ? {
@@ -760,6 +800,7 @@ export class PluginHost {
       images,
       recognition,
       tools,
+      assistant,
       analysis,
       hasPermission: (permission) => this.hasPermission(pluginId, permission),
       requirePermission: (permission) => this.requirePermission(pluginId, permission)
@@ -838,24 +879,43 @@ export class PluginHost {
     return { snapshot, hostHeld };
   }
 
-  private async applyPatchForPlugin(
+  async applyPatchForPlugin(
     pluginId: string,
     invocationToken: symbol | undefined,
-    patch: ProposedDocumentPatch
+    patch: ProposedDocumentPatch,
+    /** Trusted embedding-host override, never exposed on the plugin context. */
+    requestScope?: { objectIds: readonly string[]; apply: NonNullable<PluginHostOptions["applyDocumentPatch"]> }
   ): Promise<AppliedPatchReceipt> {
     this.requirePermission(pluginId, "document.write");
-    const invocation = invocationToken ? this.activeCommandInvocations.get(invocationToken) : undefined;
+    const invocation = invocationToken ? this.activeCommandInvocations.get(invocationToken) :
+      requestScope ? [...this.activeCommandInvocations.values()].find(candidate => candidate.pluginId === pluginId) : undefined;
     if (!invocation || invocation.pluginId !== pluginId) {
       throw new PluginHostError(
         `Plugin "${pluginId}" may call documents.applyPatch only while one of its own commands is executing.`
       );
     }
     const parsedPatch = ProposedDocumentPatchSchema.parse(patch);
-    const op = (parsedPatch.patch as { op: string }).op;
-    if (!(DirectWritePatchOps as readonly string[]).includes(op)) {
-      throw new PluginHostError(
-        `Plugin "${pluginId}" passed a "${op}" patch to documents.applyPatch, which only inserts new content (${DirectWritePatchOps.join(", ")}); changing or removing what is already in the document must go through documents.proposePatch for review.`
-      );
+    const scope = new Set(requestScope?.objectIds ?? invocation.writeScope);
+    for (const op of writePatchOps(parsedPatch.patch)) {
+      if (!(DirectWritePatchOps as readonly string[]).includes(op.op)) {
+        throw new PluginHostError(`Plugin "${pluginId}" passed an unsupported "${op.op}" patch to documents.applyPatch.`);
+      }
+      if (op.op === "addObject" || op.op === "addAnnotation") {
+        // The desktop validates complete native objects. Validate the identity needed by this
+        // scope check first, so malformed plugin input cannot throw while dereferencing it.
+        const object = op.op === "addObject" ? op.object : op.annotation;
+        if (!object || typeof object !== "object" || Array.isArray(object) ||
+          typeof object.id !== "string" || !object.id.trim() ||
+          typeof op.pageId !== "string" || !op.pageId.trim()) {
+          throw new PluginHostError(`Invalid ${op.op} patch: provide a valid ${op.op === "addObject" ? "object" : "annotation"} and pageId.`);
+        }
+        scope.add(op.op === "addObject" ? op.object.id : op.annotation.id);
+      } else {
+        const ids = op.op === "setObjectOrder" ? op.objectIds : "objectId" in op ? [op.objectId] : [];
+        for (const id of ids) {
+          if (!scope.has(id)) throw new PluginHostError(`${id} was not selected when the command started`);
+        }
+      }
     }
     // Recognition is proposal-only (AGENTS.md §7/§8). Registration already refuses a recognizer that
     // declares `document.write` (`assertRecognizerPermissions`); these per-invocation checks stay as
@@ -870,20 +930,26 @@ export class PluginHost {
         `Plugin "${pluginId}" passed a recognition proposal to documents.applyPatch; recognized structures must be proposed for review with documents.proposePatch.`
       );
     }
-    if (!this.applyDocumentPatch) {
+    const apply = requestScope?.apply ?? this.applyDocumentPatch;
+    if (!apply) {
       throw new PluginHostError(`This host provides no document-write path for plugin "${pluginId}".`);
     }
-    if (this.getActiveDocumentKey && this.getActiveDocumentKey() !== invocation.documentKey) {
+    if (!requestScope && this.getActiveDocumentKey && this.getActiveDocumentKey() !== invocation.documentKey) {
       throw new PluginHostError("The document changed while the plugin was running; nothing was inserted.");
     }
     const plugin = this.requireRegisteredPlugin(pluginId).manifest;
-    const receipt = await this.applyDocumentPatch({
+    const receipt = await apply({
       plugin: { id: plugin.id, name: plugin.name, version: plugin.version },
       command: { id: invocation.commandId, title: invocation.commandTitle },
       patch: parsedPatch,
       undoLabel: `${plugin.name}: ${invocation.commandTitle}`
     });
-    return AppliedPatchReceiptSchema.parse(receipt);
+    const parsedReceipt = AppliedPatchReceiptSchema.parse(receipt);
+    // Only a successful write grows the scope; use actual ids returned by the host after rebasing.
+    // Assistant requests own their scope separately. Their Send-time selection must not widen the
+    // surrounding command's ordinary document-write grant or the next request's grant.
+    if (!requestScope) for (const id of parsedReceipt.objectIds) invocation.writeScope.add(id);
+    return parsedReceipt;
   }
 
   /**
@@ -985,7 +1051,7 @@ export class PluginHost {
             defaultShortcut: command.defaultShortcut,
             enabled: command.enabled && Boolean(handler)
           },
-          async () => {
+          async (invocationContext) => {
             if (!handler) {
               throw new CommandRegistryError(`Command "${command.id}" has no registered handler.`);
             }
@@ -995,11 +1061,21 @@ export class PluginHost {
             }
 
             const invocationToken = Symbol(command.id);
+            const documentKey = this.getActiveDocumentKey?.();
+            // Snapshot ids only: the plugin-visible selection provider may build molfiles and
+            // collect warnings, so it must run only when the plugin explicitly reads selection.
+            const document = invocationContext.writeSelection ? undefined : this.getActiveDocument?.();
+            const selectedIds = invocationContext.writeSelection
+              ? [...invocationContext.writeSelection.objectIds]
+              : document && "then" in document
+                ? [...((await document)?.selection.objectIds ?? [])]
+                : [...(document?.selection.objectIds ?? [])];
             this.activeCommandInvocations.set(invocationToken, {
               pluginId: manifest.id,
               commandId: command.id,
               commandTitle: command.title,
-              documentKey: this.getActiveDocumentKey?.(),
+              documentKey,
+              writeScope: new Set(selectedIds),
               recognized: false,
               recognizedImages: []
             });
@@ -1460,6 +1536,7 @@ export class PluginHost {
 }
 
 interface ActiveCommandInvocation {
+  writeScope: Set<string>;
   pluginId: string;
   commandId: string;
   commandTitle: string;

@@ -1,4 +1,6 @@
 import { useExportPreviewEnabled } from "./dialogs/useExportPreviewEnabled";
+import { assistantDocumentContentUnchanged, registerAssistantHistoryPort, type AssistantHistoryPort } from "./assistant/historyPort";
+import { getAssistantTransactions } from "./assistant/assistantTransaction";
 import { acquireNativeUtilitySuspension } from "./nativeUtilitySuspension";
 import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { nativePrompt, useNativePrompt } from "./nativePrompt";
@@ -61,6 +63,7 @@ import {
   CSS_PX_PER_INCH,
   DefaultNativeTextStyle,
   admitParsedDocument,
+  adoptDerivedDocument,
   applyPatches,
   toEngineDocument,
   createDocumentHistory,
@@ -763,6 +766,7 @@ import { PluginImageRequestDialog } from "./plugins/PluginImageRequestDialog";
 import { StructureRecognitionInstallDialog } from "./plugins/StructureRecognitionInstallDialog";
 import { RecognitionProgressIndicator } from "./plugins/RecognitionProgressIndicator";
 import { usePluginRuntime, pluginCommandFailure } from "./plugins/usePluginRuntime";
+import { isTauriHost } from "./plugins/pluginStagingFs";
 import { PluginPanelSurface } from "./plugins/PluginPanelSurface";
 import { PLUGIN_DIAGNOSTICS_COMMAND_ID } from "./plugins/pluginMenuModel";
 import { buildPluginSelectionSnapshot, computeObjectFingerprint } from "./plugins/selectionSnapshot";
@@ -1603,7 +1607,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.22.19.40-codex";
+const CURRENT_BUILD_STAMP = "10.22.21.30-codex";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -2128,6 +2132,7 @@ export function MainWindow({
     viewport: ViewportState;
     scrollLeft: number;
     scrollTop: number;
+    assistantViewportRect?: import("./assistant/AssistantToolContext").AssistantRect;
     parts: NativeMoleculeSelectionPart[];
     warnings?: OpenWarningsReport;
     status: string;
@@ -2988,7 +2993,23 @@ export function MainWindow({
     });
   }, []);
 
+  const assistantHistoryWritingRef = useRef(false);
+  const assistantHistoryMountedRef = useRef(true);
+  const assistantRecordedAfterRef = useRef(new WeakMap<ChemDraftDocument, ChemDraftDocument>());
+  const assistantUserEditListenersRef = useRef(new Set<(tabId: string) => void>());
   const installDocumentHistory = useCallback((history: DocumentHistory, switchingTabs = false) => {
+    const previous = documentHistoryRef.current;
+    if (!switchingTabs && !assistantHistoryWritingRef.current) {
+      const navigated = history.past !== previous.past || history.future !== previous.future;
+      const recorded = assistantRecordedAfterRef.current.get(previous.present);
+      if (navigated || ((recorded || assistantUserEditListenersRef.current.size > 0) &&
+        !assistantDocumentContentUnchanged(previous.present, history.present))) {
+        for (const listener of assistantUserEditListenersRef.current) listener(activeDocumentTabIdRef.current);
+      } else if (recorded) {
+        // Selection changes after completion must not rewrite the run's recorded redo selection.
+        assistantRecordedAfterRef.current.set(history.present, recorded);
+      }
+    }
     // Retained moves never install preview documents. Any install while one is active
     // replaces its source geometry, so disarm it before React updates the paint/chrome.
     const drag = objectDragRef.current;
@@ -3058,6 +3079,13 @@ export function MainWindow({
     if (label) documentUndoLabelsRef.current.set(clean, label);
     return clean;
   }, []);
+  // Ordinary edits and assistant history pushes/amendments share commit preparation.
+  const prepareDocumentCommit = useCallback((nextDocument: ChemDraftDocument, undoLabel?: string) => {
+    const present = normalizeCommittedDocument(nextDocument);
+    const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
+    if (label) documentUndoLabelsRef.current.set(present, label);
+    return present;
+  }, []);
   const commitDocumentChange = useCallback((
     nextDocumentOrUpdate: ChemDraftDocument | ((current: ChemDraftDocument) => ChemDraftDocument),
     undoLabel?: string
@@ -3071,11 +3099,7 @@ export function MainWindow({
       return false;
     }
 
-    const present = normalizeCommittedDocument(nextDocument);
-    const label = undoLabel ?? documentUndoLabelsRef.current.get(nextDocument);
-    if (label) {
-      documentUndoLabelsRef.current.set(present, label);
-    }
+    const present = prepareDocumentCommit(nextDocument, undoLabel);
     installDocumentHistory({
       past: boundedHistoryPast([...currentHistory.past, atomLabelHistorySnapshot(currentHistory.present)], present),
       present,
@@ -3087,7 +3111,106 @@ export function MainWindow({
       return nextFileState;
     });
     return true;
-  }, [atomLabelHistorySnapshot, installDocumentHistory]);
+  }, [atomLabelHistorySnapshot, installDocumentHistory, prepareDocumentCommit]);
+  const assistantHistoryPort = useMemo<AssistantHistoryPort>(() => {
+    const readHistory = (tabId: string): DocumentHistory | undefined => {
+      if (!assistantHistoryMountedRef.current || !documentTabsRef.current.some(tab => tab.id === tabId)) return undefined;
+      return tabId === activeDocumentTabIdRef.current
+        ? documentHistoryRef.current : documentTabSnapshotsRef.current.get(tabId)?.history;
+    };
+    const install = (tabId: string, history: DocumentHistory) => {
+      if (quitMutationFrozenRef.current) throw new Error("Quit is completing; the assistant edit was refused.");
+      if (!readHistory(tabId)) throw new Error("The assistant's document tab is closed; write refused.");
+      if (tabId === activeDocumentTabIdRef.current) {
+        assistantHistoryWritingRef.current = true;
+        try { installDocumentHistory(history); } finally { assistantHistoryWritingRef.current = false; }
+        fileStateRef.current = { ...fileStateRef.current, dirty: true };
+        setFileState(fileStateRef.current);
+        setSelectedNativeMoleculePart(undefined);
+      } else {
+        const snapshot = documentTabSnapshotsRef.current.get(tabId)!;
+        documentTabSnapshotsRef.current.set(tabId, { ...snapshot, history, parts: [], file: { ...snapshot.file, dirty: true } });
+      }
+    };
+    const requireHistory = (tabId: string): DocumentHistory => {
+      const history = readHistory(tabId);
+      if (!history) throw new Error("The assistant's document tab is closed; write refused.");
+      return history;
+    };
+    const labelled = (document: ChemDraftDocument, label: string) => {
+      const present = prepareDocumentCommit(document, label);
+      assistantRecordedAfterRef.current.set(present, present);
+      return present;
+    };
+    return {
+      read: tabId => readHistory(tabId)?.present,
+      runWrite: apply => {
+        if (quitInteractionRef.current) throw new Error("Quit is waiting for a choice; the assistant edit was refused.");
+        const gate = pluginWriteGateRef.current;
+        if (!gate) throw new Error("The document window is closing; the assistant edit was refused.");
+        return gate.run(() => {
+          if (quitInteractionRef.current) throw new Error("Quit is waiting for a choice; the assistant edit was refused.");
+          return apply();
+        });
+      },
+      getViewportRect: tabId => {
+        if (!readHistory(tabId)) return undefined;
+        if (tabId !== activeDocumentTabIdRef.current) return documentTabSnapshotsRef.current.get(tabId)?.assistantViewportRect;
+        const canvas = canvasRegionRef.current;
+        const page = pageRef.current;
+        if (!canvas || !page) return undefined;
+        const canvasRect = canvas.getBoundingClientRect();
+        const pageRect = page.getBoundingClientRect();
+        const inset = canvas.classList.contains("rulers-visible") ? RULER_THICKNESS : 0;
+        const scale = viewportRef.current.scale;
+        const left = Math.max(canvasRect.left + inset, pageRect.left);
+        const top = Math.max(canvasRect.top + inset, pageRect.top);
+        const right = Math.min(canvasRect.left + canvas.clientWidth, pageRect.right);
+        const bottom = Math.min(canvasRect.top + canvas.clientHeight, pageRect.bottom);
+        if (right <= left || bottom <= top || scale <= 0) return undefined;
+        return { x: (left - pageRect.left) / scale, y: (top - pageRect.top) / scale,
+          width: (right - left) / scale, height: (bottom - top) / scale };
+      },
+      push: (tabId, before, after, label) => {
+        const history = requireHistory(tabId);
+        const present = labelled(after, label);
+        const beforeLabel = documentUndoLabelsRef.current.get(history.present);
+        if (beforeLabel) documentUndoLabelsRef.current.set(before, beforeLabel);
+        const recorded = assistantRecordedAfterRef.current.get(history.present);
+        if (recorded) assistantRecordedAfterRef.current.set(before, recorded);
+        install(tabId, { past: boundedHistoryPast([...history.past, before], present), present, future: [] });
+      },
+      amend: (tabId, after, label) => {
+        const history = requireHistory(tabId);
+        install(tabId, { ...history, present: labelled(after, label) });
+      },
+      select: (tabId, objectIds, label) => {
+        const history = requireHistory(tabId);
+        const present = history.present;
+        const pageId = present.pages.find(page => page.objects.some(object => objectIds.includes(object.id)))?.id ?? present.selection.pageId;
+        install(tabId, { ...history, present: labelled(adoptDerivedDocument(present,
+          { ...present, selection: { pageId, objectIds: [...objectIds] } }), label) });
+      },
+      onUserEdit: listener => {
+        assistantUserEditListenersRef.current.add(listener);
+        return () => { assistantUserEditListenersRef.current.delete(listener); };
+      },
+      undo: (tabId, expected) => {
+        const history = readHistory(tabId);
+        if (!history || (history.present !== expected && assistantRecordedAfterRef.current.get(history.present) !== expected) ||
+          history.past.length === 0) return false;
+        for (const listener of assistantUserEditListenersRef.current) listener(tabId);
+        install(tabId, undoDocumentHistory({ ...history, present: expected }));
+        return true;
+      }
+    };
+  }, [installDocumentHistory, prepareDocumentCommit, setSelectedNativeMoleculePart]);
+  const assistantTransactions = useMemo(() => getAssistantTransactions(assistantHistoryPort), [assistantHistoryPort]);
+  useEffect(() => {
+    assistantHistoryMountedRef.current = true;
+    const unregister = registerAssistantHistoryPort(assistantHistoryPort);
+    return () => { assistantHistoryMountedRef.current = false; unregister(); };
+  }, [assistantHistoryPort]);
   /** Drag-session commits install their history entry directly so undo lands on the pre-drag
    *  document — `commitDocumentChange` would record the last preview frame instead. This is that
    *  shared install plus the unsaved-changes bookkeeping every document mutation owes. */
@@ -7923,7 +8046,9 @@ export function MainWindow({
       return;
     }
 
-    const currentHistory = { ...documentHistoryRef.current, present: atomLabelHistorySnapshot(documentHistoryRef.current.present) };
+    const recordedAfter = assistantRecordedAfterRef.current.get(documentHistoryRef.current.present);
+    const currentHistory = { ...documentHistoryRef.current,
+      present: direction === "undo" && recordedAfter ? recordedAfter : atomLabelHistorySnapshot(documentHistoryRef.current.present) };
     const nextHistory = direction === "undo"
       ? undoDocumentHistory(currentHistory)
       : redoDocumentHistory(currentHistory);
@@ -8082,10 +8207,11 @@ export function MainWindow({
     documentTabSnapshotsRef.current.set(activeDocumentTabIdRef.current, {
       history, file, viewport: viewportRef.current,
       scrollLeft: canvas?.scrollLeft ?? 0, scrollTop: canvas?.scrollTop ?? 0,
+      assistantViewportRect: assistantHistoryPort.getViewportRect?.(activeDocumentTabIdRef.current),
       parts: selectedNativeMoleculePartsRef.current,
       warnings: tabWarningsRef.current, status: statusRef.current, pageFit: tabPageFitRef.current
     });
-  }, []);
+  }, [assistantHistoryPort]);
 
   const installDocumentTab = useCallback((id: string) => {
     const snapshot = documentTabSnapshotsRef.current.get(id);
@@ -8360,6 +8486,7 @@ export function MainWindow({
     if (!snapshot) throw new Error("The originating drawing is unavailable.");
     const present = normalizeCommittedDocument(setDocumentCustomPageSize(snapshot.history.present, size));
     documentUndoLabelsRef.current.set(present, "Set Custom Page Size");
+    for (const listener of assistantUserEditListenersRef.current) listener(tabId);
     documentTabSnapshotsRef.current.set(tabId, { ...snapshot,
       history: { past: boundedHistoryPast([...snapshot.history.past, snapshot.history.present], present), present, future: [] },
       file: { ...snapshot.file, dirty: true },
@@ -8392,6 +8519,7 @@ export function MainWindow({
     if (result.document === source) return;
     const present = normalizeCommittedDocument(result.document);
     documentUndoLabelsRef.current.set(present, "Adjust arrangement spacing");
+    for (const listener of assistantUserEditListenersRef.current) listener(tabId);
     documentTabSnapshotsRef.current.set(tabId, { ...snapshot,
       history: { past: boundedHistoryPast([...snapshot.history.past, source], present), present, future: [] },
       file: { ...snapshot.file, dirty: true }, status: result.status });
@@ -10355,7 +10483,12 @@ export function MainWindow({
           throw new Error("The document changed while the plugin was running; nothing was inserted.");
         }
         const applied = applyPluginDocumentPatch(documentRef.current, patch);
-        commitDocumentChange(applied.document, undoLabel);
+        const assistantTxId = assistantTransactions.activeTransactionForPlugin(plugin.id, activeDocumentTabIdRef.current);
+        if (assistantTxId) {
+          assistantTransactions.writeAssistantTransaction(assistantTxId, applied.document, applied.receipt.objectIds);
+        } else if (assistantTransactions.activeTransactionForPlugin(plugin.id)) {
+          throw new Error("The assistant request belongs to another document tab; write refused.");
+        } else commitDocumentChange(applied.document, undoLabel);
         setSelectedNativeMoleculePart(undefined);
         const insertedObject = patch.patch.op === "addObject" ? patch.patch.object : undefined;
         const insertedDescription = insertedObject?.type === "molecule"
@@ -10378,6 +10511,7 @@ export function MainWindow({
   // Mirror the plugin runtime's Analyze menu items into the native macOS menu so they are invokable
   // from the OS menu bar, not only the in-window (web) bar (ADR-0016). No-op on the web build.
   useEffect(() => {
+    if (!isTauriHost()) return;
     void syncPluginNativeMenuItems(pluginRuntime.pluginMenuItems);
   }, [pluginRuntime.pluginMenuItems]);
 

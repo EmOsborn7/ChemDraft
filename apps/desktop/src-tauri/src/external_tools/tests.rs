@@ -209,9 +209,9 @@ fn run_templates_first_turn_and_resume() {
                     "--mcp-config",
                     "/runs/conversation/claude-mcp.json",
                     "--tools",
-                    "",
+                    "WebSearch,WebFetch",
                     "--allowedTools",
-                    "mcp__chemdraft__*",
+                    "mcp__chemdraft__*,WebSearch,WebFetch",
                     "--permission-mode",
                     "dontAsk",
                     "--permission-prompts",
@@ -251,6 +251,10 @@ fn run_templates_first_turn_and_resume() {
                     .iter()
                     .any(|arg| arg.starts_with("features.") || arg.starts_with("tools.")));
                 assert!(run.args.contains(&"approval_policy=\"never\"".into()));
+                assert!(run
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["-c", "web_search=\"live\""]));
                 assert!(run
                     .args
                     .contains(&"mcp_servers.chemdraft.required=true".into()));
@@ -494,6 +498,17 @@ fn pinned_codex_accepts_rendered_run() {
     input.system_prompt_file = &system_prompt;
     input.effort = Some(Effort::High);
     let mut rendered = render_run(&spec, input).unwrap();
+    assert!(rendered
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c", "web_search=\"live\""]));
+    let disabled: Vec<_> = rendered
+        .args
+        .windows(2)
+        .filter(|pair| pair[0] == "--disable")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert_eq!(disabled, CODEX_FEATURES_DISABLE);
     // An undefined provider exits before ignored-setting diagnostics are emitted. Instead use a
     // valid local provider whose required key is absent from the scrubbed environment: config
     // validation completes, then authentication fails before any model request. Disable the MCP
@@ -699,11 +714,6 @@ fn pinned_claude_accepts_rendered_run() {
             );
         }
     }
-    // Some installations reject unauthenticated print mode before emitting init.
-    if init.is_none() && diagnostics.to_ascii_lowercase().contains("not logged in") {
-        eprintln!("Skipping Claude init parity: pinned CLI reports not logged in; rerun with the user's subscription login available.");
-        return;
-    }
     let init = init.unwrap_or_else(|| {
         panic!("Claude did not emit system/init within 60 seconds: {diagnostics}")
     });
@@ -713,12 +723,23 @@ fn pinned_claude_accepts_rendered_run() {
 // Fail closed on unexpected init shapes as well as unexpected capabilities.
 fn assert_claude_init_is_restricted(init: &serde_json::Value) {
     let tools = init["tools"].as_array().expect("init must list tools");
+    for required in ["WebSearch", "WebFetch"] {
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool.as_str() == Some(required))
+                .count(),
+            1,
+            "Claude must expose {required} exactly once: {tools:?}"
+        );
+    }
     for tool in tools {
         let name = tool.as_str().expect("tool name must be a string");
         // CLI reference: https://code.claude.com/docs/en/cli-reference
-        // --tools "" removes EndConversation only when no MCP tools remain.
+        // The pinned CLI may retain EndConversation alongside explicitly enabled tools.
         assert!(
-            name.starts_with("mcp__chemdraft__") || name == "EndConversation",
+            name.starts_with("mcp__chemdraft__")
+                || matches!(name, "EndConversation" | "WebSearch" | "WebFetch"),
             "Unexpected Claude tool: {name}"
         );
     }
@@ -752,11 +773,31 @@ fn assert_claude_init_is_restricted(init: &serde_json::Value) {
 
 #[test]
 fn claude_init_restriction_assertions_reject_extra_capabilities() {
-    let init = serde_json::json!({"tools":["EndConversation", "mcp__chemdraft__draw"], "mcp_servers":[{"name":"chemdraft","status":"failed"}], "plugins":[], "slash_commands":[], "skills":[]});
+    let init = serde_json::json!({"tools":["WebSearch", "WebFetch", "EndConversation", "mcp__chemdraft__draw"], "mcp_servers":[{"name":"chemdraft","status":"failed"}], "plugins":[], "slash_commands":[], "skills":[]});
     assert_claude_init_is_restricted(&init);
     for (key, value) in [
-        ("tools", serde_json::json!(["Bash"])),
-        ("tools", serde_json::json!(["mcp__other__draw"])),
+        ("tools", serde_json::json!(["WebSearch"])),
+        ("tools", serde_json::json!(["WebFetch"])),
+        (
+            "tools",
+            serde_json::json!(["WebSearch", "WebFetch", "Bash"]),
+        ),
+        (
+            "tools",
+            serde_json::json!(["WebSearch", "WebFetch", "Read"]),
+        ),
+        (
+            "tools",
+            serde_json::json!(["WebSearch", "WebFetch", "Edit"]),
+        ),
+        (
+            "tools",
+            serde_json::json!(["WebSearch", "WebFetch", "WebFetch"]),
+        ),
+        (
+            "tools",
+            serde_json::json!(["WebSearch", "WebFetch", "mcp__other__draw"]),
+        ),
         ("mcp_servers", serde_json::json!([{"name":"other"}])),
         ("mcp_servers", serde_json::json!([])),
         ("plugins", serde_json::json!([{"name":"user-plugin"}])),
@@ -860,6 +901,38 @@ fn environment_is_an_allowlist_for_both_platforms() {
                     r"C:\Tools;D:\Windows\System32;D:\Windows;D:\Windows\System32\Wbem"
                 );
             }
+        }
+    }
+}
+#[test]
+fn windows_child_environment_always_has_system_directories() {
+    for (parent, root, windir) in [
+        (ParentEnv::new(), r"C:\Windows", r"C:\Windows"),
+        (
+            map(&[("SystemRoot", r"D:\Windows")]),
+            r"D:\Windows",
+            r"D:\Windows",
+        ),
+        (
+            map(&[("systemroot", r"D:\Windows"), ("WINDIR", r"E:\Windows")]),
+            r"D:\Windows",
+            r"E:\Windows",
+        ),
+    ] {
+        let child = env::child_env(
+            ProbePlatform::Windows,
+            &parent,
+            Path::new(r"C:\Tools\codex.exe"),
+            Path::new("run"),
+            false,
+        );
+        assert_eq!(child["SystemRoot"], root);
+        assert_eq!(child["windir"], windir);
+        for key in ["SystemRoot", "windir"] {
+            assert_eq!(
+                child.keys().filter(|k| k.eq_ignore_ascii_case(key)).count(),
+                1
+            );
         }
     }
 }
@@ -990,6 +1063,11 @@ fn stub() -> &'static Path {
 use std::{env,fs,io::{self,Read,Write},process::{Command,Stdio},thread,time::Duration};
 fn main() {
  let args:Vec<_>=env::args().collect();
+ if matches!(args.get(1).map(String::as_str), Some("-p" | "exec"))
+     && fs::read_to_string("system-prompt.md").is_ok_and(|s| s.starts_with("mcp-live")) {
+   mcp_live(&args);
+   return;
+ }
  match args.get(1).map(String::as_str).unwrap_or("") {
   "--version"=>{println!("2.1.296 (Claude Code)");},
   "codex-version"=>{println!("codex-cli 0.163.0");},
@@ -1018,6 +1096,43 @@ fn main() {
   "sleep"=>{thread::sleep(Duration::from_secs(30));},
   "flood"=>{for _ in 0..70_000 {print!("x");}println!();},
   _=>{},
+ }
+}
+
+fn json_string<'a>(text: &'a str, key: &str) -> &'a str {
+ text.split(&format!("\"{key}\":\"")).nth(1).unwrap().split('"').next().unwrap()
+}
+fn post(url: &str, token: &str, session: bool, body: &str) -> String {
+ let (host,path)=url.strip_prefix("http://").unwrap().split_once('/').unwrap();
+ let mut socket=std::net::TcpStream::connect(host).unwrap();
+ socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+ let session_header=if session {format!("Mcp-Session-Id: {}\r\n",path.strip_prefix("mcp/").unwrap())} else {String::new()};
+ let request=format!("POST /{path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{session_header}\r\n{body}",body.len());
+ socket.write_all(request.as_bytes()).unwrap();
+ let mut response=String::new();socket.read_to_string(&mut response).unwrap();
+ assert!(response.starts_with("HTTP/1.1 200"),"{response}");
+ response
+}
+fn mcp_live(args: &[String]) {
+ let (url,token)=if args[1]=="-p" {
+   assert!(env::var("CHEMDRAFT_MCP_TOKEN").is_err());
+   let index=args.iter().position(|a|a=="--mcp-config").unwrap();
+   let config=fs::read_to_string(&args[index+1]).unwrap();
+   assert_eq!(json_string(&config,"type"),"http");
+   (json_string(&config,"url").to_owned(),json_string(&config,"Authorization").strip_prefix("Bearer ").unwrap().to_owned())
+ } else {
+   assert!(args.iter().any(|a|a=="mcp_servers.chemdraft.bearer_token_env_var=\"CHEMDRAFT_MCP_TOKEN\""));
+   (args.iter().find_map(|a|a.strip_prefix("mcp_servers.chemdraft.url=")).unwrap().trim_matches('"').to_owned(),env::var("CHEMDRAFT_MCP_TOKEN").unwrap())
+ };
+ assert_eq!(token.len(),64);
+ assert!(args.iter().all(|a|!a.contains(&token)));
+ let initialized=post(&url,&token,false,"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}");
+ assert!(initialized.contains("\"serverInfo\""));
+ let listed=post(&url,&token,true,"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
+ assert!(listed.contains("\"tools\":[]"));
+ println!("mcp-live-ok");io::stdout().flush().unwrap();
+ if fs::read_to_string("system-prompt.md").unwrap()=="mcp-live-wait" {
+   while !std::path::Path::new("release").exists() { thread::sleep(Duration::from_millis(20)); }
  }
 }
 "#).unwrap();
@@ -1234,7 +1349,7 @@ fn capability_is_main_only_and_exactly_matches_registered_commands() {
 }
 
 #[test]
-fn command_run_refuses_mcp_and_missing_consent_before_probing_or_writing() {
+fn command_run_refuses_unknown_mcp_and_missing_consent_before_probing_or_writing() {
     let temp = TempDir::new();
     let state = ExternalToolsState::default();
     let mut req = request(ToolId::Claude, "converse_1");
@@ -1762,13 +1877,14 @@ fn run_request_accepts_absent_or_empty_mcp_session() {
     value.as_object_mut().unwrap().remove("mcpSessionId");
     let absent: ExternalToolRunRequest = serde_json::from_value(value.clone()).unwrap();
     absent.validate().unwrap();
-    validate_mcp_session(&absent).unwrap();
+    bind_mcp_session(&absent).unwrap();
     value["mcpSessionId"] = serde_json::json!("");
-    validate_mcp_session(&serde_json::from_value(value.clone()).unwrap()).unwrap();
+    bind_mcp_session(&serde_json::from_value(value.clone()).unwrap()).unwrap();
     value["mcpSessionId"] = serde_json::json!("session_123");
     assert_eq!(
-        validate_mcp_session(&serde_json::from_value(value).unwrap())
-            .unwrap_err()
+        bind_mcp_session(&serde_json::from_value(value).unwrap())
+            .err()
+            .unwrap()
             .code,
         RunErrorCode::InvalidArgs
     );
@@ -1894,4 +2010,322 @@ fn long_poll_caps_wait_and_shims_are_rejected_at_spawn() {
             .unwrap()
             .contains("Batch shims")
     );
+}
+
+#[test]
+fn only_a_bound_rust_token_may_enter_the_child_environment() {
+    let inherited = map(&[
+        ("CHEMDRAFT_MCP_TOKEN", "stolen"),
+        ("chemdraft_mcp_token", "also-stolen"),
+        ("CHEMDRAFT_AGENT_BRIDGE", "1"),
+        ("chemdraft_other", "forbidden"),
+        ("HOME", "home"),
+    ]);
+    for platform in [ProbePlatform::MacOS, ProbePlatform::Windows] {
+        let child = env::child_env(
+            platform,
+            &inherited,
+            Path::new("binary"),
+            Path::new("run"),
+            false,
+        );
+        for token in [None, Some("rust-only")] {
+            let child = env::with_mcp_token(child.clone(), token);
+            assert_eq!(child.get("CHEMDRAFT_MCP_TOKEN").map(String::as_str), token);
+            assert_eq!(
+                child
+                    .keys()
+                    .filter(|k| k.to_ascii_uppercase().starts_with("CHEMDRAFT_"))
+                    .count(),
+                usize::from(token.is_some())
+            );
+        }
+    }
+    // Even accidental inherited variants are scrubbed before the explicit token is inserted.
+    let bound = env::with_mcp_token(inherited, Some("rust-only"));
+    assert_eq!(bound["CHEMDRAFT_MCP_TOKEN"], "rust-only");
+    assert!(!bound.contains_key("chemdraft_mcp_token"));
+    assert!(!bound.contains_key("CHEMDRAFT_AGENT_BRIDGE"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_mcp_run_binding_ownership_credentials_and_cleanup() {
+    if current_platform().is_none() {
+        return;
+    }
+    use crate::assistant_mcp::{McpBridgeRequest, McpBridgeResponse};
+    let manager = session::manager();
+    let (sender, receiver) = std::sync::mpsc::channel::<McpBridgeRequest>();
+    let plugin = "org.chemdraft.test";
+    let opened = manager
+        .open(plugin.into(), "Test".into(), Arc::new(sender))
+        .unwrap();
+    let session_id = opened.session_id;
+    let (url, token) = session::session_credentials(&session_id).unwrap();
+    let answer_session = session_id.clone();
+    let responder = thread::spawn(move || {
+        while let Ok(request) = receiver.recv() {
+            if request.method == "cancel" {
+                continue;
+            }
+            assert_eq!(request.method, "tools/list");
+            // A cancelled child may disconnect before the bridge answer arrives.
+            let _ = session::manager().respond(
+                &answer_session,
+                &request.request_id,
+                McpBridgeResponse::Result {
+                    result: serde_json::json!({"tools":[]}),
+                },
+            );
+        }
+    });
+    let temp = TempDir::new();
+    let state = ExternalToolsState::default();
+    for tool in [ToolId::Claude, ToolId::Codex] {
+        cached_stub(&state, tool);
+        consent::ConsentStore::new(&temp.0)
+            .set(tool, plugin, true)
+            .unwrap();
+    }
+    let mut req = request(ToolId::Claude, "mcp_conversation");
+    req.mcp_session_id = session_id.clone();
+    req.system_prompt = "mcp-live".into();
+
+    // Reject cross-plugin use before any probing, consent lookup, or file writes.
+    let mut foreign = req.clone();
+    foreign.plugin_id = "org.chemdraft.other".into();
+    assert_eq!(
+        run_start_impl(&temp.0, &state, foreign, &ParentEnv::new())
+            .unwrap_err()
+            .code,
+        RunErrorCode::NotOwner
+    );
+    assert!(!temp.0.join("runs").exists());
+
+    // Deliberately omit SystemRoot: child_env must supply the Windows Winsock default.
+    // Both first and follow-up CLI processes must be able to initialize the same session.
+    for tool in [ToolId::Claude, ToolId::Codex, ToolId::Claude] {
+        req.tool = tool;
+        let started = run_start_impl(
+            &temp.0,
+            &state,
+            req.clone(),
+            &map(&[("CHEMDRAFT_MCP_TOKEN", "untrusted")]),
+        )
+        .unwrap();
+        let config_path = started.cwd.join("claude-mcp.json");
+        if tool == ToolId::Claude {
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+            assert_eq!(
+                config,
+                serde_json::json!({"mcpServers":{"chemdraft":{
+                    "type":"http", "url":url, "headers":{"Authorization":format!("Bearer {token}")}
+                }}})
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        // Assert the actual catalog inputs produce no bearer token in argv.
+        let mut input = inputs(None);
+        input.mcp_url = &url;
+        input.mcp_config_file = &config_path;
+        let rendered = render_run(&tool.spec(), input).unwrap();
+        assert!(rendered.args.iter().all(|a| !a.contains(&token)));
+        let run = state.run_by_id(&started.run_id).unwrap();
+        assert!(run.wait_finished(Duration::from_secs(10)));
+        let poll = run.poll(0, 5000, 0);
+        assert!(
+            matches!(poll.status, RunStatus::Exited { code: Some(0), .. }),
+            "{poll:?}"
+        );
+        assert!(
+            poll.lines.iter().any(|l| l.text == "mcp-live-ok"),
+            "{poll:?}"
+        );
+        assert!(poll.lines.iter().all(|l| !l.text.contains(&token)));
+        assert_eq!(
+            state.inner.lock().unwrap().runs[&started.run_id].mcp_session_id,
+            session_id
+        );
+        assert!(
+            !config_path.exists(),
+            "Run completion must remove MCP credentials"
+        );
+        // Completion releases the reservation and preserves the session.
+        drop(session::bind_session(&session_id, plugin, "after-exit").unwrap());
+        assert!(session::session_credentials(&session_id).is_some());
+    }
+    let cwd = conversation_dir(&temp.0, plugin, &req.conversation_id).unwrap();
+    conversation_clear_impl(
+        &temp.0,
+        &state,
+        req.tool,
+        plugin,
+        &req.conversation_id,
+        &ParentEnv::new(),
+    )
+    .unwrap();
+    assert!(!cwd.exists());
+    assert!(!cwd.join("claude-mcp.json").exists());
+    assert!(session::session_credentials(&session_id).is_some());
+
+    req.tool = ToolId::Claude;
+    req.system_prompt = "mcp-live-wait".into();
+    // Cancel, timeout, and shutdown all release the supervisor's binding.
+    for mode in ["cancel", "timeout", "shutdown"] {
+        req.timeout_ms = Some(if mode == "timeout" { 1000 } else { 10_000 });
+        let started = run_start_impl(&temp.0, &state, req.clone(), &ParentEnv::new()).unwrap();
+        let run = state.run_by_id(&started.run_id).unwrap();
+        // Bind is already reserved before the child makes any MCP request.
+        let mut second = req.clone();
+        second.tool = ToolId::Codex;
+        second.conversation_id = "mcp_second".into();
+        assert_eq!(
+            run_start_impl(&temp.0, &state, second, &ParentEnv::new())
+                .unwrap_err()
+                .code,
+            RunErrorCode::Busy
+        );
+        match mode {
+            "cancel" => run.cancel(KillReason::Cancelled),
+            "shutdown" => state.shutdown(),
+            _ => {}
+        }
+        assert!(run.wait_finished(Duration::from_secs(10)));
+        let expected = match mode {
+            "cancel" => KillReason::Cancelled,
+            "shutdown" => KillReason::AppExit,
+            _ => KillReason::Timeout,
+        };
+        assert_eq!(run.status(), RunStatus::Killed { reason: expected });
+        assert!(!started.cwd.join("claude-mcp.json").exists());
+        drop(session::bind_session(&session_id, plugin, "after-kill").unwrap());
+        if mode == "shutdown" {
+            assert!(!started.cwd.exists());
+            assert!(!started.cwd.join("claude-mcp.json").exists());
+        }
+    }
+    failed_run_preparation_and_spawn_release_mcp_binding();
+    manager.close(&session_id);
+    responder.join().unwrap();
+}
+
+fn failed_run_preparation_and_spawn_release_mcp_binding() {
+    let manager = session::manager();
+    let (sender, _receiver) = std::sync::mpsc::channel::<crate::assistant_mcp::McpBridgeRequest>();
+    let mut req = request(ToolId::Claude, "mcp_fail_conversation");
+    // Keep the failure cases separate from the live conversation's per-plugin state.
+    req.plugin_id = "org.chemdraft.failure".into();
+    let opened = manager
+        .open(req.plugin_id.clone(), "Test".into(), Arc::new(sender))
+        .unwrap();
+    req.mcp_session_id = opened.session_id;
+    let temp = TempDir::new();
+    let state = ExternalToolsState::default();
+    cached_stub(&state, req.tool);
+    consent::ConsentStore::new(&temp.0)
+        .set(req.tool, &req.plugin_id, true)
+        .unwrap();
+    let cwd = conversation_dir(&temp.0, &req.plugin_id, &req.conversation_id).unwrap();
+    for failure in ["missing executable", "render", "busy", "limit", "shutdown"] {
+        let state = ExternalToolsState::default();
+        cached_stub(&state, req.tool);
+        let mut failed_request = req.clone();
+        let mut active = None;
+        let expected = match failure {
+            "missing executable" => {
+                state
+                    .probes
+                    .get_or_probe(req.tool, true, || {
+                        Ok(probe::ProbeResult {
+                            path: temp.0.join("missing-binary"),
+                            version: "2.1.308".into(),
+                            auth: catalog::AuthStatus {
+                                signed_in: true,
+                                auth_method: None,
+                                detail: None,
+                            },
+                            probed_at: "2026-10-22T00:00:00Z".into(),
+                        })
+                    })
+                    .unwrap();
+                RunErrorCode::NotInstalled
+            }
+            "render" => {
+                // Request validation accepts this model, but template rendering refuses flags.
+                failed_request.model = Some("-invalid".into());
+                RunErrorCode::InvalidArgs
+            }
+            "busy" => {
+                let run = spawn(&["sleep"], None, &temp.0, Duration::from_secs(10));
+                state.inner.lock().unwrap().runs.insert(
+                    "active".into(),
+                    OwnedRun {
+                        tool: req.tool,
+                        plugin_id: req.plugin_id.clone(),
+                        conversation_id: "other_conversation".into(),
+                        mcp_session_id: String::new(),
+                        run: run.clone(),
+                    },
+                );
+                active = Some(run);
+                RunErrorCode::Busy
+            }
+            "limit" => {
+                for index in 0..8 {
+                    state.inner.lock().unwrap().conversations.insert(
+                        (req.plugin_id.clone(), format!("conversation_{index}")),
+                        temp.0.clone(),
+                    );
+                }
+                RunErrorCode::Limit
+            }
+            "shutdown" => {
+                state.inner.lock().unwrap().shutting_down = true;
+                RunErrorCode::Limit
+            }
+            _ => unreachable!(),
+        };
+        let error = run_start_impl(&temp.0, &state, failed_request, &ParentEnv::new()).unwrap_err();
+        assert_eq!(error.code, expected, "{failure}: {error:?}");
+        assert!(
+            !cwd.join("claude-mcp.json").exists(),
+            "{failure} leaked credentials"
+        );
+        drop(session::bind_session(&req.mcp_session_id, &req.plugin_id, "after-failure").unwrap());
+        if let Some(run) = active {
+            run.cancel(KillReason::Cancelled);
+            assert!(run.wait_finished(Duration::from_secs(5)));
+        }
+    }
+    fs::create_dir(cwd.join("claude-mcp.json")).unwrap();
+    assert_eq!(
+        run_start_impl(&temp.0, &state, req.clone(), &ParentEnv::new())
+            .unwrap_err()
+            .code,
+        RunErrorCode::SpawnFailed
+    );
+    drop(
+        session::bind_session(&req.mcp_session_id, &req.plugin_id, "after-prepare-failed").unwrap(),
+    );
+
+    let binding = bind_mcp_session(&req).unwrap();
+    let mut command = rendered(&[], None);
+    command.program = temp.0.join("missing-binary");
+    assert_eq!(
+        state
+            .start_bound(&temp.0, &req, command, &ParentEnv::new(), false, binding)
+            .unwrap_err()
+            .code,
+        RunErrorCode::SpawnFailed
+    );
+    drop(session::bind_session(&req.mcp_session_id, &req.plugin_id, "after-spawn-failed").unwrap());
+    manager.close(&req.mcp_session_id);
 }

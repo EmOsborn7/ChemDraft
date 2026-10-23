@@ -1,6 +1,6 @@
 //! Owned child lifetime, bounded output and cursor-based polling. Only the supervisor reaps PIDs.
 use super::{catalog::RenderedRun, env::ParentEnv};
-use crate::{local_engine::platform, WithoutConsoleWindow};
+use crate::{assistant_mcp::session::RunBinding, local_engine::platform, WithoutConsoleWindow};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -135,6 +135,16 @@ pub struct ToolRun {
     pub started_at: String,
     shared: Arc<Shared>,
 }
+// Keep credential-file lifetime within the bound run, including failed spawns.
+pub(super) struct RunConfigCleanup(pub(super) Option<PathBuf>);
+impl Drop for RunConfigCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 impl ToolRun {
     pub fn spawn(
         rendered: RenderedRun,
@@ -151,6 +161,27 @@ impl ToolRun {
         timeout: Duration,
         output_limit: Option<usize>,
     ) -> Result<Arc<Self>, String> {
+        Self::spawn_supervised(rendered, cwd, environment, timeout, output_limit, None)
+    }
+    pub(super) fn spawn_bound(
+        rendered: RenderedRun,
+        cwd: &Path,
+        environment: &ParentEnv,
+        timeout: Duration,
+        binding: Option<RunBinding>,
+    ) -> Result<Arc<Self>, String> {
+        Self::spawn_supervised(rendered, cwd, environment, timeout, None, binding)
+    }
+    fn spawn_supervised(
+        rendered: RenderedRun,
+        cwd: &Path,
+        environment: &ParentEnv,
+        timeout: Duration,
+        output_limit: Option<usize>,
+        binding: Option<RunBinding>,
+    ) -> Result<Arc<Self>, String> {
+        let config_cleanup =
+            RunConfigCleanup(binding.as_ref().map(|_| cwd.join("claude-mcp.json")));
         if rendered
             .program
             .extension()
@@ -324,9 +355,13 @@ impl ToolRun {
             };
             #[cfg(windows)]
             drop(job);
+            // The child (and its Windows Job Object) has exited; discard credentials now.
+            drop(config_cleanup);
             let _ = writer.join();
             let _ = stdout.join();
             let _ = stderr.join();
+            // Release before publishing completion, so the next turn can bind immediately.
+            drop(binding);
             let mut b = shared.buffer.lock().unwrap();
             // A cancel arriving just as the child exits still owns the terminal result.
             b.status = b

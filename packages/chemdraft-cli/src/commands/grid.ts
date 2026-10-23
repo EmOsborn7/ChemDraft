@@ -1,11 +1,10 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, extname } from "node:path";
 
-import { createEmptyDocument, DocumentTextStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { createEmptyDocument } from "@chemdraft/chem-core";
 import { exportDocumentToSvg } from "@chemdraft/export-engine";
 import {
-  insertNativeTextObject,
-  nativeTextObjectSizeForText
+  layoutGrid
 } from "@chemdraft/document-workflow-core";
 
 import { integerOption, numericOption, parseOptions, stringOption } from "../args";
@@ -201,37 +200,6 @@ async function prepareEntries(jobs: readonly GridJob[], labels: GridLabels, io: 
   return entries;
 }
 
-function translateMolecule(
-  molecule: MoleculeObject,
-  id: string,
-  dx: number,
-  dy: number
-): MoleculeObject {
-  return {
-    ...molecule,
-    id,
-    x: molecule.x + dx,
-    y: molecule.y + dy,
-    atoms: molecule.atoms.map((atom) => ({ ...atom, x: atom.x + dx, y: atom.y + dy }))
-  };
-}
-
-function appendMolecule(document: ChemDraftDocument, molecule: MoleculeObject): ChemDraftDocument {
-  return {
-    ...document,
-    pages: document.pages.map((page, index) => index === 0
-      ? { ...page, objects: [...page.objects, molecule] }
-      : page)
-  };
-}
-
-function automaticColumns(entries: readonly MeasuredEntry[], gutter: number): number {
-  const pageWidth = createEmptyDocument().pages[0]?.width;
-  if (!pageWidth) throw new Error("The grid document has no page.");
-  const cellWidth = Math.max(...entries.map((entry) => entry.width)) + gutter;
-  return Math.min(entries.length, Math.max(1, Math.floor((pageWidth - 48) / cellWidth)));
-}
-
 export interface RenderedGrid {
   svg: string;
   png: Uint8Array;
@@ -249,43 +217,21 @@ export async function renderGrid(
   io: CliIo = defaultCliIo
 ): Promise<RenderedGrid> {
   const entries = await prepareEntries(jobs, args.labels, io, args.style);
-  const textStyle = args.style === "document" ? DocumentTextStyle : {};
-  const columns = Math.min(entries.length, args.columns ?? automaticColumns(entries, args.gutter));
-  const rows = Math.ceil(entries.length / columns);
-  const moleculeWidth = Math.max(...entries.map((entry) => entry.width));
-  const moleculeHeight = Math.max(...entries.map((entry) => entry.height));
-  const labelGap = args.labels === "none" ? 0 : 8;
-  const labelHeight = args.labels === "none" ? 0 : Math.max(
-    ...entries.map((entry) => nativeTextObjectSizeForText(entry.label!, textStyle).height)
-  );
-  const cellWidth = (args.style === "document" ? Math.max(moleculeWidth,
-    ...entries.map((entry) => entry.label === null ? 0 : nativeTextObjectSizeForText(entry.label, textStyle).width)) : moleculeWidth) + args.gutter;
-  const cellHeight = moleculeHeight + labelGap + labelHeight + args.gutter;
-  const margin = 24;
-  let document = createEmptyDocument({ title: "ChemDraft grid" });
-  if (args.style === "document") document = { ...document, pages: document.pages.map((page) => ({
-    ...page, width: margin * 2 + columns * cellWidth, height: margin * 2 + rows * cellHeight,
-    layout: { ...page.layout, presetId: "custom", widthPx: margin * 2 + columns * cellWidth, heightPx: margin * 2 + rows * cellHeight }
-  })) };
+  const pageWidth = createEmptyDocument().pages[0]?.width;
+  if (!pageWidth) throw new Error("The grid document has no page.");
+  const layout = layoutGrid({
+    style: args.style,
+    entries: entries.map((entry) => ({ molecule: entry.built.molecule, bounds: entry.bounds, label: entry.label })),
+    columns: args.columns,
+    gutter: args.gutter,
+    anchor: { x: 24, y: 24 },
+    pageWidth,
+    labelGap: args.labels === "none" ? 0 : 8
+  });
+  const document = layout.document;
   const cells = entries.map((entry, index) => {
-    const column = index % columns;
-    const row = Math.floor(index / columns);
-    const cellX = margin + column * cellWidth;
-    const cellY = margin + row * cellHeight;
-    const visualX = cellX + (cellWidth - entry.width) / 2;
-    const visualY = cellY + (moleculeHeight - entry.height) / 2;
-    document = appendMolecule(document, translateMolecule(
-      entry.built.molecule,
-      `mol_grid_${String(index + 1).padStart(3, "0")}`,
-      visualX - entry.bounds.minX,
-      visualY - entry.bounds.minY
-    ));
-    if (entry.label !== null) {
-      const size = nativeTextObjectSizeForText(entry.label, textStyle);
-      const x = cellX + (cellWidth - size.width) / 2;
-      const y = cellY + moleculeHeight + labelGap;
-      document = insertNativeTextObject(document, { x, y }, entry.label, textStyle);
-    }
+    const column = index % layout.columns;
+    const row = Math.floor(index / layout.columns);
     return { name: entry.name, smiles: entry.smiles, label: entry.label, column, row };
   });
 
@@ -305,8 +251,8 @@ export async function renderGrid(
     png: svgToPng(cropped.svg, args.width, args.style, args.dpi),
     document,
     viewBox: cropped.viewBox,
-    columns,
-    rows,
+    columns: layout.columns,
+    rows: layout.rows,
     cells,
     warnings: [...entries.flatMap((entry) => entry.built.warnings), ...exported.warnings.map((warning) => warning.message)]
   };
