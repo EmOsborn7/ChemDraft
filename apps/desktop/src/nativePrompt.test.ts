@@ -5,8 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { nativePrompt, nativePromptButtons, setNativePromptProvider, useNativePrompt, type NativePromptOptions } from "./nativePrompt";
 import { save } from "./nativeFileDialog";
 
-const plugin = vi.hoisted(() => ({ native: true, message: vi.fn(), invoke: vi.fn(), save: vi.fn() }));
+const plugin = vi.hoisted(() => ({ native: true, owner: "main", message: vi.fn(), invoke: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => plugin.native, invoke: plugin.invoke }));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: plugin.owner }) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ message: plugin.message, save: plugin.save }));
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -18,9 +19,47 @@ const three: NativePromptOptions = {
     { id: "save", label: "Save" }
   ]
 };
-afterEach(() => { plugin.native = true; plugin.message.mockReset(); plugin.invoke.mockReset(); plugin.save.mockReset(); document.body.innerHTML = ""; vi.restoreAllMocks(); });
+afterEach(() => { plugin.native = true; plugin.owner = "main"; plugin.message.mockReset(); plugin.invoke.mockReset(); plugin.save.mockReset(); document.body.innerHTML = ""; vi.restoreAllMocks(); });
 
 describe("nativePrompt", () => {
+  const growth: NativePromptOptions = { title: "ChemDraft Assistant", kind: "info", owner: "document",
+    message: "Olympiadane needs a page 1960 × 900 pt. Enlarge the page to fit?",
+    choices: [{ id: "enlarge", label: "Enlarge Page" }, { id: "decline", label: "Cancel", cancel: true }] };
+
+  it.each(["macos", "windows"] as const)("requires the document window as native message-box owner on %s", async platform => {
+    for (const [answer, expected] of [["Enlarge Page", "enlarge"], ["Cancel", "decline"]]) {
+      plugin.message.mockResolvedValue(answer);
+      expect(await nativePrompt(growth, undefined, undefined, undefined, platform)).toBe(expected);
+      expect(plugin.message).toHaveBeenLastCalledWith(growth.message, {
+        title: growth.title, kind: "info", buttons: { ok: "Enlarge Page", cancel: "Cancel" }
+      });
+    }
+    plugin.owner = "plugin-panel";
+    plugin.message.mockClear();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(await nativePrompt(growth, async () => "decline", undefined, undefined, platform)).toBe("decline");
+    expect(plugin.message).not.toHaveBeenCalled();
+  });
+
+  it.each(["macos", "windows"] as const)("rejects the obsolete platform-dependent three-button growth prompt on %s", platform => {
+    expect(() => nativePromptButtons({ ...growth, choices: [growth.choices[0]!,
+      // Regression: the obsolete special case silently admitted a third macOS button.
+      { id: "decline", label: "Don't enlarge", cancel: true }
+    ] } as NativePromptOptions, platform)).toThrow(/Cancel/);
+  });
+
+  it("ignores approval after cancellation while the native message box is open", async () => {
+    let answer!: (label: string) => void;
+    plugin.message.mockImplementation(() => new Promise<string>(resolve => { answer = resolve; }));
+    const stop = new AbortController();
+    const response = nativePrompt(growth, undefined, stop.signal);
+    await vi.waitFor(() => expect(plugin.message).toHaveBeenCalledOnce());
+    stop.abort();
+    expect(await response).toBe("decline");
+    answer("Enlarge Page");
+    await vi.waitFor(() => expect(plugin.invoke).toHaveBeenLastCalledWith("suspend_toolset_windows", { suspended: false }));
+  });
+
   it("reports opening only after invoking the native box, before its answer", async () => {
     const calls: string[] = [];
     let answer: (label: string) => void = () => {};
@@ -128,9 +167,9 @@ describe("nativePrompt", () => {
     });
     expect(await nativePrompt(three, undefined, controller.signal)).toBe("cancel");
     expect(plugin.message).not.toHaveBeenCalled();
-    expect(plugin.invoke.mock.calls).toEqual([
+    await vi.waitFor(() => expect(plugin.invoke.mock.calls).toEqual([
       ["suspend_toolset_windows", { suspended: true }], ["suspend_toolset_windows", { suspended: false }]
-    ]);
+    ]));
   });
 
   it("balances every overlapping native prompt independently", async () => {
