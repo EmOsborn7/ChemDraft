@@ -17,6 +17,7 @@ mod network_test_http;
 mod ocsr_engine;
 mod opsin;
 mod panel_window;
+mod perf_log;
 mod plugin_package;
 #[cfg(test)]
 mod plugin_panel_acl_tests;
@@ -864,6 +865,8 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let perf_enabled = agent_bridge_status().enabled;
+    let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
 
     // Registered first, as the plugin requires. A second launch forwards its argv here (a document
@@ -895,7 +898,24 @@ pub fn run() {
         }
     }));
 
+    let builder = if perf_enabled {
+        builder.plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("perf-probe")
+                .on_window_ready(|window| {
+                    if let Some(state) = window.app_handle().try_state::<perf_log::PerfLog>() {
+                        state.window_created(window.label());
+                    }
+                })
+                .js_init_script(
+                    "Object.defineProperty(window, '__CHEMDRAFT_PERF_ALLOWED__', { value: true });",
+                )
+                .build(),
+        )
+    } else {
+        builder
+    };
     let builder = builder
+        .manage(perf_log)
         .manage(PendingOpenDocument::default())
         .manage(panel_window::PanelFocusState::default())
         .manage(Engine3dSidecarSessions::default())
@@ -1295,6 +1315,7 @@ pub fn run() {
             set_keybinding_scheme,
             plugin_storage_read,
             plugin_storage_write,
+            plugin_storage_delete,
             open_plugin_panel_window,
             plugin_panel_action_forward,
             plugin_panel_event_forward,
@@ -1327,6 +1348,10 @@ pub fn run() {
             toggle_preferences_window,
             window_logical_position,
             agent_bridge_status,
+            perf_log::perf_log_clock,
+            perf_log::perf_log_append,
+            perf_log::perf_log_complete,
+            perf_log::perf_log_window_state,
             opsin::opsin_status,
             opsin::opsin_name_to_structure,
             naming_engine::naming_engine_status,
@@ -2653,9 +2678,11 @@ fn set_menu_checked(
 
 /// Guards the storage path against traversal: plugin ids become directory names, so the
 /// charset is restricted and dot-leading names (".", "..", hidden dirs) are rejected.
+/// Windows strips trailing dots from paths, so those names cannot own separate storage either.
 fn is_valid_plugin_storage_id(plugin_id: &str) -> bool {
     !plugin_id.is_empty()
         && !plugin_id.starts_with('.')
+        && !plugin_id.ends_with('.')
         && plugin_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
@@ -2663,12 +2690,24 @@ fn is_valid_plugin_storage_id(plugin_id: &str) -> bool {
 
 #[cfg(test)]
 mod plugin_storage_id_tests {
-    use super::is_valid_plugin_storage_id;
+    use super::{
+        delete_plugin_storage, delete_plugin_storage_with_directory_cleanup,
+        is_valid_plugin_storage_id,
+    };
 
     #[test]
     fn accepts_reverse_domain_plugin_ids() {
         assert!(is_valid_plugin_storage_id("org.chemdraft.fixture"));
         assert!(is_valid_plugin_storage_id("mass-fragment_v2"));
+        assert!(is_valid_plugin_storage_id("Org.ChemDraft.Fixture"));
+        assert!(is_valid_plugin_storage_id("a..b_-"));
+    }
+
+    #[test]
+    fn rejects_windows_trailing_dot_aliases() {
+        for id in ["org.chemdraft.fixture.", "org.chemdraft.fixture..", "a."] {
+            assert!(!is_valid_plugin_storage_id(id));
+        }
     }
 
     #[test]
@@ -2679,6 +2718,85 @@ mod plugin_storage_id_tests {
         assert!(!is_valid_plugin_storage_id("a/b"));
         assert!(!is_valid_plugin_storage_id("a\\b"));
         assert!(!is_valid_plugin_storage_id("a b"));
+    }
+
+    #[test]
+    fn plugin_storage_delete_removes_only_storage_and_accepts_missing_files() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-plugin-storage-delete-{}",
+            std::process::id()
+        ));
+        let plugin_id = "org.chemdraft.fixture";
+        let directory = root.join("plugins").join(plugin_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("storage.json");
+        std::fs::write(&path, r#"{"setupDone":true}"#).unwrap();
+        delete_plugin_storage(&root, plugin_id).unwrap();
+        assert!(!path.exists());
+        assert!(!directory.exists());
+        delete_plugin_storage(&root, plugin_id).unwrap();
+
+        // Never recursively remove other plugin data while cleaning up an empty directory.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let other = directory.join("other.json");
+        std::fs::write(&other, "keep").unwrap();
+        delete_plugin_storage(&root, plugin_id).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+        delete_plugin_storage(&root, plugin_id).unwrap();
+
+        for invalid in ["", "..", ".hidden", "a/b", "a\\b", "org.chemdraft.fixture."] {
+            assert!(delete_plugin_storage(&root, invalid)
+                .unwrap_err()
+                .contains("Invalid plugin id"));
+        }
+        assert!(other.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plugin_storage_delete_succeeds_when_directory_cleanup_is_denied() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-plugin-storage-directory-denied-{}",
+            std::process::id()
+        ));
+        let plugin_id = "org.chemdraft.fixture";
+        let directory = root.join("plugins").join(plugin_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("storage.json");
+        std::fs::write(&path, "{}").unwrap();
+        let result = delete_plugin_storage_with_directory_cleanup(&root, plugin_id, |dir| {
+            assert_eq!(dir, directory);
+            assert!(!path.exists());
+            // Portable simulation of a Windows sharing violation or a denied parent directory.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory locked",
+            ))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!path.exists());
+        assert!(directory.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plugin_storage_delete_reports_storage_file_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-plugin-storage-file-denied-{}",
+            std::process::id()
+        ));
+        let directory = root.join("plugins").join("org.chemdraft.fixture");
+        // remove_file must fail for a directory on both platforms, regardless of user permissions.
+        std::fs::create_dir_all(directory.join("storage.json")).unwrap();
+        let error =
+            delete_plugin_storage_with_directory_cleanup(&root, "org.chemdraft.fixture", |_| {
+                panic!("directory cleanup must not run when file deletion fails")
+            })
+            .unwrap_err();
+        assert!(error.contains("Could not delete plugin storage"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -2723,6 +2841,60 @@ fn plugin_storage_write(
     }
     let path = plugin_storage_path(&app, &plugin_id)?;
     write_file_atomic(&path, &contents)
+}
+
+fn delete_plugin_storage(app_data_dir: &Path, plugin_id: &str) -> Result<(), String> {
+    delete_plugin_storage_with_directory_cleanup(app_data_dir, plugin_id, |directory| {
+        std::fs::remove_dir(directory)
+    })
+}
+
+fn delete_plugin_storage_with_directory_cleanup(
+    app_data_dir: &Path,
+    plugin_id: &str,
+    remove_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if !is_valid_plugin_storage_id(plugin_id) {
+        return Err(format!("Invalid plugin id \"{plugin_id}\"."));
+    }
+    let directory = app_data_dir.join("plugins").join(plugin_id);
+    let path = directory.join("storage.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not delete plugin storage at {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    match remove_directory(&directory) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => eprintln!(
+            "Could not remove empty plugin storage directory {}: {error}",
+            directory.display()
+        ),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn plugin_storage_delete(app: tauri::AppHandle, plugin_id: String) -> Result<(), String> {
+    // Validate before even resolving the application data directory, like read and write.
+    if !is_valid_plugin_storage_id(&plugin_id) {
+        return Err(format!("Invalid plugin id \"{plugin_id}\"."));
+    }
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    delete_plugin_storage(&app_data_dir, &plugin_id)
 }
 
 #[derive(Clone, serde::Deserialize)]

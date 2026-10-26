@@ -5,6 +5,8 @@ file was consolidated (2026-10-04); `AGENTS.md` §14 still requires it. Run ever
 Windows** unless the item names one platform. `docs/windows-port-stress-test.md` records the Windows
 port's own hands-on pass.
 
+Speed runs on both platforms: follow the [timing probe protocol](architecture/perf-probe.md), including the bridge-off no-log check.
+
 Manual stress must cover tab initialization, user tab persistence, mixed states, multi-molecule
 scaling, sparse override precedence, terminal carbon labels, hidden implicit hydrogens, explicit
 hydrogens, fonts, save/reopen, undo/redo, Spin 3D, atom-label editor placement, SVG export, and ring
@@ -302,6 +304,8 @@ request: no Claude/Codex CLI process remains and the listener closes. Confirm we
 consent text must say that it does and that page content can leave the computer.
 
 ## Plugin panel input and canvas overlay (macOS and Windows)
+
+On both platforms, shrink the window to 405 px high, resize the canvas region, and move between display scales: Send stays reachable, the collapsed icon stays inside, and growing restores the remembered height; flick-drag the resize grip outside its bounds and cancel/interruption then hover (no stuck resize); double-click the header/grip (no text selection) and select text normally in the prompt and transcript.
 
 With an API 0.1.12 overlay-only plugin, use its Plugins menu command to expand and focus the
 prompt; repeat `open` without `focus: true` while drawing and verify focus stays on the drawing.
