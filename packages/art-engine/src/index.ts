@@ -153,7 +153,13 @@ export const arrowPathSamplePoints=(pathD:string):NativeArtPoint[]=>svgPathSampl
  * graphicPathEditPoints, rather than the Bezier control point. */
 export function quadraticArrowGeometry(object: GraphicObject, start: NativeArtPoint,
   end: NativeArtPoint, middle: NativeArtPoint): GraphicObject {
-  return updateQuadraticCurveObject({ ...object, rotation: 0 }, start, end, middle) ?? object;
+  const updated = updateQuadraticCurveObject({ ...object, rotation: 0 }, start, end, middle) ?? object;
+  // Attachment junctions must be exact even when the generic editor ignores a subpixel move.
+  // Keeping stale points here makes later normalization reinterpret rounding as an authored edit.
+  const data: GraphicObject["data"] = { ...updated.data, artPathKind: "quadratic",
+    lineStart: start, lineEnd: end, pathControlPoint: middle };
+  deleteSemanticArcData(data);
+  return { ...updated, rotation: 0, data };
 }
 export type NativeArtObstacle = NativeArtBounds | { outline: readonly NativeArtPoint[]; padding?: number };
 /** Actual rotated shafts and head clearance, shared by automatic condition-label placement. */
