@@ -1,9 +1,10 @@
 # Electron-mark verification
 
-Branch: `codex/reposition-electron-marks`, based directly on upstream main `20112a1`.
+Branch: `codex/reposition-electron-marks`. The feature started directly on upstream main
+`20112a1`; latest upstream main `ecb104e` was subsequently merged at the owner’s request.
 Verification: 2026-10-25–26. No unrelated PR branches were included.
 
-## Automated results
+## Automated results before the main update
 
 - `pnpm vitest run --maxWorkers=1 --minWorkers=1`: 435 files passed, seven files skipped;
   8,944 tests passed, 34 skipped. Three raster tests in `packages/export-engine/src/pdf.test.ts`
@@ -31,6 +32,18 @@ charge signs at large thickness. The corrected geometry keeps the pair separated
 single-charge radical-ion dots and signs inside the symbol frame. Inspected the corrected PNG.
 The rendering check uses the same layout/export implementation as the canvas.
 
+## Verification after merging main `ecb104e`
+
+- The merge preserved main's timing-probe startup function and set the build stamp to
+  `10.26.09.01-codex`. That was the only merge conflict.
+- Seventeen focused suites passed: 968 tests covering the canvas layers, Art toolbar,
+  eight-variant stress checks, app shell, agent bridge, drawing tools, layout engine,
+  plugin canvas overlay and the new performance-probe integration.
+- Root type checking and Rust formatting passed on the merged tree.
+- The entire repository suite was not repeated. Additional native test/build reruns were
+  not performed after this merge. The native build, clippy and Rust results below apply to
+  the feature before the main update; they are not a native sign-off of the merged tree.
+
 ## Native verification
 
 `CARGO_BUILD_JOBS=1 ./run-app` built and launched the packaged macOS app successfully.
@@ -49,5 +62,5 @@ The first unrestricted test run ended without a final result after the editor cr
 results were discarded. The replacement run used one worker. The cause of the VS Code crash
 was not established.
 
-Before merge, run the electron-mark items in `manual-stress-checklist.md` in the native
+Before merging this PR, run the electron-mark items in `manual-stress-checklist.md` in the native
 macOS and Windows apps and obtain green CI.
