@@ -1,5 +1,50 @@
 # Reaction arrows: thread handoff
 
+## Reconciliation checkpoint (2026-10-25)
+
+PR #202 now includes upstream main `5b0837d` and the actual standalone #201 head
+`831233e` as merge ancestors. No feature commits were rewritten. The old #201 commit
+remains in history, but its implementation is reconciled with the standalone branch:
+rotation and flip expand the attachment tree, while conditions, arrangement metadata,
+independent preferences and the combined spacing workflow are retained. Duplicate barrel
+imports/exports from the overlapping branch extraction were removed. Upstream plugin command
+input forwarding is retained alongside the independent arrow-preference guards.
+
+This is still an integration PR against upstream `main`, not a standalone conditions-only PR.
+#200 and #201 remain unmerged dependencies; merge those before #202 and review the remaining
+diff afterward (squash merges may require another branch update). The standalone offshoot
+handoff describes #201's own scope, not a prohibition on conditions in this integration branch.
+Source stamp: `10.25.19.00-codex`. The original development checkout's uncommitted work is untouched.
+
+Validation of code head `7086b53`:
+
+- Local root TypeScript, whitespace checks, Rust formatting and macOS Clippy with
+  `-D warnings` passed. The original TypeScript pass preceded the precision fix; CI's
+  Linux and Windows TypeScript checks passed on `7086b53`, including that fix and its test.
+- 62 geometry/attachment cases and 63 art-engine cases passed after the precision fix.
+  The unchanged adversarial tests retain their original exact-junction assertions.
+- All 16 arrangement DOM cases passed with a local diagnostic `--testTimeout=60000`.
+  All 135 graphic-path DOM and PDF cases also passed with that diagnostic timeout.
+  SVG (21), drawing tools (20) and agent bridge (6) passed with normal settings.
+  Repository and CI timeouts were not modified. Initial default-timeout attempts hit
+  timeouts and cascading DOM failures; those attempts are not claimed green.
+- The full Vitest attempt was stopped after hover-label stress timeouts and cascading
+  failures; no clean local full-suite pass is claimed.
+- CI run `40261554875` passed the build-stamp gate, Linux and Windows TypeScript,
+  and the complete macOS job (production web build, Rust fmt, Clippy and Rust tests).
+  Its Linux/Windows full-suite jobs were still running at handoff. These results are
+  for `7086b53`; the following commit changes this handoff document only.
+- Local Rust tests were stopped during dependency compilation. The development-launch
+  attempt, `CHEMDRAFT_DEV_PORT=5183 ./run-app --dev`, was stopped while waiting for the
+  Cargo lock, before the app launched; no native build-label or hands-on result is claimed.
+  The redundant local production web build and final TypeScript rerun were stopped after
+  CI passed those checks. `pnpm build` / a packaged native build was not completed.
+- Native macOS and Windows focus, pointer, monitor and attachment-transform checks remain
+  unverified. The slice stays in flight; the extreme attachment-depth limit is unchanged.
+
+Next task: let required CI finish, land #200 and #201, then review #202's remaining diff
+and run the shared native manual checklist on both platforms before merging it.
+
 ## Integration checkpoint (2026-10-24)
 
 The owner authorized publishing and merging all three feature commits into `jgassens/ChemDraft`
