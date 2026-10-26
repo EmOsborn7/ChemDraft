@@ -14700,7 +14700,7 @@ export function rotateDocumentObjectsAroundPoint(
     return document;
   }
   const page = firstPage(document);
-  const set = new Set(resolveGroupedDocumentObjectIds(page.objects, ids));
+  const set = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, ids)));
   const cascadedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches: DocumentPatch[] = [];
   for (const object of page.objects) {
@@ -14798,7 +14798,7 @@ export function flipDocumentObjectsAroundPoint(
   }
 
   const page = firstPage(document);
-  const set = new Set(resolveGroupedDocumentObjectIds(page.objects, ids));
+  const set = new Set(withArrowAttachmentIds(page.objects, resolveGroupedDocumentObjectIds(page.objects, ids)));
   const cascadedMarkIds = cascadeCarriedAnchoredMarkIds(page.objects, set);
   const patches: DocumentPatch[] = [];
   for (const object of page.objects) {

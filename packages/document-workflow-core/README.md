@@ -19,6 +19,7 @@ desktop importers did not change.
 | `documentInventory.ts` | Native atom/bond ids and page geometry, with rings from layout-engine |
 | `textObjects.ts` | Plain/formatted text sizing, creation and insertion; formatted sizing respects script sizes and authored line breaks |
 | `reactionArrows.ts` | Reaction arrow creation and insertion |
+| `reactionArrowAttachments.ts` | Editable half/full arrow offshoot creation and attachment reconciliation |
 | `reactionScheme.ts` | Pure placement of pre-depicted reaction components, plus signs, arrow, and conditions |
 | `gridLayout.ts` | Pure placement of pre-depicted molecules and optional labels in a grid |
 

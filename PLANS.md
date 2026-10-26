@@ -8,6 +8,13 @@ in progress rather than a changelog.
 
 # In flight
 
+## Reaction conditions integration reconciliation (PR #202)
+
+Integrate current upstream main (`5b0837d`) and standalone offshoot PR #201 (`831233e`),
+retaining arrangement PR #200 as an unmerged dependency. Resolve overlapping attachment
+code without discarding formatted conditions, independent preferences or arrangement routing.
+Validation and native platform checks remain in flight; see `docs/reaction-arrows-handoff.md`.
+
 # ChemDraft Assistant plugin (active, branches claude/assistant-*)
 
 ## Objective
