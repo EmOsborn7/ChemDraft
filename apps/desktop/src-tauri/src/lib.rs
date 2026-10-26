@@ -18,6 +18,8 @@ mod ocsr_engine;
 mod opsin;
 mod panel_window;
 mod plugin_package;
+#[cfg(test)]
+mod plugin_panel_acl_tests;
 mod problem_reports;
 mod screen_capture;
 mod utility_suspension;
@@ -630,6 +632,16 @@ fn default_plugin_menu_location() -> String {
 
 fn default_menu_item_enabled() -> bool {
     true
+}
+
+fn plugin_menu_items_in<'a>(
+    items: &'a [PluginMenuItemInput],
+    location: &str,
+) -> Vec<&'a PluginMenuItemInput> {
+    items
+        .iter()
+        .filter(|item| item.location == location)
+        .collect()
 }
 
 /// The plugin menu items last synced from the webview. Read by every menu rebuild so the items
@@ -1283,7 +1295,10 @@ pub fn run() {
             set_keybinding_scheme,
             plugin_storage_read,
             plugin_storage_write,
+            plugin_storage_delete,
             open_plugin_panel_window,
+            plugin_panel_action_forward,
+            plugin_panel_event_forward,
             register_plugin_panel_input_focus,
             set_plugin_panel_input_focus,
             open_toolset_popover,
@@ -2639,9 +2654,11 @@ fn set_menu_checked(
 
 /// Guards the storage path against traversal: plugin ids become directory names, so the
 /// charset is restricted and dot-leading names (".", "..", hidden dirs) are rejected.
+/// Windows strips trailing dots from paths, so those names cannot own separate storage either.
 fn is_valid_plugin_storage_id(plugin_id: &str) -> bool {
     !plugin_id.is_empty()
         && !plugin_id.starts_with('.')
+        && !plugin_id.ends_with('.')
         && plugin_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
@@ -2649,12 +2666,24 @@ fn is_valid_plugin_storage_id(plugin_id: &str) -> bool {
 
 #[cfg(test)]
 mod plugin_storage_id_tests {
-    use super::is_valid_plugin_storage_id;
+    use super::{
+        delete_plugin_storage, delete_plugin_storage_with_directory_cleanup,
+        is_valid_plugin_storage_id,
+    };
 
     #[test]
     fn accepts_reverse_domain_plugin_ids() {
         assert!(is_valid_plugin_storage_id("org.chemdraft.fixture"));
         assert!(is_valid_plugin_storage_id("mass-fragment_v2"));
+        assert!(is_valid_plugin_storage_id("Org.ChemDraft.Fixture"));
+        assert!(is_valid_plugin_storage_id("a..b_-"));
+    }
+
+    #[test]
+    fn rejects_windows_trailing_dot_aliases() {
+        for id in ["org.chemdraft.fixture.", "org.chemdraft.fixture..", "a."] {
+            assert!(!is_valid_plugin_storage_id(id));
+        }
     }
 
     #[test]
@@ -2665,6 +2694,85 @@ mod plugin_storage_id_tests {
         assert!(!is_valid_plugin_storage_id("a/b"));
         assert!(!is_valid_plugin_storage_id("a\\b"));
         assert!(!is_valid_plugin_storage_id("a b"));
+    }
+
+    #[test]
+    fn plugin_storage_delete_removes_only_storage_and_accepts_missing_files() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-plugin-storage-delete-{}",
+            std::process::id()
+        ));
+        let plugin_id = "org.chemdraft.fixture";
+        let directory = root.join("plugins").join(plugin_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("storage.json");
+        std::fs::write(&path, r#"{"setupDone":true}"#).unwrap();
+        delete_plugin_storage(&root, plugin_id).unwrap();
+        assert!(!path.exists());
+        assert!(!directory.exists());
+        delete_plugin_storage(&root, plugin_id).unwrap();
+
+        // Never recursively remove other plugin data while cleaning up an empty directory.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        let other = directory.join("other.json");
+        std::fs::write(&other, "keep").unwrap();
+        delete_plugin_storage(&root, plugin_id).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+        delete_plugin_storage(&root, plugin_id).unwrap();
+
+        for invalid in ["", "..", ".hidden", "a/b", "a\\b", "org.chemdraft.fixture."] {
+            assert!(delete_plugin_storage(&root, invalid)
+                .unwrap_err()
+                .contains("Invalid plugin id"));
+        }
+        assert!(other.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plugin_storage_delete_succeeds_when_directory_cleanup_is_denied() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-plugin-storage-directory-denied-{}",
+            std::process::id()
+        ));
+        let plugin_id = "org.chemdraft.fixture";
+        let directory = root.join("plugins").join(plugin_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("storage.json");
+        std::fs::write(&path, "{}").unwrap();
+        let result = delete_plugin_storage_with_directory_cleanup(&root, plugin_id, |dir| {
+            assert_eq!(dir, directory);
+            assert!(!path.exists());
+            // Portable simulation of a Windows sharing violation or a denied parent directory.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "directory locked",
+            ))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!path.exists());
+        assert!(directory.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plugin_storage_delete_reports_storage_file_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "chemdraft-plugin-storage-file-denied-{}",
+            std::process::id()
+        ));
+        let directory = root.join("plugins").join("org.chemdraft.fixture");
+        // remove_file must fail for a directory on both platforms, regardless of user permissions.
+        std::fs::create_dir_all(directory.join("storage.json")).unwrap();
+        let error =
+            delete_plugin_storage_with_directory_cleanup(&root, "org.chemdraft.fixture", |_| {
+                panic!("directory cleanup must not run when file deletion fails")
+            })
+            .unwrap_err();
+        assert!(error.contains("Could not delete plugin storage"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -2711,6 +2819,60 @@ fn plugin_storage_write(
     write_file_atomic(&path, &contents)
 }
 
+fn delete_plugin_storage(app_data_dir: &Path, plugin_id: &str) -> Result<(), String> {
+    delete_plugin_storage_with_directory_cleanup(app_data_dir, plugin_id, |directory| {
+        std::fs::remove_dir(directory)
+    })
+}
+
+fn delete_plugin_storage_with_directory_cleanup(
+    app_data_dir: &Path,
+    plugin_id: &str,
+    remove_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if !is_valid_plugin_storage_id(plugin_id) {
+        return Err(format!("Invalid plugin id \"{plugin_id}\"."));
+    }
+    let directory = app_data_dir.join("plugins").join(plugin_id);
+    let path = directory.join("storage.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Could not delete plugin storage at {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    match remove_directory(&directory) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => eprintln!(
+            "Could not remove empty plugin storage directory {}: {error}",
+            directory.display()
+        ),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn plugin_storage_delete(app: tauri::AppHandle, plugin_id: String) -> Result<(), String> {
+    // Validate before even resolving the application data directory, like read and write.
+    if !is_valid_plugin_storage_id(&plugin_id) {
+        return Err(format!("Invalid plugin id \"{plugin_id}\"."));
+    }
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    delete_plugin_storage(&app_data_dir, &plugin_id)
+}
+
 #[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenPluginPanelRequest {
@@ -2752,6 +2914,83 @@ fn plugin_panel_window_label(panel_id: &str) -> String {
 }
 
 const PLUGIN_PANEL_WINDOW_LABEL_PREFIX: &str = "plugin-panel-";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginPanelActionForwardRequest {
+    id: String,
+    request: serde_json::Value,
+}
+
+/// Only native IPC supplies `sourceLabel`; callers cannot nominate another panel's label.
+fn authenticated_plugin_panel_action(
+    label: &str,
+    request: PluginPanelActionForwardRequest,
+) -> Result<serde_json::Value, String> {
+    if !is_plugin_panel_window_label(label) {
+        return Err("Only a ChemDraft panel window may forward panel actions.".into());
+    }
+    Ok(serde_json::json!({
+        "id": request.id,
+        "request": request.request,
+        "sourceLabel": label,
+    }))
+}
+
+#[tauri::command]
+fn plugin_panel_action_forward(
+    window: tauri::WebviewWindow,
+    request: PluginPanelActionForwardRequest,
+) -> Result<(), String> {
+    let payload = authenticated_plugin_panel_action(window.label(), request)?;
+    window
+        .app_handle()
+        .emit_to(
+            MAIN_WINDOW_LABEL,
+            "chemdraft://plugin-panel-action",
+            payload,
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// Panel windows cannot emit arbitrary events (including forged authenticated actions).
+/// Preserve their existing non-command bridges through this fixed list only.
+fn validate_plugin_panel_event(
+    label: &str,
+    event: &str,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    if !is_plugin_panel_window_label(label) {
+        return Err("Only a ChemDraft panel window may forward panel events.".into());
+    }
+    match event {
+        "chemdraft://plugin-panel-request"
+        | "chemdraft://plugin-panel-rerun"
+        | "chemdraft://plugin-panel-closed" => {
+            let plugin_id = payload["pluginId"].as_str().ok_or("Missing panel owner.")?;
+            let panel_id = payload["panelId"].as_str().ok_or("Missing panel id.")?;
+            if plugin_panel_identity_window_label(plugin_id, panel_id) != label {
+                return Err("This event does not belong to its source panel.".into());
+            }
+            Ok(())
+        }
+        "chemdraft://analysis-window-action" => Ok(()),
+        _ => Err("This event cannot be forwarded by a panel window.".into()),
+    }
+}
+
+#[tauri::command]
+fn plugin_panel_event_forward(
+    window: tauri::WebviewWindow,
+    event: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    validate_plugin_panel_event(window.label(), &event, &payload)?;
+    window
+        .app_handle()
+        .emit_to(MAIN_WINDOW_LABEL, &event, payload)
+        .map_err(|error| error.to_string())
+}
 
 /// The IPC injects the calling window; it never accepts a caller-selected target label.
 fn validate_plugin_panel_focus_caller(label: &str) -> Result<(), String> {
@@ -2908,6 +3147,14 @@ fn cancel_plugin_panel_restore(
     if identity.plugin_id.is_empty() || identity.panel_id.is_empty() {
         return;
     }
+    let label = plugin_panel_identity_window_label(&identity.plugin_id, &identity.panel_id);
+    suspension
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .closed(&label);
+}
+
+fn plugin_panel_identity_window_label(plugin_id: &str, panel_id: &str) -> String {
     let hex = |value: &str| {
         value
             .as_bytes()
@@ -2915,15 +3162,7 @@ fn cancel_plugin_panel_restore(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     };
-    let label = plugin_panel_window_label(&format!(
-        "v1x{}x{}",
-        hex(&identity.plugin_id),
-        hex(&identity.panel_id)
-    ));
-    suspension
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .closed(&label);
+    plugin_panel_window_label(&format!("v1x{}x{}", hex(plugin_id), hex(panel_id)))
 }
 
 fn is_plugin_panel_window_label(label: &str) -> bool {
@@ -2951,6 +3190,67 @@ mod plugin_panel_label_tests {
         choose_analysis_window_position, is_plugin_panel_window_label, is_valid_plugin_storage_id,
         plugin_panel_window_label, OpenPluginPanelRequest, ScreenRect,
     };
+
+    #[test]
+    fn plugin_panel_action_forward_authenticates_the_injected_caller() {
+        use super::{authenticated_plugin_panel_action, PluginPanelActionForwardRequest};
+        let request = || PluginPanelActionForwardRequest {
+            id: "request-1".into(),
+            request: serde_json::json!({"panelId": "panel.b.chat", "sectionId": "message"}),
+        };
+        for label in ["main", "preferences", "toolset-core-main", "plugin-panel-"] {
+            assert!(authenticated_plugin_panel_action(label, request()).is_err());
+        }
+        let label = plugin_panel_window_label("v1x61x70616e656c");
+        let forwarded = authenticated_plugin_panel_action(&label, request()).unwrap();
+        assert_eq!(forwarded["sourceLabel"], label);
+        assert_eq!(forwarded["id"], "request-1");
+        assert_eq!(forwarded["request"]["panelId"], "panel.b.chat");
+        // Even a forged extra field is refused by the IPC argument schema.
+        assert!(
+            serde_json::from_value::<PluginPanelActionForwardRequest>(serde_json::json!({
+                "id": "forged", "request": {}, "sourceLabel": "plugin-panel-other"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_panel_event_forward_cannot_spoof_authenticated_actions() {
+        use super::validate_plugin_panel_event;
+        let label = plugin_panel_window_label("v1x61x62");
+        let payload = serde_json::json!({"pluginId": "a", "panelId": "b"});
+        for event in [
+            "chemdraft://plugin-panel-action",
+            "chemdraft://plugin-panel-action-result",
+            "menu-command",
+        ] {
+            assert!(validate_plugin_panel_event(&label, event, &payload).is_err());
+        }
+        for event in [
+            "chemdraft://plugin-panel-request",
+            "chemdraft://plugin-panel-rerun",
+            "chemdraft://plugin-panel-closed",
+            "chemdraft://analysis-window-action",
+        ] {
+            assert!(validate_plugin_panel_event(&label, event, &payload).is_ok());
+            assert!(validate_plugin_panel_event("main", event, &payload).is_err());
+        }
+        for event in [
+            "chemdraft://plugin-panel-request",
+            "chemdraft://plugin-panel-rerun",
+            "chemdraft://plugin-panel-closed",
+        ] {
+            assert!(validate_plugin_panel_event(
+                &label,
+                event,
+                &serde_json::json!({
+                    "pluginId": "other", "panelId": "b"
+                })
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn suspended_panel_opens_skip_builder_and_duplicates_build_once_after_last_resume() {
@@ -5862,9 +6162,8 @@ fn build_analyze_submenu<R: Runtime>(
     // Separates the core Analyze commands from the plugin-contributed items below them.
     let core_separator = PredefinedMenuItem::separator(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let plugin_menu_items = plugin_items
-        .iter()
-        .filter(|item| item.location == "analyze")
+    let plugin_menu_items = plugin_menu_items_in(plugin_items, "analyze")
+        .into_iter()
         .map(|item| {
             MenuItem::with_id(
                 app,
@@ -5950,10 +6249,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
             )?,
         ],
     )?;
-    let structure_plugin_items = plugin_items
-        .iter()
-        .filter(|item| item.location == "structure")
-        .collect::<Vec<_>>();
+    let structure_plugin_items = plugin_menu_items_in(plugin_items, "structure");
     if !structure_plugin_items.is_empty() {
         structure_menu.append(&PredefinedMenuItem::separator(app)?)?;
         for item in structure_plugin_items {
@@ -5979,6 +6275,19 @@ fn create_app_menu_for_toolsets<R: Runtime>(
             None::<&str>,
         )?],
     )?;
+    let plugins_plugin_items = plugin_menu_items_in(plugin_items, "plugins");
+    if !plugins_plugin_items.is_empty() {
+        plugins_menu.append(&PredefinedMenuItem::separator(app)?)?;
+        for item in plugins_plugin_items {
+            plugins_menu.append(&MenuItem::with_id(
+                app,
+                item.id.as_str(),
+                item.label.as_str(),
+                item.enabled,
+                None::<&str>,
+            )?)?;
+        }
+    }
 
     Menu::with_items(
         app,
@@ -8742,6 +9051,54 @@ mod tests {
             "plugin.molscribeOcsr.recognizeImage",
         ));
         expect_false(is_routed_menu_command("definitely.not.a.routed.command"));
+    }
+
+    #[test]
+    fn plugin_menu_items_in_filters_by_location_and_keeps_order() {
+        let items = vec![
+            PluginMenuItemInput {
+                id: "plugin.first".to_owned(),
+                label: "First".to_owned(),
+                location: "plugins".to_owned(),
+                enabled: true,
+            },
+            PluginMenuItemInput {
+                id: "plugin.analyze".to_owned(),
+                label: "Analyze".to_owned(),
+                location: "analyze".to_owned(),
+                enabled: true,
+            },
+            PluginMenuItemInput {
+                id: "plugin.second".to_owned(),
+                label: "Second".to_owned(),
+                location: "plugins".to_owned(),
+                enabled: false,
+            },
+        ];
+
+        let plugin_ids = plugin_menu_items_in(&items, "plugins")
+            .into_iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(plugin_ids, vec!["plugin.first", "plugin.second"]);
+        assert_eq!(plugin_menu_items_in(&items, "structure").len(), 0);
+    }
+
+    #[test]
+    fn plugin_menu_block_uses_location_helper() {
+        let source = include_str!("lib.rs");
+        let plugins_menu_block = source
+            .split("let plugins_menu =")
+            .nth(1)
+            .and_then(|section| section.split("Menu::with_items(").next())
+            .expect("Plugins menu block");
+
+        assert!(plugins_menu_block.contains("plugin_menu_items_in(plugin_items, \"plugins\")"));
+    }
+
+    #[test]
+    fn plugin_menu_command_is_routed() {
+        expect_true(is_routed_menu_command("plugin.assistant.open"));
     }
 
     #[test]
