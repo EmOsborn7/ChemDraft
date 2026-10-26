@@ -193,7 +193,7 @@ import {
   type ProposalDecisionOutcome
 } from "./plugins/panelBridge";
 import { resolvePluginPanelAction } from "./plugins/pluginPanelActions";
-import { PluginCanvasOverlay } from "./plugins/PluginCanvasOverlay";
+import { canvasOverlayDockSlots, PluginCanvasOverlay } from "./plugins/PluginCanvasOverlay";
 import { pluginPanelOpenCommand } from "./plugins/pluginPanelOpenCommand";
 import { canvasOverlayPrompt, OVERLAY_BUSY_MESSAGE, pluginCanvasOverlayOpenCommand } from "./plugins/pluginCanvasOverlayControls";
 import type { PluginPanelActionRequest, PluginPanelActionResult } from "./plugins/pluginPanelActionTypes";
@@ -1615,7 +1615,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
 const LASSO_POINT_SPACING_PX = 3;
 const OBJECT_RESIZE_MIN_SCALE = 0.12;
 const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
-const CURRENT_BUILD_STAMP = "10.25.18.33-codex";
+const CURRENT_BUILD_STAMP = "10.25.20.30-codex";
 /** Whether this page load already asked the native side for a crash note from the last run. */
 let pendingCrashNoteChecked = false;
 const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
@@ -20215,11 +20215,13 @@ export function MainWindow({
           </div>
         </section>
         <div ref={canvasOverlayLayerRef} className="plugin-canvas-overlay-layer">
-          {pluginRuntime.canvasOverlays.map(({ pluginId, overlay }) => {
+          {canvasOverlayDockSlots(pluginRuntime.canvasOverlays).map(({ pluginId, overlay, dockIndex, dockCount }) => {
             const manifest = pluginRuntime.plugins.find(plugin => plugin.id === pluginId);
             const panel = manifest?.contributes.panels[0];
             const openCommandId = manifest && pluginCanvasOverlayOpenCommand(manifest, overlay.id);
             return <PluginCanvasOverlay key={`${pluginId}:${overlay.id}`} overlay={overlay}
+              dockIndex={dockIndex}
+              dockCount={dockCount}
               shortcutPlatform={shortcutPlatform}
               viewportRef={canvasRegionRef}
               overlayLayerRef={canvasOverlayLayerRef}
