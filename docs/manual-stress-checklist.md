@@ -12,6 +12,30 @@ scaling, sparse override precedence, terminal carbon labels, hidden implicit hyd
 hydrogens, fonts, save/reopen, undo/redo, Spin 3D, atom-label editor placement, SVG export, and ring
 selection after tab switching/closing.
 
+Canvas context menus (macOS and Windows): open the page and object menus with the mouse and keyboard;
+use arrows, Home/End, Arrange and Copy As submenus, Enter, Space, Escape and Tab, then verify canvas
+focus and drawing shortcuts return after an action or dismissal.
+Text commit clicks (macOS and Windows): edit a text object with Bond or Select restored, then click empty canvas or an existing atom; that click commits only, preserves bonds and selection, and focuses SECTION.canvas-region for shortcuts; the next click works normally. Repeat Enter/Escape/Tab, toolbar actions, double-click editing, and IME composition (no mid-composition commit).
+With nothing focused, press Shift+F10: the app menu opens, never the browser menu, and mouse and keyboard input keep working.
+On Windows, right-click and press Shift+F10 in text fields (including textareas) in the document,
+dialogs, plugin panels, Preferences, and color popovers: no browser menu appears and real mouse,
+typing, and Tab input keep working. Ctrl+X/C/V/A still work in text fields. Repeat right-click on
+palettes, tooltips, and the 3D debugger; app menus and subsequent input must keep working.
+
+## Spin 3D (macOS and Windows)
+
+Paste `c1ccccc1.CC(C)(C)C.OCCO` as one native molecule object; with RDKit and the OCL fallback,
+check that all three fragments open apart in their drawn arrangement, stay spatially separate while
+rotating, and remain apart after flatten, save/reopen and Spin again; Copy As SMILES and formula
+must stay unchanged.
+
+## Plugin 3D chemistry (macOS and Windows)
+
+With a plugin that declares `chemistry.compute`, embed a two-component complex, arrange and minimize
+it with interfragment forces, then flatten and insert it. The components must not interpenetrate,
+flattening must retain stereochemistry, and one Undo must remove the insertion. Confirm Spin 3D is
+unchanged.
+
 Ring-fill labels: fill every ring of pyridinium, CBPQT4+ and 1,3,5-oxathiazinane with light blue
 (25%), solid blue and a vivid alternating palette (90%). Check N+, NH, O and S: each fill reaches
 every bond, without a missing box or white glyph outline. At shared-ring nitrogens each part of the
@@ -304,6 +328,8 @@ request: no Claude/Codex CLI process remains and the listener closes. Confirm we
 consent text must say that it does and that page content can leave the computer.
 
 ## Plugin panel input and canvas overlay (macOS and Windows)
+
+On both platforms with a real mouse and Japanese IME, compose in the text tool and in the assistant/plugin overlay prompt and commit with ONE Return. Click the empty page: the composed text stays committed after that one Return, and canvas keyboard shortcuts work. Repeat after launch and after closing a dialog with nothing focused.
 
 On both platforms, shrink the window to 405 px high, resize the canvas region, and move between display scales: Send stays reachable, the collapsed icon stays inside, and growing restores the remembered height; flick-drag the resize grip outside its bounds and cancel/interruption then hover (no stuck resize); double-click the header/grip (no text selection) and select text normally in the prompt and transcript.
 
@@ -703,6 +729,7 @@ with a preview/flyout open: it closes, controls disappear and direct commands re
 - Open a native message box and a file picker with Page Size open, including nested boxes. Verify
   it hides with the toolbars and returns in the preserved #140 stacking order, without changing
   remembered toolbar visibility or frames. Close the dialog during suspension: it must stay closed.
+- In a dialog, right-click and press Shift+F10 on non-editable content; no browser menu appears and mouse and Tab input still work. On an editable field, confirm its native menu remains available on macOS; Windows shows no browser menu and Ctrl+X/C/V/A still work.
 - Check first-field focus, invalid dimensions, valid Enter, IME composition Enter, Escape,
   title-bar close, Cmd/Ctrl+W, field-local Undo/Redo, and reload prevention. Test screen-reader labels.
 - With a dialog width/height field focused on macOS, use Cmd+A and Edit > Select All. Only that
