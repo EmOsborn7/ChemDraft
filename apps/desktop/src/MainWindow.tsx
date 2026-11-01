@@ -465,6 +465,7 @@ import {
   applyNativeWarningSuppressionToScope,
   nativeAtomSproutHotkeyTarget,
   applyNativeBondDisplayStyleTarget,
+  nativeBondDisplayStyleReverses,
   nativeRingHotkeyAttachAtAtomTarget,
   nativeRingHotkeyFuseAtBondTarget,
   applyNativeDoubleBondSideTarget,
@@ -484,7 +485,7 @@ import {
   analysisSubjectKey,
   validationFacingStructure,
   nativeMoleculeUnspellableLabels,
-  applyFreeformSingleBondToolAtPoint,
+  nativeFreeformSingleBondToolAtPoint,
   applyNativeTemplateToolAtTarget,
   applyNativeTemplateToolAtPoint,
   planNativeTemplatePlacement,
@@ -494,6 +495,7 @@ import {
   type NativeAtomSproutHotkeyResult,
   type NativeAtomSproutRefusal,
   applySingleBondToolAtPoint,
+  nativeSingleBondToolAtPoint,
   nativeSingleBondHotkeyAtAtomTarget,
   applyToolbarColorToSelection,
   applyGraphicObjectColorToSelection,
@@ -632,6 +634,7 @@ import {
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
   previewNativeMoleculeBondGrowth,
+  nativeBondDragSourceAtomId,
   previewNativeMoleculeFreeformBondGrowth,
   prepareGraphicPathForDirectEdit,
   recommendImportedPageFit,
@@ -1673,7 +1676,7 @@ function tableClipboardDecisionBeforePicture(payload: ClipboardReadPayload) {
   return tableClipboardPasteDecision(payload, html => new DOMParser().parseFromString(html, "text/html"));
 }
 
-const CURRENT_BUILD_STAMP = "11.01.12.00-codex";
+const CURRENT_BUILD_STAMP = "11.01.13.33-opus";
 const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 /** Starts in the background for the document webview under the existing probe gate. */
 export function startMainWindowPerfProbe(): void {
@@ -4421,22 +4424,25 @@ export function MainWindow({
     }
 
     const selectedDocument = selectDocumentObject(currentDocument, target.objectId);
+    const reverses = targetBond !== undefined && nativeBondDisplayStyleReverses(targetBond, bondStyle);
     const nextDocument = applyNativeBondDisplayStyleTarget(selectedDocument, target, bondStyle);
     if (nextDocument === selectedDocument) {
       setStatus(`Cannot set hovered bond to ${bondStyle}`);
       return;
     }
 
-    commitDocumentChange(nextDocument);
+    commitDocumentChange(nextDocument, reverses ? `Reverse ${nativeBondToolStatusLabel(bondStyle)}` : undefined);
     setActiveEditorObjectId(undefined);
     setActiveTextEditObjectId(undefined);
     setActiveAtomLabelEdit(undefined);
     setHoveredNativeAtom(undefined);
     assignHoveredNativeDeleteTarget(undefined);
     setFreeformNativeBond(undefined);
-    setStatus(bondStyle === "dashed"
-      ? "Set hovered bond to dashed (dative): no covalent valence on either atom"
-      : `Set hovered bond display to ${bondStyle}`);
+    setStatus(reverses
+      ? `Reversed hovered ${bondStyle} bond: its narrow end moved to the other atom`
+      : bondStyle === "dashed"
+        ? "Set hovered bond to dashed (dative): no covalent valence on either atom"
+        : `Set hovered bond display to ${bondStyle}`);
   }, [assignHoveredNativeDeleteTarget, commitDocumentChange, selectedNativeMoleculePart]);
 
   const setHoveredNativeAtomElement = useCallback((element: NativeHotkeyElement) => {
@@ -14207,7 +14213,13 @@ export function MainWindow({
     point: ClientPoint,
     bondStyle?: NativeBondDisplayStyle
   ) => {
-    const nextDocument = applySingleBondToolAtPoint(sourceDocument, point, { bondStyle });
+    const { document: nextDocument, refusal } = nativeSingleBondToolAtPoint(sourceDocument, point, { bondStyle });
+    if (refusal) {
+      setHoveredNativeAtom(undefined);
+      setFreeformNativeBond(undefined);
+      setStatus(`No room to add a bond here: ${nativeTemplateFallbackReasonText(refusal)}`);
+      return;
+    }
     const selected = getSelectedMolecule(nextDocument);
     const atomCount = selected?.atoms.length ?? 0;
     commitDocumentChange(nextDocument);
@@ -14357,9 +14369,10 @@ export function MainWindow({
       setStatus("Dashed (dative) display needs a single bond");
       return;
     }
+    const reverses = targetBond !== undefined && nativeBondDisplayStyleReverses(targetBond, bondStyle);
     const nextDocument = applyNativeBondDisplayStyleTarget(currentDocument, target, bondStyle);
     if (nextDocument !== currentDocument) {
-      commitDocumentChange(nextDocument);
+      commitDocumentChange(nextDocument, reverses ? `Reverse ${nativeBondToolStatusLabel(bondStyle)}` : undefined);
     }
     setActiveEditorObjectId(undefined);
     setActiveTextEditObjectId(undefined);
@@ -14369,7 +14382,9 @@ export function MainWindow({
     setNativeDoubleBondSidePreview(undefined);
     setStatus(nextDocument === currentDocument
       ? `${nativeBondToolStatusLabel(bondStyle)} already applied`
-      : bondStyle === "dashed"
+      : reverses
+        ? `Reversed ${nativeBondToolStatusLabel(bondStyle)}: its narrow end moved to the other atom`
+        : bondStyle === "dashed"
         ? "Set bond to dashed (dative): no covalent valence on either atom"
         : `Applied ${nativeBondToolStatusLabel(bondStyle)} style`);
   }, [commitDocumentChange]);
@@ -14398,7 +14413,7 @@ export function MainWindow({
     placementAltKey = false
   ) => {
     const previousMolecule = findDocumentObject(sourceDocument, objectId);
-    const nextDocument = applyFreeformSingleBondToolAtPoint(sourceDocument, objectId, atomId, point, {
+    const { document: nextDocument, refusal } = nativeFreeformSingleBondToolAtPoint(sourceDocument, objectId, atomId, point, {
       forceCustomLength,
       bondStyle,
       placementAltKey
@@ -14420,7 +14435,9 @@ export function MainWindow({
     setFreeformNativeBond(undefined);
     setStatus(
       nextDocument === sourceDocument
-        ? "Freeform bond not placed"
+        ? refusal === "sprout-page-edge"
+          ? "Freeform bond not placed: the page edge leaves no room in that direction"
+          : "Freeform bond not placed"
         : connectedExistingAtoms
           ? `Connected carbon atoms; molecule has ${atomCount} atoms`
           : `Placed freeform carbon bond; molecule has ${atomCount} atoms`
@@ -18384,7 +18401,10 @@ export function MainWindow({
 
       const page = document.pages[0];
       const preview = previewNativeMoleculeBondGrowth(object, point, page.width, page.height);
-      if (!preview) {
+      // A drag may start from any atom that can take a bond, even one the page edge boxes in for a
+      // click: Alt/Option can still aim it toward open room. The release decides click vs drag.
+      const dragAtomId = preview?.atomId ?? nativeBondDragSourceAtomId(object, point);
+      if (!dragAtomId) {
         applySingleBondDocumentAtPoint(selectDocumentObject(document, objectId), point, activeNativeBondDisplayStyle);
         return;
       }
@@ -18392,7 +18412,7 @@ export function MainWindow({
       nativeBondDragRef.current = {
         pointerId: event.pointerId,
         objectId,
-        atomId: preview.atomId,
+        atomId: dragAtomId,
         bondStyle: activeNativeBondDisplayStyle,
         startPoint: point,
         latestPoint: point,
@@ -18402,13 +18422,13 @@ export function MainWindow({
         altKey: event.altKey
       };
       captureGesturePointer(captureElement, event.pointerId);
-      setHoveredNativeAtom({
+      setHoveredNativeAtom(preview ? {
         objectId,
         atomId: preview.atomId,
         direction: preview.direction,
         candidateDirections: preview.candidateDirections,
         newAtomPoint: preview.newAtomPoint
-      });
+      } : undefined);
       setFreeformNativeBond(undefined);
       return;
     }
@@ -23199,6 +23219,8 @@ export function nativeTemplateFallbackReasonText(reason: NativeAtomSproutRefusal
   switch (reason) {
     case "sprout-no-free-direction":
       return "there is no free direction to grow into without overlapping";
+    case "sprout-page-edge":
+      return "the page edge blocks every direction";
     case "sprout-needs-two-valences":
       return "that atom needs two free valences for this sprout";
     case "methylidene-needs-neutral-carbon":
