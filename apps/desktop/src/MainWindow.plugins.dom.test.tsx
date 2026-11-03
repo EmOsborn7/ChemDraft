@@ -1,3 +1,4 @@
+import { structureFromSmilesForPlugin } from "./plugins/pluginChemistry";
 // @vitest-environment jsdom
 import { act } from "react";
 import { readFileSync } from "node:fs";
@@ -6,10 +7,10 @@ import { resolve } from "node:path";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AssistantCapabilityPermissions, PluginPanelReportSchema, type PluginCommandContext, type PluginAssistantToolResult } from "@chemdraft/plugin-api";
-import { applyPatch, createEmptyDocument, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
-import { createSmilesMolecule, pastedStructureDepictionFromMolfile } from "@chemdraft/document-workflow-core";
+import { applyPatch, createEmptyDocument, DocumentStylePreset, nativeDrawingStyleFromObjectStyle, type ChemDraftDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { applyMoleculeTargetBondLength, createSmilesMolecule, inspectHydrogenNormalizedIdentity, pastedStructureDepictionFromMolfile, resolveStructureTemplateName } from "@chemdraft/document-workflow-core";
 import { ensureRdkit, generateSmiles2DMolfile, setRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/conformer";
-import { applyChargeToolAtPoint } from "./documentWorkflow";
+import { applyChargeToolAtPoint, normalizeCommittedDocument } from "./documentWorkflow";
 import { getAssistantHistoryPort } from "./assistant/historyPort";
 import { buildMoveObjects, inspectMolecule } from "./assistant/writeBuilder";
 import { testContext } from "./assistant/tools/testContext";
@@ -21,6 +22,7 @@ import { MemoryStorage } from "./testSupport/memoryStorage";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 
 vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
+vi.mock("./plugins/rdkitAppLoader", () => ({ loadRdkitWithAppLoader: (load: () => Promise<unknown>) => load() }));
 // Keep the ruler's DOM hit surface; jsdom does not implement its canvas painting context.
 vi.mock("@scena/react-ruler", () => ({ default: () => <canvas /> }));
 const captured = vi.hoisted(() => ({ runtime: undefined as DesktopPluginRuntime | undefined,
@@ -72,7 +74,10 @@ describe("assistant writes through mounted desktop normalization", () => {
         if (!molecule) return { valid: false, reason: "Invalid structure" };
         try {
           const graph = JSON.parse((molecule as typeof molecule & { get_json(): string }).get_json());
-          return { valid: true, canonicalSmiles: molecule.get_smiles!(), formula: "test-only", warnings: [],
+          const identity = inspectHydrogenNormalizedIdentity(rdkit, value);
+          if (!identity.valid) return identity;
+          return { valid: true, canonicalSmiles: molecule.get_smiles!(),
+            identitySmiles: identity.canonicalSmiles, formula: "test-only", warnings: [],
             heavyAtoms: graph.molecules.reduce((n: number, mol: { atoms: { z?: number }[] }) =>
               n + mol.atoms.filter(atom => (atom.z ?? graph.defaults?.atom?.z ?? 6) !== 1).length, 0) };
         } finally { molecule.delete(); }
@@ -112,22 +117,100 @@ describe("assistant writes through mounted desktop normalization", () => {
     return result;
   }
 
+  it("pastes beta-CD SMILES with template status, selection and one undo", async () => {
+    const { port } = await mount(createEmptyDocument());
+    const template = resolveStructureTemplateName("beta-cyclodextrin")!;
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: { types: ["text/plain"],
+      getData: (type: string) => type === "text/plain" ? template.smiles : "" } });
+    await act(async () => {
+      window.dispatchEvent(event);
+      // Pasting now includes RDKit identity verification.
+      await vi.waitFor(() => expect(port.read("initial")!.pages[0]!.objects).toHaveLength(1), { timeout: 5000 });
+    });
+    const after = port.read("initial")!;
+    expect(after.selection.objectIds).toEqual([after.pages[0]!.objects[0]!.id]);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Used the β-Cyclodextrin template layout");
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")!.pages[0]!.objects).toHaveLength(0);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Undid Paste SMILES");
+  }, 60_000);
+
+  it("uses template layouts in a pasted SMILES list, with unique selected ids and one undo", async () => {
+    const { port } = await mount(createEmptyDocument());
+    const template = resolveStructureTemplateName("beta-cyclodextrin")!;
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: { types: ["text/plain"],
+      getData: (type: string) => type === "text/plain" ? `${template.smiles}\n${template.smiles}` : "" } });
+    await act(async () => {
+      window.dispatchEvent(event);
+      await vi.waitFor(() => expect(port.read("initial")!.pages[0]!.objects).toHaveLength(2), { timeout: 5000 });
+    });
+    const after = port.read("initial")!;
+    expect(new Set(after.selection.objectIds).size).toBe(2);
+    expect(after.pages[0]!.objects.every(object => object.style.source === `structure-template:${template.id}`)).toBe(true);
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Used the β-Cyclodextrin template layout");
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: "edit.undo" } })); });
+    expect(port.read("initial")!.pages[0]!.objects).toHaveLength(0);
+  }, 60_000);
+
+  it.each(["insert_structures", "edit_structure"])("%s uses beta-CD layout at default size in one selected undo entry with status", async name => {
+    const drawing = name === "insert_structures" ? createEmptyDocument() : testContext().context.getDocument()!;
+    const old = drawing.pages[0]!.objects.find(object => object.type === "molecule");
+    if (old) drawing.selection.objectIds = [old.id];
+    const { port, push, amend } = await mount(drawing);
+    chemistry.structureFromSmiles = request => structureFromSmilesForPlugin(request, () => port.read("initial"));
+    const template = resolveStructureTemplateName("beta-cyclodextrin")!;
+    const result = await call(name, name === "insert_structures"
+      ? { items: [{ kind: "molecule", smiles: template.smiles }] }
+      : { objectId: old!.id, smiles: template.smiles });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const after = port.read("initial")!;
+    const ids = result.structuredContent!.objectIds as string[];
+    const selectedIds = ids.filter(id => after.pages[0]!.objects.some(object => object.id === id));
+    expect(after.selection.objectIds).toEqual(selectedIds);
+    const molecule = after.pages[0]!.objects.find(object => selectedIds.includes(object.id))! as MoleculeObject;
+    expect(molecule.style.source).toBe(`structure-template:${template.id}`);
+    const atoms = new Map(molecule.atoms.map(atom => [atom.id, atom]));
+    const mean = molecule.bonds.reduce((sum, bond) => {
+      const a = atoms.get(bond.fromAtomId)!, b = atoms.get(bond.toAtomId)!;
+      return sum + Math.hypot(a.x - b.x, a.y - b.y);
+    }, 0) / molecule.bonds.length;
+    expect(Math.abs(mean - DocumentStylePreset.drawing.bondLengthPx)).toBeLessThan(1e-6);
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(amend).not.toHaveBeenCalled();
+    expect(container.querySelector("[role=status]")?.textContent).toContain("Used the β-Cyclodextrin template layout");
+  }, 60_000);
+
   it.each([
     { selectedMark: false, kind: "charge" }, { selectedMark: true, kind: "charge" },
     { selectedMark: false, kind: "lone-pair" }, { selectedMark: true, kind: "radical-dot" }
   ] as const)("refuses a relative move that would attach a $kind mark (selected: $selectedMark), without changing document or history", async ({ selectedMark, kind }) => {
     const fixture = testContext();
+    // Keep an existing 28px molecule: the 22px default's 25.3px association radius
+    // cannot bridge placement's 8px molecule padding + 12px gap + 9px mark half-width.
+    // Merely shrinking the offset makes placement move the atom at least 29px away.
+    fixture.replace(applyMoleculeTargetBondLength(fixture.context.getDocument()!, [fixture.molecule.id], 28));
     const input = { objectIds: [fixture.molecule.id], to: { relativeTo: fixture.text.id, side: "right" as const } };
     const drawing = fixture.context.getDocument()!;
     const planned = applyPatch(drawing, buildMoveObjects(fixture.context, input).patch);
     const moved = planned.pages[0]!.objects.find(object => object.id === fixture.molecule.id)! as MoleculeObject;
     const atom = moved.atoms[0]!;
-    const withMark = applyChargeToolAtPoint(drawing, kind === "charge" ? 1 : { kind }, { x: atom.x - 30, y: atom.y });
+    // Just outside one bond length, but inside the 1.15-bond association radius.
+    const markOffset = nativeDrawingStyleFromObjectStyle(moved.style).bondLengthPx * 1.1;
+    const withMark = applyChargeToolAtPoint(drawing, kind === "charge" ? 1 : { kind }, { x: atom.x - markOffset, y: atom.y });
     const mark = withMark.pages[0]!.objects.find(object => object.type === "electron-mark")!;
     const { port, push, amend, select } = await mount(applyPatch(withMark, { op: "setSelection",
       objectIds: [fixture.molecule.id, ...(selectedMark ? [mark.id] : [])] }));
     const before = port.read("initial")!;
     expect(before.pages[0]!.objects.find(object => object.id === mark.id)).toMatchObject({ anchor: { kind: "point" } });
+    // Replan with the mark present, as the live tool does, and prove the unsafe
+    // normalized result would attach it before asserting that the host refuses it.
+    const unsafe = normalizeCommittedDocument(applyPatch(before,
+      buildMoveObjects({ ...fixture.context, getDocument: () => before }, input).patch));
+    expect(unsafe.pages[0]!.objects.find(object => object.id === mark.id)).toMatchObject({
+      anchor: { kind: "atom", objectId: moved.id, atomId: atom.id }
+    });
     expect((await inspectMolecule({ ...fixture.context, chemistry }, before.pages[0]!.objects[0] as MoleculeObject)).canonicalSmiles).toBe("CC");
     const result = await call("move_objects", input);
     // Before the guard, this mounted path reported success with [] warnings and committed
@@ -303,6 +386,36 @@ describe("MainWindow canvas overlays", () => {
     beforeEach(async () => {
       await act(async () => root.render(<MainWindow initialPaletteMode="hidden" initialRulersVisible={false}
         nativePalette={false} shortcutPlatform={platform} />));
+    });
+
+    it("hands focus back from the prompt exactly once for a primary page press (#211)", async () => {
+      const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+      const focus = vi.spyOn(canvas, "focus");
+      expect(document.activeElement).toBe(container.querySelector(".plugin-canvas-overlay textarea"));
+      await canvasPointer(container.querySelector(".page")!, "pointerdown");
+      expect(document.activeElement).toBe(canvas);
+      expect(focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      await canvasPointer(canvas, "pointerup");
+    });
+
+    it("does not claim BODY focus during prompt composition and recovers after compositionend", async () => {
+      const textarea = container.querySelector<HTMLTextAreaElement>(".plugin-canvas-overlay textarea")!;
+      const canvas = container.querySelector<HTMLElement>(".canvas-region")!;
+      const focus = vi.spyOn(canvas, "focus");
+      await act(async () => {
+        textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        textarea.blur();
+      });
+      expect(document.activeElement).toBe(document.body);
+      await canvasPointer(canvas, "pointerdown");
+      expect(document.activeElement).toBe(document.body);
+      expect(focus).not.toHaveBeenCalled();
+      await canvasPointer(canvas, "pointerup");
+      await act(async () => textarea.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "あ" })));
+      await canvasPointer(canvas, "pointerdown");
+      expect(document.activeElement).toBe(canvas);
+      expect(focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      await canvasPointer(canvas, "pointerup");
     });
 
     it("keeps the prompt focused for a press inside the overlay", async () => {

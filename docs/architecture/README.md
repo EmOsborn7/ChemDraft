@@ -6,7 +6,9 @@ The native document model belongs in `packages/chem-core`. Compatibility formats
 
 Key architecture notes:
 
+- [perf-probe.md](perf-probe.md) — Bridge-gated timing logs for comparable macOS and Windows speed runs.
 - `3d-spin-flatten.md` — Spin 3D flattening and placement architecture.
+- [plugin-3d-chemistry.md](plugin-3d-chemistry.md) — Plugin 3D chemistry worker, model-token, and flattening boundary.
 - `composited-page-editor-model.md`
 - `dependency-inventory.md` — Dependency and vendored-binary inventory.
 - `over-under-crossing-model.md`
@@ -26,3 +28,4 @@ Key architecture notes:
 - `ux-surfaces.md` — Metadata-only UX surface scaffold.
 - `viewport-and-rulers.md`
 - `image-acquisition.md`
+- [tables.md](tables.md) — Native table model, layout, editing, clipboard, export and agent insertion.

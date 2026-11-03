@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { nativeTextSubscriptBottomEm } from "./textMetrics";
 import {
   ChemDraftSyntheticStylePreset,
   DocumentPageSchema,
@@ -17,6 +18,7 @@ import {
   atomDegrees,
   atomLabelAnchorOffset,
   atomLabelLayout,
+  atomLabelRunAdvance,
   atomLabelHaloWidthPx,
   averageDefinedDepthWeights,
   bondRefKey,
@@ -32,6 +34,13 @@ import {
   nativeMoleculeRingAtPoint,
   NativeAtomLabelStyleMapKeys,
   planBondExtension,
+  bondGrowthAngleDegrees,
+  linearBondGrowthAimDegrees,
+  ringAttachmentAngleMetrics,
+  ringAttachmentCenterAngle,
+  ringAttachmentIsClear,
+  ringAttachmentRotationAims,
+  selectRingAttachmentRotation,
   planNativeArtVisual,
   planPageSvgRender,
   planMoleculeAtomLabels,
@@ -60,7 +69,197 @@ const baseInput = {
   objectBounds: { x: 152, y: 204, width: 96, height: 32 }
 } satisfies Omit<BondExtensionPlanningInput, "clickPoint">;
 
+describe("native subscript ink", () => {
+  it("ends digit and non-descender subscripts at their shifted baseline", () => {
+    expect(nativeTextSubscriptBottomEm("4")).toBe(0.4);
+    expect(nativeTextSubscriptBottomEm("0123456789ABCdef+−-–—")).toBe(0.4);
+  });
+
+  it("reserves script descent for descender letters and punctuation", () => {
+    expect(nativeTextSubscriptBottomEm("Hp")).toBeCloseTo(0.5512, 8);
+    for (const glyph of "gjpqyQ()[]{},;|_") {
+      expect(nativeTextSubscriptBottomEm(`4${glyph}`)).toBeCloseTo(0.5512, 8);
+    }
+  });
+});
+
 describe("layout-engine molecule growth planning", () => {
+  it("turns a ring about its atom from the preferred orientation in 15 degree steps", () => {
+    const aims = ringAttachmentRotationAims({ sourceAtom: { x: 100, y: 50 }, centerAngle: Math.PI / 6, aimDistance: 44 });
+    expect(aims.map(({ rotationDegrees }) => rotationDegrees)).toEqual([
+      0, -15, 15, -30, 30, -45, 45, -60, 60, -75, 75, -90, 90, -105, 105, -120, 120, -135, 135, -150, 150, -165, 165, 180
+    ]);
+    for (const { rotationDegrees, point } of aims) {
+      expect(Math.hypot(point.x - 100, point.y - 50)).toBeCloseTo(44, 8);
+      const aimDegrees = Math.atan2(point.y - 50, point.x - 100) * 180 / Math.PI;
+      expect(((aimDegrees - 30 - rotationDegrees) % 360 + 540) % 360 - 180).toBeCloseTo(0, 6);
+    }
+  });
+
+  it("measures the ring centre direction from the atoms added at the source", () => {
+    expect(ringAttachmentCenterAngle({ x: 0, y: 0 }, [{ x: 10, y: 10 }, { x: 10, y: -10 }, { x: 30, y: 0 }]))
+      .toBeCloseTo(0, 8);
+    expect(ringAttachmentCenterAngle({ x: 0, y: 0 }, [])).toBeUndefined();
+  });
+
+  describe("ring attachment angles", () => {
+    // Existing bond runs left from the source; a ring bond pair opens `half` degrees either side of `centre`.
+    const source = { id: "source", x: 0, y: 0 };
+    const ringBondsAt = (centre: number, half: number) => [centre - half, centre + half].map((degrees, index) => ({
+      atom: { id: `r${index}`, x: 22 * Math.cos(degrees * Math.PI / 180), y: 22 * Math.sin(degrees * Math.PI / 180) },
+      bond: { fromAtomId: "source", toAtomId: `r${index}` }
+    }));
+    const metricsFor = (centre: number, half = 60) => ringAttachmentAngleMetrics({
+      atoms: [source, { id: "parent", x: -22, y: 0 }], bonds: [{ fromAtomId: "source", toAtomId: "parent" }],
+      addedAtoms: ringBondsAt(centre, half).map(({ atom }) => atom),
+      addedBonds: ringBondsAt(centre, half).map(({ bond }) => bond),
+      sourceAtomId: "source"
+    })!;
+
+    it("is symmetric with every angle 120 degrees when the old bond bisects the exterior", () => {
+      const metrics = metricsFor(0);
+      expect(metrics.minAngleDegrees).toBeCloseTo(120, 6);
+      expect(metrics.asymmetryDegrees).toBeCloseTo(0, 6);
+    });
+
+    it("reports the 60/120/180 layout of a ring turned 60 degrees", () => {
+      const metrics = metricsFor(60);
+      expect(metrics.minAngleDegrees).toBeCloseTo(60, 6);
+      expect(metrics.asymmetryDegrees).toBeCloseTo(120, 6);
+    });
+
+    it("measures across every existing bond", () => {
+      const metrics = ringAttachmentAngleMetrics({
+        atoms: [source, { id: "parent", x: -22, y: 0 }, { id: "up", x: 0, y: -22 }],
+        bonds: [{ fromAtomId: "source", toAtomId: "parent" }, { fromAtomId: "source", toAtomId: "up" }],
+        addedAtoms: ringBondsAt(45, 60).map(({ atom }) => atom),
+        addedBonds: ringBondsAt(45, 60).map(({ bond }) => bond),
+        sourceAtomId: "source"
+      })!;
+      // Ring bonds at -15 and 105 degrees: 15 to the old bond straight up (-90), the least of all four.
+      expect(metrics.minAngleDegrees).toBeCloseTo(75, 6);
+    });
+
+    it("has no angular constraint on a bare atom and declines a ring without two bonds there", () => {
+      const ring = ringBondsAt(0, 60);
+      expect(ringAttachmentAngleMetrics({
+        atoms: [source], bonds: [], addedAtoms: ring.map(({ atom }) => atom),
+        addedBonds: ring.map(({ bond }) => bond), sourceAtomId: "source"
+      })).toEqual({ minAngleDegrees: 180, asymmetryDegrees: 0 });
+      expect(ringAttachmentAngleMetrics({
+        atoms: [source], bonds: [], addedAtoms: [ring[0]!.atom], addedBonds: [ring[0]!.bond], sourceAtomId: "source"
+      })).toBeUndefined();
+    });
+  });
+
+  describe("choosing a ring rotation", () => {
+    const turn = (rotationDegrees: number, minAngleDegrees: number, asymmetryDegrees = 0) =>
+      ({ rotationDegrees, minAngleDegrees, asymmetryDegrees });
+
+    it("takes the most symmetric rotation among those reaching 90 degrees", () => {
+      expect(selectRingAttachmentRotation([turn(15, 120, 30), turn(-45, 95, 10), turn(30, 60, 0)])).toBe(1);
+    });
+
+    it("breaks a tie by the smaller turn, then the negative direction", () => {
+      expect(selectRingAttachmentRotation([turn(60, 100, 20), turn(30, 100, 20)])).toBe(1);
+      expect(selectRingAttachmentRotation([turn(30, 100, 20), turn(-30, 100, 20)])).toBe(1);
+    });
+
+    it("accepts exactly 90 degrees", () => {
+      expect(selectRingAttachmentRotation([turn(-30, 90, 120)])).toBe(0);
+    });
+
+    it("accepts an exact 90-degree turn that rounded vertices measure a few thousandths short", () => {
+      // Source (780,300), neighbour (800.801,307.162): the -30 turn measures 89.99915.
+      expect(selectRingAttachmentRotation([turn(-30, 89.99915, 120)])).toBe(0);
+      expect(selectRingAttachmentRotation([turn(-30, 89.9, 120)])).toBeUndefined();
+    });
+
+    it("treats asymmetries within rounding noise as a tie", () => {
+      expect(selectRingAttachmentRotation([turn(30, 100, 20.004), turn(-30, 100, 20)])).toBe(1);
+      expect(selectRingAttachmentRotation([turn(-30, 100, 20.004), turn(30, 100, 20)])).toBe(0);
+    });
+
+    it("refuses when no rotation reaches 90 degrees, however wide the best one is", () => {
+      expect(selectRingAttachmentRotation([turn(90, 89, 120), turn(75, 51, 100), turn(105, 15, 140)])).toBeUndefined();
+      expect(selectRingAttachmentRotation([turn(120, 0, 180)])).toBeUndefined();
+      expect(selectRingAttachmentRotation([])).toBeUndefined();
+    });
+  });
+
+  const ringAtoms = [
+    { id: "source", x: 0, y: 0 },
+    { id: "a", x: 11, y: -Math.sqrt(3) * 11 },
+    { id: "b", x: 33, y: -Math.sqrt(3) * 11 },
+    { id: "c", x: 44, y: 0 },
+    { id: "d", x: 33, y: Math.sqrt(3) * 11 },
+    { id: "e", x: 11, y: Math.sqrt(3) * 11 }
+  ];
+  const ringBonds = ringAtoms.map((atom, index) => ({
+    fromAtomId: atom.id, toAtomId: ringAtoms[(index + 1) % ringAtoms.length].id
+  }));
+  const clearRingInput = {
+    atoms: [ringAtoms[0], { id: "parent", x: -22, y: 0 }],
+    bonds: [{ fromAtomId: "source", toAtomId: "parent" }],
+    addedAtoms: ringAtoms.slice(1), addedBonds: ringBonds,
+    sourceAtomId: "source", bondLength: 22
+  };
+
+  it("accepts a clean ring with bonds meeting existing geometry at the source", () => {
+    expect(ringAttachmentIsClear(clearRingInput)).toBe(true);
+  });
+
+  it.each([11, 22, 44])("uses the growth clearance threshold at bond length %s", (bondLength) => {
+    const scale = bondLength / 22;
+    const atoms = clearRingInput.atoms.map((atom) => ({ ...atom, x: atom.x * scale, y: atom.y * scale }));
+    const addedAtoms = clearRingInput.addedAtoms.map((atom) => ({ ...atom, x: atom.x * scale, y: atom.y * scale }));
+    const obstacle = { id: "obstacle", x: addedAtoms[0].x, y: addedAtoms[0].y - bondLength * 0.44 };
+    expect(ringAttachmentIsClear({ ...clearRingInput, atoms: [...atoms, obstacle], addedAtoms, bondLength })).toBe(false);
+    expect(ringAttachmentIsClear({ ...clearRingInput, atoms: [...atoms, { ...obstacle,
+      y: addedAtoms[0].y - bondLength * 0.46 }], addedAtoms, bondLength })).toBe(true);
+  });
+
+  it("rejects a ring bond crossing an existing bond even with well-separated atoms", () => {
+    expect(ringAttachmentIsClear({
+      ...clearRingInput,
+      atoms: [...clearRingInput.atoms, { id: "top", x: 22, y: -44 }, { id: "bottom", x: 22, y: 44 }],
+      bonds: [...clearRingInput.bonds, { fromAtomId: "top", toAtomId: "bottom" }]
+    })).toBe(false);
+  });
+
+  it("rejects a ring that wraps around an existing atom without crossing any bond", () => {
+    expect(ringAttachmentIsClear({
+      ...clearRingInput,
+      atoms: [...clearRingInput.atoms, { id: "inner", x: 22, y: 0 }]
+    })).toBe(false);
+  });
+
+  it("rejects a hexagon drawn around a cyclopropane at a narrow gap", () => {
+    // Source at the top edge; its cyclopropane neighbours leave a ~60 degree gap that the hexagon fills.
+    const bondLength = 22;
+    const atoms = [
+      { id: "source", x: 0, y: 0 },
+      { id: "p1", x: 11, y: -bondLength * 0.5 },
+      { id: "p2", x: 11, y: bondLength * 0.5 },
+      { id: "cp", x: 33, y: 0 }
+    ];
+    const bonds = [
+      { fromAtomId: "source", toAtomId: "p1" }, { fromAtomId: "source", toAtomId: "p2" },
+      { fromAtomId: "p1", toAtomId: "p2" }, { fromAtomId: "p2", toAtomId: "cp" }
+    ];
+    expect(ringAttachmentIsClear({
+      atoms, bonds, addedAtoms: clearRingInput.addedAtoms, addedBonds: ringBonds,
+      sourceAtomId: "source", bondLength
+    })).toBe(false);
+  });
+
+  it("rejects a collinear overlapping bond at the shared source", () => {
+    expect(ringAttachmentIsClear({
+      ...clearRingInput,
+      atoms: [ringAtoms[0], { id: "parent", x: 22, y: -Math.sqrt(3) * 22 }]
+    })).toBe(false);
+  });
+
   it("reports atom degrees from native molecule graph edges", () => {
     expect(atomDegrees(baseInput.atoms, baseInput.bonds)).toEqual(new Map([
       ["atom_001", 1],
@@ -83,6 +282,220 @@ describe("layout-engine molecule growth planning", () => {
     expect(plan?.newAtomPoint.y).toBeCloseTo(150.718, 3);
     expect(plan?.direction.x).toBeCloseTo(0.5, 3);
     expect(plan?.direction.y).toBeCloseTo(-0.866, 3);
+  });
+
+  it("grows straight through a terminal alkyne carbon, however the click leans", () => {
+    for (const clickPoint of [{ x: 300, y: 220 }, { x: 282, y: 290 }, { x: 248, y: 212 }]) {
+      const plan = planBondExtension({
+        ...baseInput,
+        bonds: [{ fromAtomId: "atom_001", toAtomId: "atom_002", order: "triple" }],
+        clickPoint
+      });
+      expect(plan?.sourceAtomId).toBe("atom_002");
+      expect(plan?.direction.x).toBeCloseTo(1, 6);
+      expect(plan?.direction.y).toBeCloseTo(0, 6);
+      expect(plan?.newAtomPoint.x).toBeCloseTo(320, 3);
+      expect(plan?.newAtomPoint.y).toBeCloseTo(220, 3);
+    }
+  });
+
+  it.each([
+    ["a triple bond", [{ fromAtomId: "a", toAtomId: "b", order: "triple" }], 180],
+    ["two double bonds (an allene centre)", [
+      { fromAtomId: "a", toAtomId: "b", order: "double" },
+      { fromAtomId: "c", toAtomId: "a", order: "double" }
+    ], 180],
+    ["one double bond", [{ fromAtomId: "a", toAtomId: "b", order: "double" }], 120],
+    ["single and aromatic bonds", [
+      { fromAtomId: "a", toAtomId: "b", order: "single" },
+      { fromAtomId: "a", toAtomId: "c", order: "aromatic" }
+    ], 120],
+    ["bonds with no order", [{ fromAtomId: "a", toAtomId: "b" }], 120],
+    ["a triple bond elsewhere in the molecule", [
+      { fromAtomId: "a", toAtomId: "b", order: "single" },
+      { fromAtomId: "b", toAtomId: "c", order: "triple" }
+    ], 120]
+  ] as const)("gives an atom with %s a %s-degree growth angle", (_name, bonds, expected) => {
+    expect(bondGrowthAngleDegrees("a", bonds, 120)).toBe(expected);
+  });
+
+  it("keeps a non-default chain angle off an sp atom", () => {
+    expect(bondGrowthAngleDegrees("a", [{ fromAtomId: "a", toAtomId: "b", order: "single" }], 112)).toBe(112);
+    expect(bondGrowthAngleDegrees("a", [{ fromAtomId: "a", toAtomId: "b", order: "triple" }], 112)).toBe(180);
+  });
+
+  it("aims a bond dragged off an sp end straight through it, and declines anywhere else", () => {
+    const atoms = [{ id: "b", x: 0, y: 0 }, { id: "a", x: 30, y: -30 }, { id: "c", x: 60, y: -30 }];
+    const triple = [{ fromAtomId: "b", toAtomId: "a", order: "triple" }];
+    expect(linearBondGrowthAimDegrees("a", atoms, triple)).toBeCloseTo(-45, 9);
+    expect(linearBondGrowthAimDegrees("b", atoms, triple)).toBeCloseTo(135, 9);
+    expect(linearBondGrowthAimDegrees("a", atoms, [{ fromAtomId: "a", toAtomId: "b", order: "single" }])).toBeUndefined();
+    expect(linearBondGrowthAimDegrees("a", atoms, [{ fromAtomId: "a", toAtomId: "b", order: "double" }])).toBeUndefined();
+    // An allene centre already has two collinear bonds: no single straight-through aim remains.
+    expect(linearBondGrowthAimDegrees("a", atoms, [
+      { fromAtomId: "a", toAtomId: "b", order: "double" },
+      { fromAtomId: "a", toAtomId: "c", order: "double" }
+    ])).toBeUndefined();
+    expect(linearBondGrowthAimDegrees("missing", atoms, triple)).toBeUndefined();
+  });
+
+  // Ethyne flush with the right edge of an 816-wide page: the straight-through position for a third
+  // carbon lies off the page and clamps back onto the sp carbon itself.
+  const edgeEthyne = {
+    atoms: [{ id: "c1", x: 776, y: 300 }, { id: "c2", x: 816, y: 300 }],
+    bonds: [{ fromAtomId: "c1", toAtomId: "c2", order: "triple" }],
+    pageBounds: { x: 0, y: 0, width: 816, height: 1056 }
+  };
+  const turnFromParent = (point: { x: number; y: number }) => {
+    const [parent, source] = edgeEthyne.atoms;
+    const first = Math.atan2(parent!.y - source!.y, parent!.x - source!.x);
+    const second = Math.atan2(point.y - source!.y, point.x - source!.x);
+    return Math.abs(((second - first) * 180 / Math.PI + 540) % 360 - 180);
+  };
+
+  it("never grows a zero-length bond off an sp end at the page edge: it takes the chain angle instead", () => {
+    const plan = planBondExtension({
+      ...edgeEthyne,
+      clickPoint: { x: 816, y: 300 },
+      preferredAtomId: "c2",
+      bondLength: 40,
+      hitRadius: 10,
+      targetBondAngleDegrees: 120
+    });
+    expect(plan).toBeDefined();
+    expect(plan!.sourceAtomId).toBe("c2");
+    // The chain-angle position, clamped to the page like any growth at the edge: a real bond, bent.
+    expect(Math.hypot(plan!.newAtomPoint.x - 816, plan!.newAtomPoint.y - 300)).toBeGreaterThanOrEqual(20);
+    expect(turnFromParent(plan!.newAtomPoint)).toBeLessThan(150);
+    expect(plan!.newAtomPoint.x).toBeLessThanOrEqual(816);
+  });
+
+  it("still grows an sp end straight through when the page has room", () => {
+    const plan = planBondExtension({
+      ...edgeEthyne,
+      pageBounds: { x: 0, y: 0, width: 1000, height: 1056 },
+      clickPoint: { x: 816, y: 300 },
+      preferredAtomId: "c2",
+      bondLength: 40,
+      hitRadius: 10,
+      targetBondAngleDegrees: 120
+    });
+    expect(plan!.newAtomPoint.x).toBeCloseTo(856, 6);
+    expect(plan!.newAtomPoint.y).toBeCloseTo(300, 6);
+  });
+
+  it("declines rather than grow a bond with no visible length anywhere on the page", () => {
+    // A 1 px page: every direction clamps back onto the source.
+    expect(planBondExtension({
+      atoms: [{ id: "c1", x: 0, y: 0 }, { id: "c2", x: 1, y: 0 }],
+      bonds: [{ fromAtomId: "c1", toAtomId: "c2", order: "triple" }],
+      pageBounds: { x: 0, y: 0, width: 1, height: 1 },
+      clickPoint: { x: 1, y: 0 },
+      preferredAtomId: "c2",
+      bondLength: 40,
+      hitRadius: 10
+    })).toBeUndefined();
+  });
+
+  it("lets a drag's straight-through snap give way to the chain angle at the page edge", () => {
+    const linearAim = linearBondGrowthAimDegrees("c2", edgeEthyne.atoms, edgeEthyne.bonds)!;
+    expect(linearAim).toBeCloseTo(0, 9);
+    // The pointer is dragged up and right of the sp carbon, beyond the page edge.
+    const plan = planFreeformBondExtension({
+      ...edgeEthyne,
+      sourceAtomId: "c2",
+      endPoint: { x: 836, y: 265 },
+      bondLength: 40,
+      directionDegrees: linearAim,
+      minimumBondLength: 12
+    });
+    expect(plan).toBeDefined();
+    expect(Math.hypot(plan!.newAtomPoint.x - 816, plan!.newAtomPoint.y - 300)).toBeGreaterThanOrEqual(20);
+    expect(turnFromParent(plan!.newAtomPoint)).toBeLessThan(150);
+    expect(plan!.newAtomPoint.x).toBeLessThanOrEqual(816);
+    // Toward the pointer: up the page.
+    expect(plan!.newAtomPoint.y).toBeLessThan(300);
+  });
+
+  it("never swaps a free-angle (Alt/Option) aim for another angle at the page edge: it declines", () => {
+    // Horizontal alkyne ending on the right edge; the free aim runs straight through, off the page.
+    const straight = planFreeformBondExtension({
+      ...edgeEthyne,
+      sourceAtomId: "c2",
+      endPoint: { x: 856, y: 300 },
+      bondLength: 40,
+      directionDegrees: 0,
+      freeAngle: true,
+      minimumBondLength: 12
+    });
+    expect(straight).toBeUndefined();
+    // Any aim with a rightward component has no length on the page either.
+    expect(planFreeformBondExtension({
+      ...edgeEthyne,
+      sourceAtomId: "c2",
+      endPoint: { x: 836, y: 265 },
+      bondLength: 40,
+      directionDegrees: -60,
+      freeAngle: true,
+      minimumBondLength: 12
+    })).toBeUndefined();
+    // The same straight-through angle as a snap (no free angle) still falls back to the chain angle.
+    const snapped = planFreeformBondExtension({
+      ...edgeEthyne,
+      sourceAtomId: "c2",
+      endPoint: { x: 836, y: 265 },
+      bondLength: 40,
+      directionDegrees: 0,
+      minimumBondLength: 12
+    });
+    expect(snapped).toBeDefined();
+    expect(turnFromParent(snapped!.newAtomPoint)).toBeLessThan(150);
+  });
+
+  it("keeps a free-angle aim exactly when it fits on the page", () => {
+    // Up the page from the sp carbon on the right edge: 90° off the straight-through line.
+    const plan = planFreeformBondExtension({
+      ...edgeEthyne,
+      sourceAtomId: "c2",
+      endPoint: { x: 816, y: 260 },
+      bondLength: 40,
+      directionDegrees: -90,
+      freeAngle: true,
+      minimumBondLength: 12
+    });
+    expect(plan!.newAtomPoint.x).toBeCloseTo(816, 6);
+    expect(plan!.newAtomPoint.y).toBeCloseTo(260, 6);
+    // With room past the edge, the free aim straight through is kept too.
+    const roomy = planFreeformBondExtension({
+      ...edgeEthyne,
+      pageBounds: { x: 0, y: 0, width: 1000, height: 1056 },
+      sourceAtomId: "c2",
+      endPoint: { x: 856, y: 300 },
+      bondLength: 40,
+      directionDegrees: 0,
+      freeAngle: true,
+      minimumBondLength: 12
+    });
+    expect(roomy!.newAtomPoint.x).toBeCloseTo(856, 6);
+    expect(roomy!.newAtomPoint.y).toBeCloseTo(300, 6);
+  });
+
+  it("does not let a drag's straight-through snap land a bond on another atom", () => {
+    const atoms = [...edgeEthyne.atoms, { id: "x", x: 856, y: 300 }];
+    const plan = planFreeformBondExtension({
+      ...edgeEthyne,
+      atoms,
+      pageBounds: { x: 0, y: 0, width: 1000, height: 1056 },
+      sourceAtomId: "c2",
+      endPoint: { x: 836, y: 335 },
+      bondLength: 40,
+      directionDegrees: linearBondGrowthAimDegrees("c2", atoms, edgeEthyne.bonds),
+      minimumBondLength: 12,
+      snapHitRadius: 0
+    });
+    expect(plan).toBeDefined();
+    expect(Math.hypot(plan!.newAtomPoint.x - 856, plan!.newAtomPoint.y - 300)).toBeGreaterThan(10);
+    expect(turnFromParent(plan!.newAtomPoint)).toBeCloseTo(120, 6);
   });
 
   it("uses the click side to choose between the two 120-degree candidates", () => {
@@ -1611,7 +2024,7 @@ describe("layout-engine page SVG planner", () => {
         "text|mol_snapshot|molecule|native-atom-label-run|0|0|middle",
         "text|mol_snapshot|molecule|native-atom-label-run|5.8500000000000005|-7.199999999999999|start",
         "text|text_snapshot|text|220|178|start",
-        "tspan|text_snapshot|text|220|start",
+        "tspan|text_snapshot|text|220|178|start",
         "circle|charge_snapshot|electron-mark",
         "line|charge_snapshot|electron-mark|325.832|169|332.168|169",
         "line|charge_snapshot|electron-mark|329|165.832|329|172.168",
@@ -1766,7 +2179,8 @@ describe("layout-engine page SVG planner", () => {
 
     const labels = new Map(planMoleculeAtomLabels(molecule).map((plan) => [plan.atom.id, plan]));
 
-    expect(labels.get("atom_001")?.label).toBe("CH3");
+    // Its bond leaves to the right, so the hydrogens lead: H3C, as HO does.
+    expect(labels.get("atom_001")?.label).toBe("H3C");
     expect(labels.get("atom_002")).toBeUndefined();
     expect(labels.get("atom_003")?.label).toBe("CH2");
     expect(labels.get("atom_003")?.color).toBe("#c75c12");
@@ -1782,7 +2196,7 @@ describe("layout-engine page SVG planner", () => {
     });
   });
 
-  it("preserves established trailing-subscript and leading-hydrogen label geometry", () => {
+  it("lays out trailing-subscript labels and leading hydrogens with the element on the atom", () => {
     const drawingStyle = {
       ...ChemDraftSyntheticStylePreset.drawing,
       atomLabelPlacement: "above" as const
@@ -1837,24 +2251,31 @@ describe("layout-engine page SVG planner", () => {
           "layout": {
             "bounds": {
               "height": 22.816000000000003,
-              "width": 28.6,
-              "x": -11.3,
+              "width": 31.6648,
+              "x": -24.2498,
               "y": -10.100000000000001,
             },
             "runs": [
               {
                 "script": "normal",
-                "text": "HN",
-                "textAnchor": "middle",
-                "x": 0,
+                "text": "H",
+                "textAnchor": "end",
+                "x": -11.4198,
                 "y": 0,
               },
               {
                 "script": "subscript",
                 "text": "2",
-                "textAnchor": "start",
-                "x": 9.9,
+                "textAnchor": "end",
+                "x": -5.415,
                 "y": 5.1000000000000005,
+              },
+              {
+                "script": "normal",
+                "text": "N",
+                "textAnchor": "middle",
+                "x": 0,
+                "y": 0,
               },
             ],
           },
@@ -2066,7 +2487,10 @@ describe("layout-engine page SVG planner", () => {
     ]);
     const hydrogenRight = oxygenLabel?.layout.runs[0]?.x;
     expect(hydrogenRight).toBeDefined();
-    expect(hydrogenRight!).toBeLessThanOrEqual(-6);
+    // The H ends where the O's glyph begins (half its advance left of the atom), as in "OH": clear
+    // of the O, with no extra space between them.
+    const oxygenAdvance = atomLabelRunAdvance({ text: "O", script: "normal" }, oxygenLabel!.drawingStyle);
+    expect(hydrogenRight!).toBeCloseTo(-oxygenAdvance / 2, 6);
   });
 
   it("resolves sparse atom-label style overrides per atom", () => {

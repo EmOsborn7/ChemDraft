@@ -1,5 +1,7 @@
 import type { ArrangementDraft } from "@chemdraft/layout-engine";
+import { isEditableTarget } from "../editableTarget";
 import { useExportPreviewEnabled } from "./useExportPreviewEnabled";
+import { perfHook, perfProbe, perfSurfaceReady } from "../perf/runtime";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { detectDialogPlatform, dialogEnvelope, sameDialog, type DialogMessage } from "./dialogProtocol";
 import { sendDialogMessage, subscribeDialogHost } from "./dialogTransport";
@@ -12,9 +14,21 @@ import type { ExportDialogState, ExportOptions, ExportPreviewResult, ExportFrame
 import { exportOptions } from "./exportOptionsValidation";
 import { EngineInstallForm } from "./EngineInstallForm";
 import { ToolInstallForm } from "./ToolInstallForm";
+import { InsertTableForm } from "./InsertTableForm";
+import { measureDialogContentWhenFontsReady } from "./dialogContentFit";
 const ExportForm = lazy(() => import("./ExportForm").then(module => ({ default: module.ExportForm })));
+const StructureTemplatePicker = lazy(() => import("./StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
 
 export function DialogWindow({ hostId }: { hostId: string }) {
+  useEffect(() => {
+    const onMenu = (event: MouseEvent) => { if (!isEditableTarget(event.target)) event.preventDefault(); };
+    window.document.addEventListener("contextmenu", onMenu);
+    return () => window.document.removeEventListener("contextmenu", onMenu);
+  }, []);
+  return <DialogWindowContent hostId={hostId} />;
+}
+
+function DialogWindowContent({ hostId }: { hostId: string }) {
   const previewEnabled = useExportPreviewEnabled();
   const previewEnabledRef = useRef(previewEnabled);
   previewEnabledRef.current = previewEnabled;
@@ -135,11 +149,15 @@ export function DialogWindow({ hostId }: { hostId: string }) {
     return () => { stopped = true; stop?.(); clearTimeout(actionTimer.current); clearTimeout(previewTimer.current); clearPreview(); };
   }, [hostId]);
   // React committed the form, including first-field focus. Hidden webviews suspend rAF: never wait for it.
-  const reportReady = useCallback(() => {
+  // A content-fit form passes its root: the host sizes the window to it (measured once fonts settle).
+  const reportReady = useCallback((fitElement?: HTMLElement) => {
     if (!snapshot) return;
     if ((snapshot.dialogKind === "engineInstall" || snapshot.dialogKind === "toolInstall") && readySession.current === snapshot.sessionId) return;
     readySession.current = snapshot.sessionId;
-    void sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type: "ready", data: {} }).catch(e => setError(String(e)));
+    const sending = (fitElement ? measureDialogContentWhenFontsReady(fitElement) : Promise.resolve(undefined)).then(fit =>
+      sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId: crypto.randomUUID(), type: "ready", data: fit ?? {} }));
+    if (perfProbe) void sending.then(() => perfHook(() => perfSurfaceReady("main", snapshot.sessionId, "dialog-open"))).catch(() => undefined);
+    void sending.catch(e => setError(String(e)));
   }, [hostId, snapshot]);
   useEffect(() => {
     if (snapshot?.dialogKind !== "arrangementSpacing") return;
@@ -153,7 +171,7 @@ export function DialogWindow({ hostId }: { hostId: string }) {
     }, percent === 100 ? 0 : 120);
     return () => { clearTimeout(debounce); clearTimeout(previewTimer.current); };
   }, [hostId, snapshot, percent, arrangement]);
-  useEffect(() => { if (snapshot && snapshot.dialogKind !== "export") reportReady(); }, [snapshot, reportReady]);
+  useEffect(() => { if (snapshot?.dialogKind === "pageSize" || snapshot?.dialogKind === "arrangementSpacing" || snapshot?.dialogKind === "reactionConditions" || snapshot?.dialogKind === "engineInstall" || snapshot?.dialogKind === "toolInstall") reportReady(); }, [snapshot, reportReady]);
   const sendAction = (data: Extract<DialogMessage, { type: "action" }>["data"]) => {
     if (!snapshot) return;
     clearPreview();
@@ -174,6 +192,10 @@ export function DialogWindow({ hostId }: { hostId: string }) {
     setError(undefined); setNotice(undefined);
     const requestId = crypto.randomUUID();
     pendingRequestId.current = requestId;
+    if (perfProbe) {
+      if (data.action === "export") perfHook(() => perfProbe?.expectCompletion("export-written", requestId));
+      else if (data.action === "apply") perfHook(() => perfProbe?.expectCompletion("document-commit", requestId));
+    }
     startAcceptanceDeadline();
     void sendDialogMessage(hostId, { ...dialogEnvelope(snapshot), requestId, type: "action", data }).catch(e => {
       if (cancellationRequested.current) return;
@@ -181,6 +203,10 @@ export function DialogWindow({ hostId }: { hostId: string }) {
     });
   };
   if (!snapshot) return <p role="status">{error ?? "Opening dialog…"}</p>;
+  if (snapshot.dialogKind === "structureTemplates") return <Suspense fallback={<p role="status">Opening Templates…</p>}>
+    <StructureTemplatePicker {...snapshot.data} busy={busy} error={error} onReady={reportReady}
+      onInsert={templateId => sendAction({ action: "insert", templateId })} onClose={() => sendAction({ action: "cancel" })} />
+  </Suspense>;
   if (snapshot.dialogKind === "reactionConditions" && conditions) return <ReactionConditionsForm title={snapshot.data.title}
     draft={conditions} onChange={setConditions} busy={busy} error={error} onCancel={() => sendAction({ action: "cancel" })}
     onSave={() => sendAction({ action: "apply", draft: conditions })} />;
@@ -211,6 +237,9 @@ export function DialogWindow({ hostId }: { hostId: string }) {
     onCancel={() => sendAction({ action: "cancel" })}
     onChooseDestination={() => sendAction({ action: "chooseDestination", options: exportOptions(exportDraft) })}
     onSubmit={() => sendAction({ action: "export", options: exportOptions(exportDraft) })} /></Suspense>;
+  if (snapshot?.dialogKind === "insertTable") return <InsertTableForm key={snapshot.sessionId} title={snapshot.data.title} initial={snapshot.data}
+    busy={busy} error={error} onReady={reportReady} onCancel={() => sendAction({ action: "cancel" })}
+    onSubmit={options => sendAction({ action: "apply", ...options })} />;
   if (snapshot?.dialogKind === "engineInstall") return <EngineInstallForm snapshot={snapshot.data} onAction={action => sendAction({ action })} busy={busy} error={error} />;
   if (snapshot?.dialogKind === "toolInstall") return <ToolInstallForm snapshot={snapshot.data} onAction={action => sendAction({ action })} busy={busy} error={error} />;
   if (!snapshot || snapshot.dialogKind !== "pageSize" || !draft) return <p role="status">{error ?? "Opening dialog…"}</p>;

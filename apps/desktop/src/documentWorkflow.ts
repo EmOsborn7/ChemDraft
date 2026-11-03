@@ -1,11 +1,20 @@
+import { formulaSpansFromText } from "@chemdraft/document-workflow-core";
+import { nativeMoleculeLayoutQuality } from "./depiction2d/layoutQuality";
 import { planObjectArrangement, moleculeOutlineForArrangement, moleculeAnchorForArrangement, moleculeVisualBoundsForArrangement, textVisualBoundsForArrangement, type ArrangementLayout, type ArrangementOptions, type ArrangementItem, type LayoutBounds } from "@chemdraft/layout-engine";
 import { snapRotationDegrees } from "./rotationSnap";
 import { arrangementConnectionPairs, defaultArrangementDraft, planArrangementConnections, validArrangementDraft, type ArrangementDraft, type ArrangementConnection } from "@chemdraft/layout-engine";
 import { quadraticArrowGeometry, nativeSemanticArrowHeadSizePx, trimQuadraticRoute, type NativeArtObstacle } from "@chemdraft/art-engine";
 import { snapPlacementDegrees } from "./placementSnap";
+import { nativeTemplateForToolCommand as sharedTemplateForToolCommand } from "./ringTemplates";
 import { projectedDoubleBondSides } from "./interaction/projectedDoubleBondSides";
 import { nativeFormattedTextObjectSize, reconcileReactionArrowAttachments } from "@chemdraft/document-workflow-core";
 import { withArrowAttachmentIds,arrowAttachmentFrame,arrowAttachmentFractionAtPoint } from "@chemdraft/layout-engine";
+import { buildTableObject, pageConstrainedShift } from "@chemdraft/document-workflow-core";
+import { planTableLayout, tableVisualBoundsForArrangement, transformPointForObject } from "@chemdraft/layout-engine";
+import { validTableDimensions, type TableInsertDimensions } from "./dialogs/insertTableOptions";
+import { doubleBondStereoState, perceivedSpecifiedDoubleBondIds } from "./interaction/doubleBondStereo";
+import type { storedCoordinatesMatchStereo } from "@chemdraft/ocl-adapter";
+import type { DoubleBondStereoReader } from "./interaction/doubleBondStereo";
 import {
   GRAPHIC_CORNER_RADIUS_HANDLE_SIZE_PX,
   OBJECT_RESIZE_HANDLE_OFFSET_PX,
@@ -55,6 +64,7 @@ import {
   applyPatches,
   ChemDraftSyntheticStylePreset,
   createEmptyDocument,
+  createImageGraphicObject,
   DocumentObjectSchema,
   createPageLayout,
   createCustomPageLayout,
@@ -69,12 +79,12 @@ import {
   clearChangedAtomHydrogenHints,
   drawnLabelBondSide,
   moleculeToMolfileV3000,
+  normalizeAtomIsotope,
   UnknownBondOrderError,
   PageSizePresets,
   pageMarginFromLayout,
   nativeDrawingStyleFromObjectStyle,
   nativeTextStyleFromObjectStyle,
-  stylePresetToObjectStyle,
   textStyleToObjectStyle,
   type Anchor,
   type ArrowObject,
@@ -134,6 +144,18 @@ import {
   type TextExportResult
 } from "@chemdraft/export-engine";
 import {
+  compareLayoutQuality,
+  layoutAtomAndLabelDefects,
+  repairBridgedLayoutContacts,
+  compareLayoutRepairs,
+  evaluateLayoutQuality,
+  prepareLayoutTopology,
+  repairLayoutOverlaps,
+  moleculeLayoutLabelBoxes,
+  orientLayoutForLabels,
+  type LayoutBond,
+  type LayoutLabelBox,
+  type LayoutQuality,
   aimPlacementVertices,
   placementAimDegrees,
   findNearestAtomAtPoint,
@@ -142,6 +164,14 @@ import {
   moleculeFillCycleKeyBondIds,
   nativeMoleculeRings,
   planBondExtension,
+  ringAttachmentAngleMetrics,
+  ringAttachmentCenterAngle,
+  ringAttachmentIsClear,
+  ringAttachmentRotationAims,
+  selectRingAttachmentRotation,
+  layoutPointsFitBounds,
+  bondGrowthAngleDegrees,
+  linearBondGrowthAimDegrees,
   planFreeformBondExtension,
   nativeMultipleBondGapPx,
   nativeMoleculeBondDrawingStyle,
@@ -151,6 +181,7 @@ import {
   mechanismArrowGeometry,
   nativeBondOrderResolution,
   nativeGroupLabelDisplay,
+  representativeMoleculeBondLength,
   resolvePageAnchorPoint
 } from "@chemdraft/layout-engine";
 import {
@@ -194,6 +225,7 @@ import {
   nativeAtomValidationState,
   type NativeAtomValidationState,
   nativeBondByAtomPair,
+  documentDrawingDefaults,
   nativeBondLengthPx,
   nativeBondOrderValue,
   nativeComponents,
@@ -254,7 +286,6 @@ export {
   normalizeNativeAtomElementLabel,
   pastedStructureDepictionFromMolfile,
   phase4Timestamp,
-  smilesPasteBondLengthPx,
   stereoPerceptionMolfile
 } from "@chemdraft/document-workflow-core";
 export type {
@@ -709,7 +740,10 @@ function artArcTool(
 }
 
 export interface NativeBondToolOptions {
+  bondOrder?: NativeBondOrderValue;
   bondStyle?: NativeBondDisplayStyle;
+  /** Told why the tool refused to place the bond, so the caller can say so instead of guessing. */
+  onRefusal?: (reason: string) => void;
 }
 
 export interface NativeFreeformBondGrowthOptions extends NativeBondToolOptions {
@@ -884,6 +918,7 @@ export function createAdapterFallbackMolecule(
     rotation: 0,
     transform: defaultNativeMoleculeTransform,
     style: {
+      ...documentDrawingDefaults(document).objectStyle,
       source: "editor-adapter-fallback"
     },
     compatibility: {
@@ -932,7 +967,7 @@ export function createNativeSingleBondMolecule(
   options: NativeBondToolOptions = {}
 ): MoleculeObject {
   const page = firstPage(document);
-  const objectStyle = stylePresetToObjectStyle(ChemDraftSyntheticStylePreset);
+  const { objectStyle, bondLengthPx: nativeBondLength } = documentDrawingDefaults(document);
   // The first bond lands at the zig-zag half-angle — (180° − chainAngleDegrees)/2, 30° above
   // horizontal for the default 120° chain angle — rising left-to-right, ChemDraw's first-bond
   // orientation, rather than flat. The angle comes from the same preset style the new molecule
@@ -965,7 +1000,7 @@ export function createNativeSingleBondMolecule(
     id: "bond_001",
     fromAtomId: leftAtom.id,
     toAtomId: rightAtom.id,
-    order: "single",
+    order: options.bondOrder ?? "single",
     ...nativeBondDisplayObject(options.bondStyle)
   }] satisfies MoleculeBond[];
   const geometry = moleculeGeometryFromAtoms(atoms);
@@ -1273,7 +1308,7 @@ function planChainVerticesForOptions(
 
 /** Chain tool: press-drag draws an alkane zig-zag in one gesture. Anchored on an existing atom it
  *  appends carbons to that molecule using the molecule's own bond length and chain angle;
- *  otherwise it seeds a new native molecule from the synthetic preset. With `options.pathPoints`
+ *  otherwise it seeds a new native molecule from the document drawing defaults. With `options.pathPoints`
  *  (the flexible variant) the zig-zag follows the pointer path instead of a straight axis. Pure —
  *  the caller previews with replacePresentDocument and commits once. */
 export function applyNativeChainTool(
@@ -1318,7 +1353,7 @@ export function applyNativeChainTool(
     );
   }
 
-  const presetStyle = nativeDrawingStyleFromObjectStyle(stylePresetToObjectStyle(ChemDraftSyntheticStylePreset));
+  const { drawing: presetStyle, objectStyle } = documentDrawingDefaults(document);
   const start = {
     x: clamp(startPoint.x, 0, page.width),
     y: clamp(startPoint.y, 0, page.height)
@@ -1359,7 +1394,7 @@ export function applyNativeChainTool(
     rotation: 0,
     transform: defaultNativeMoleculeTransform,
     style: {
-      ...stylePresetToObjectStyle(ChemDraftSyntheticStylePreset),
+      ...objectStyle,
       source: "chemdraft-native-drawing",
       drawingPrimitive: "chain"
     },
@@ -1390,9 +1425,15 @@ export function applyNativeChainTool(
   );
 }
 
+export function nativeBondOrderForToolCommand(commandId: string): NativeBondOrderValue {
+  return commandId === "tool.doubleBond" ? "double" : commandId === "tool.tripleBond" ? "triple" : "single";
+}
+
 export function nativeBondStyleForToolCommand(commandId: string): NativeBondToolStyle | undefined {
   switch (commandId) {
     case "tool.bond":
+    case "tool.doubleBond":
+    case "tool.tripleBond":
       return "solid";
     case "tool.wedgeBond":
       return "wedge";
@@ -1408,20 +1449,7 @@ export function nativeBondStyleForToolCommand(commandId: string): NativeBondTool
 }
 
 export function nativeTemplateForToolCommand(commandId: string): NativeMoleculeTemplateId | undefined {
-  switch (commandId) {
-    case "tool.cyclopentane":
-      return "cyclopentane";
-    case "tool.cyclohexane":
-      return "cyclohexane";
-    case "tool.benzene":
-      return "benzene";
-    case "tool.chairCyclohexaneA":
-      return "chairCyclohexaneA";
-    case "tool.chairCyclohexaneB":
-      return "chairCyclohexaneB";
-    default:
-      return undefined;
-  }
+  return sharedTemplateForToolCommand(commandId);
 }
 
 export function nativeArtToolForCommand(commandId: string): NativeArtToolDefinition | undefined {
@@ -1479,10 +1507,34 @@ export function createNativeArtGraphicObject(
   };
 }
 
+export function nativeArtToolIsOrbital(commandId: string): boolean {
+  return ["tool.lobe", "tool.shadedLobe", "tool.pOrbital", "tool.sOrbital"].includes(commandId);
+}
+
+/** The node shared by lobes, in page coordinates; no persistent chemical attachment. */
+export function nativeOrbitalAnchorPoint(object: DocumentObject): PagePoint | undefined {
+  if (object.type !== "graphic" || !(nativeArtToolIsOrbital(String(object.style.artToolCommandId)) ||
+      ["lobe", "shadedLobe", "pOrbital", "sOrbital"].includes(String(object.data.artToolId)))) return undefined;
+  const offset = (object.data.artToolId === "lobe" || object.data.artToolId === "shadedLobe")
+    ? nativeOrbitalLobeTip(object, object.rotation)
+    : { x: object.width / 2, y: object.height / 2 };
+  return { x: object.x + offset.x, y: object.y + offset.y };
+}
+
+/** Aim about the same node used for snapping and subsequent rotation. */
+export function aimNativeOrbitalPlacement(document: ChemDraftDocument, objectId: string, point: PagePoint, shiftKey = false): ChemDraftDocument {
+  const object = findDocumentObject(document, objectId);
+  const anchor = object && nativeOrbitalAnchorPoint(object);
+  if (!object || !anchor || Math.hypot(point.x - anchor.x, point.y - anchor.y) < 1) return document;
+  const angle = radiansToDegrees(Math.atan2(point.y - anchor.y, point.x - anchor.x)) + 90;
+  const rotation = shiftKey ? Math.round(angle / 15) * 15 : angle;
+  return rotateDocumentObject(document, objectId, rotation - object.rotation);
+}
+
 type NativeOrbitalPlacement = Pick<GraphicObject, "x" | "y" | "rotation">;
 
 /**
- * Place orbital art at the atom under the pointer, without creating a persistent anchor.
+ * Place orbital art at a molecule atom or an existing orbital node, without a persistent anchor.
  *
  * A single lobe's local tip is at the bottom centre of its frame, and a p orbital's
  * coincident lobe nodes are at its frame centre. The angle is chosen from the largest
@@ -1493,20 +1545,49 @@ function nativeOrbitalPlacementAtPoint(
   point: PagePoint,
   tool: NativeArtToolDefinition
 ): NativeOrbitalPlacement | undefined {
-  if (tool.id !== "lobe" && tool.id !== "shadedLobe" && tool.id !== "pOrbital") {
+  if (!nativeArtToolIsOrbital(tool.commandId)) {
     return undefined;
   }
 
   const target = nativeOrbitalAtomAtPoint(document, point);
-  if (!target) {
-    return undefined;
+  const existingNodeOnAtom = target && firstPage(document).objects.some(object => {
+    const node = nativeOrbitalAnchorPoint(object);
+    return node && Math.hypot(node.x - target.atom.x, node.y - target.atom.y) < 0.01;
+  });
+  if (!target || existingNodeOnAtom) {
+    const orbitals = firstPage(document).objects.flatMap(object => {
+      const anchor = nativeOrbitalAnchorPoint(object);
+      return anchor && Math.hypot(point.x - anchor.x, point.y - anchor.y) <= 12 ? [{ object, anchor }] : [];
+    }).sort((a, b) => Math.hypot(point.x - a.anchor.x, point.y - a.anchor.y) - Math.hypot(point.x - b.anchor.x, point.y - b.anchor.y));
+    const anchor = target?.atom ?? orbitals[0]?.anchor ?? point;
+    // Choose a visible, unoccupied direction for repeated clicks at the same node. A p
+    // orbital is an axis (180 degrees); a single lobe has a direction (360 degrees). A p
+    // orbital occupies both of its lobe directions, an s orbital none, and the atom's
+    // bonds always count (a lobe at rotation r points along bearing r - 90 degrees).
+    const period = tool.id === "pOrbital" ? 180 : 360;
+    const occupied = orbitals.filter(entry => Math.hypot(entry.anchor.x - anchor.x, entry.anchor.y - anchor.y) < 0.01)
+      .flatMap(entry => entry.object.type !== "graphic" || entry.object.data.artToolId === "sOrbital" ? []
+        : entry.object.data.artToolId === "pOrbital" ? [entry.object.rotation, entry.object.rotation + 180] : [entry.object.rotation]);
+    if (target) {
+      occupied.push(...nativeAtomBondAngles(target.molecule, target.atom.id).map(angle => radiansToDegrees(angle) + 90));
+    }
+    const angles = occupied.map(angle => ((angle % period) + period) % period).sort((a, b) => a - b);
+    let rotation = 0, gap = -1;
+    angles.forEach((angle, index) => {
+      const next = angles[(index + 1) % angles.length] + (index === angles.length - 1 ? period : 0);
+      if (next - angle > gap) { gap = next - angle; rotation = (angle + gap / 2) % period; }
+    });
+    const tip = tool.id === "lobe" || tool.id === "shadedLobe"
+      ? rotatePointAround({ x: tool.width / 2, y: tool.height }, { x: tool.width / 2, y: tool.height / 2 }, degreesToRadians(rotation))
+      : { x: tool.width / 2, y: tool.height / 2 };
+    return { x: anchor.x - tip.x, y: anchor.y - tip.y, rotation };
   }
 
   const gapBisector = nativeAtomLargestBondGapBisector(target.molecule, target.atom.id);
-  if (tool.id === "pOrbital") {
+  if (tool.id === "pOrbital" || tool.id === "sOrbital") {
     // The p-orbital's local axis is vertical. Its axis, unlike a single lobe's direction,
     // is perpendicular to the unoccupied-gap bisector.
-    const rotation = gapBisector === undefined ? 0 : radiansToDegrees(gapBisector + Math.PI);
+    const rotation = tool.id === "sOrbital" || gapBisector === undefined ? 0 : radiansToDegrees(gapBisector + Math.PI);
     return {
       x: target.atom.x - tool.width / 2,
       y: target.atom.y - tool.height / 2,
@@ -1555,18 +1636,23 @@ function nativeOrbitalAtomAtPoint(
   return target ? { molecule: target.molecule, atom: target.atom } : undefined;
 }
 
-function nativeAtomLargestBondGapBisector(molecule: MoleculeObject, atomId: string): number | undefined {
+/** Bearings (radians, sorted) from an atom to each bonded neighbour. */
+function nativeAtomBondAngles(molecule: MoleculeObject, atomId: string): number[] {
   const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
   if (!atom) {
-    return undefined;
+    return [];
   }
-  const angles = molecule.bonds.flatMap((bond) => {
+  return molecule.bonds.flatMap((bond) => {
     const neighborId = bond.fromAtomId === atomId
       ? bond.toAtomId
       : bond.toAtomId === atomId ? bond.fromAtomId : undefined;
     const neighbor = neighborId ? molecule.atoms.find((candidate) => candidate.id === neighborId) : undefined;
     return neighbor ? [Math.atan2(neighbor.y - atom.y, neighbor.x - atom.x)] : [];
   }).sort((left, right) => left - right);
+}
+
+function nativeAtomLargestBondGapBisector(molecule: MoleculeObject, atomId: string): number | undefined {
+  const angles = nativeAtomBondAngles(molecule, atomId);
   if (angles.length === 0) {
     return undefined;
   }
@@ -2985,11 +3071,12 @@ export function createNativeTemplateMolecule(
   templateId: NativeMoleculeTemplateId
 ): MoleculeObject {
   const page = firstPage(document);
+  const { bondLengthPx: nativeBondLength, objectStyle } = documentDrawingDefaults(document);
   const center = {
     x: clamp(point.x, nativeBondLength, page.width - nativeBondLength),
     y: clamp(point.y, nativeBondLength, page.height - nativeBondLength)
   };
-  const geometry = nativeTemplateGeometry(center, templateId);
+  const geometry = nativeTemplateGeometry(center, templateId, nativeBondLength);
   const atoms = geometry.atoms;
   const bonds = geometry.bonds;
   const moleculeGeometry = moleculeGeometryFromAtoms(atoms);
@@ -3004,7 +3091,7 @@ export function createNativeTemplateMolecule(
     rotation: 0,
     transform: defaultNativeMoleculeTransform,
     style: {
-      ...stylePresetToObjectStyle(ChemDraftSyntheticStylePreset),
+      ...objectStyle,
       source: "chemdraft-native-drawing",
       drawingPrimitive: templateId
     },
@@ -3069,43 +3156,57 @@ export type NativeTemplateFallbackReason =
   | "double-bond-overfill"
   | "bond-cannot-accept";
 
-/** Compute the placement a template click would make, without mutating the document. */
+/** Compute a previewable plan; refused placements have no preview. */
 export function planNativeTemplatePlacement(
   document: ChemDraftDocument,
   placement: { point: PagePoint; target?: NativeMoleculeDeleteTarget },
   templateId: NativeMoleculeTemplateId
 ): NativeTemplatePlacementPlan | undefined {
+  return nativeTemplatePlacementResult(document, placement, templateId).plan;
+}
+
+/** Resolve a template click, retaining the reason when page bounds refuse its placement. */
+export function nativeTemplatePlacementResult(
+  document: ChemDraftDocument,
+  placement: { point: PagePoint; target?: NativeMoleculeDeleteTarget },
+  templateId: NativeMoleculeTemplateId
+): { plan?: NativeTemplatePlacementPlan; refusal?: "sprout-page-edge" } {
   const { point, target } = placement;
   if (target) {
     const molecule = firstPage(document).objects.find((object): object is MoleculeObject =>
       object.id === target.objectId && object.type === "molecule"
     );
     if (!molecule || !isEditableNativeMoleculeGraph(molecule)) {
-      return standaloneNativeTemplateFallbackPlan(document, point, templateId, "structure-not-editable");
+      return { plan: standaloneNativeTemplateFallbackPlan(document, point, templateId, "structure-not-editable") };
     }
 
     if (target.kind === "atom") {
       const atom = molecule.atoms.find((candidate) => candidate.id === target.atomId);
       if (!atom) {
-        return standaloneNativeTemplateFallbackPlan(document, point, templateId, "target-unavailable");
+        return { plan: standaloneNativeTemplateFallbackPlan(document, point, templateId, "target-unavailable") };
       }
     }
 
+    const attachment = target.kind === "atom"
+      ? attachNativeTemplateRingToAtomOnPage(molecule, target.atomId, point, templateId, firstPage(document))
+      : undefined;
+    // A page-blocked attachment is refused, never turned into a separate ring elsewhere.
+    if (attachment?.refusal) return { refusal: attachment.refusal };
     const nextMolecule = target.kind === "bond"
       ? fuseNativeTemplateRingToBond(molecule, target.bondId, point, templateId)
-      : attachNativeTemplateRingToAtom(molecule, target.atomId, point, templateId);
+      : attachment?.molecule;
     if (!nextMolecule) {
-      return standaloneNativeTemplateFallbackPlan(
+      return { plan: standaloneNativeTemplateFallbackPlan(
         document,
         point,
         templateId,
         nativeRingTargetFailureValenceReason(molecule, target)
           ?? (target.kind === "bond" ? "bond-cannot-accept" : "target-unavailable")
-      );
+      ) };
     }
     const valenceRefusal = nativeRingPlacementValenceRefusal(molecule, nextMolecule, target);
     if (valenceRefusal) {
-      return standaloneNativeTemplateFallbackPlan(document, point, templateId, valenceRefusal);
+      return { plan: standaloneNativeTemplateFallbackPlan(document, point, templateId, valenceRefusal) };
     }
 
     const existingAtomIds = new Set(molecule.atoms.map((atom) => atom.id));
@@ -3119,24 +3220,24 @@ export function planNativeTemplatePlacement(
     const kind = target.kind === "atom"
       ? "attach-atom"
       : addedAtomIds.length < fusedNewAtoms ? "fused-closure" : "fuse-bond";
-    return {
+    return { plan: {
       kind,
       templateId,
       molecule: nextMolecule,
       objectId: molecule.id,
       addedAtomIds,
       addedBondIds
-    };
+    } };
   }
 
   const molecule = createNativeTemplateMolecule(document, point, templateId);
-  return {
+  return { plan: {
     kind: "standalone",
     templateId,
     molecule,
     addedAtomIds: molecule.atoms.map((atom) => atom.id),
     addedBondIds: molecule.bonds.map((bond) => bond.id)
-  };
+  } };
 }
 
 /** Why a ring placement is refused for valence: the outcome {@link nativeRingPlacementValenceRefusal} reports. */
@@ -3268,6 +3369,7 @@ function createStandaloneTemplateAwayFromExistingAtoms(
   templateId: NativeMoleculeTemplateId
 ): MoleculeObject | undefined {
   const page = firstPage(document);
+  const { bondLengthPx: nativeBondLength } = documentDrawingDefaults(document);
   const existingAtoms = page.objects
     .filter((object): object is MoleculeObject => object.type === "molecule")
     .flatMap((molecule) => molecule.atoms);
@@ -3356,7 +3458,8 @@ export function applyNativeTemplateToolAtTarget(
 
 function nativeTemplateGeometry(
   center: PagePoint,
-  templateId: NativeMoleculeTemplateId
+  templateId: NativeMoleculeTemplateId,
+  bondLengthPx: number
 ): { atoms: MoleculeAtom[]; bonds: MoleculeBond[] } {
   if (
     templateId === "cyclopropane" ||
@@ -3365,7 +3468,7 @@ function nativeTemplateGeometry(
     templateId === "cycloheptane" ||
     templateId === "cyclooctane"
   ) {
-    const atoms = regularNativeRingAtoms(center, nativeTemplateRingSize(templateId), -Math.PI / 2);
+    const atoms = regularNativeRingAtoms(center, nativeTemplateRingSize(templateId), -Math.PI / 2, bondLengthPx);
     return { atoms, bonds: nativeRingBonds(atoms, () => ({ order: "single" })) };
   }
 
@@ -3373,12 +3476,12 @@ function nativeTemplateGeometry(
     // Vertex at the top (flat left/right sides) — the orientation ChemDraw stamps and the one
     // journals draw, so hotkey sprouts from the top/bottom vertices head vertically and the
     // side-vertex sprouts head out diagonally.
-    const atoms = regularNativeRingAtoms(center, 6, -Math.PI / 2);
+    const atoms = regularNativeRingAtoms(center, 6, -Math.PI / 2, bondLengthPx);
     return { atoms, bonds: nativeRingBonds(atoms, () => ({ order: "single" })) };
   }
 
   if (templateId === "benzene") {
-    const atoms = regularNativeRingAtoms(center, 6, -Math.PI / 2);
+    const atoms = regularNativeRingAtoms(center, 6, -Math.PI / 2, bondLengthPx);
     return {
       atoms,
       bonds: nativeRingBonds(atoms, (index, fromAtom, toAtom) => {
@@ -3394,10 +3497,10 @@ function nativeTemplateGeometry(
     };
   }
 
-  return nativeChairCyclohexaneGeometry(center, templateId === "chairCyclohexaneB");
+  return nativeChairCyclohexaneGeometry(center, templateId === "chairCyclohexaneB", bondLengthPx);
 }
 
-function regularNativeRingAtoms(center: PagePoint, size: number, rotation: number): MoleculeAtom[] {
+function regularNativeRingAtoms(center: PagePoint, size: number, rotation: number, nativeBondLength: number): MoleculeAtom[] {
   const radius = nativeBondLength / (2 * Math.sin(Math.PI / size));
   return Array.from({ length: size }, (_, index) => {
     const angle = rotation + index * Math.PI * 2 / size;
@@ -3413,9 +3516,10 @@ function regularNativeRingAtoms(center: PagePoint, size: number, rotation: numbe
 
 function nativeChairCyclohexaneGeometry(
   center: PagePoint,
-  reflected: boolean
+  reflected: boolean,
+  bondLengthPx: number
 ): { atoms: MoleculeAtom[]; bonds: MoleculeBond[] } {
-  const atoms = nativeChairCyclohexaneBasePoints(reflected).map((point, index) => ({
+  const atoms = nativeChairCyclohexaneBasePoints(reflected, bondLengthPx).map((point, index) => ({
     id: `atom_${String(index + 1).padStart(3, "0")}`,
     element: "C",
     ...offsetPoint(center, point),
@@ -3425,7 +3529,7 @@ function nativeChairCyclohexaneGeometry(
   return { atoms, bonds: nativeRingBonds(atoms, () => ({ order: "single" })) };
 }
 
-function nativeChairCyclohexaneBasePoints(reflected: boolean): PagePoint[] {
+function nativeChairCyclohexaneBasePoints(reflected: boolean, nativeBondLength: number = nativeBondLengthPx): PagePoint[] {
   const points: PagePoint[] = [{ x: 0, y: 0 }];
 
   nativeChairCyclohexaneDirections(reflected).slice(0, -1).forEach((degrees) => {
@@ -3703,6 +3807,55 @@ function nativeClosureExceedsDegreeCap(molecule: MoleculeObject, newBonds: reado
   return molecule.atoms.some((atom) => (degree.get(atom.id) ?? 0) > 3);
 }
 
+/** Keep the preferred attachment exactly when it fits; otherwise try complete alternate rings. */
+function attachNativeTemplateRingToAtomOnPage(
+  molecule: MoleculeObject,
+  atomId: string,
+  point: PagePoint,
+  templateId: NativeMoleculeTemplateId,
+  page: ChemDraftDocument["pages"][number]
+): { molecule?: MoleculeObject; refusal?: "sprout-page-edge" } {
+  const preferred = attachNativeTemplateRingToAtom(molecule, atomId, point, templateId);
+  // Preserve the existing geometry/valence refusals (including separate-placement tool fallbacks).
+  if (!preferred || nativeRingPlacementValenceRefusal(molecule, preferred, {
+    objectId: molecule.id, kind: "atom", atomId, distanceToPointer: 0
+  })) return { molecule: preferred };
+
+  const existingAtomIds = new Set(molecule.atoms.map((atom) => atom.id));
+  const pageBounds = { x: 0, y: 0, width: page.width, height: page.height };
+  const fits = (candidate: MoleculeObject) => layoutPointsFitBounds(
+    candidate.atoms.filter((atom) => !existingAtomIds.has(atom.id)),
+    pageBounds
+  );
+  if (fits(preferred)) return { molecule: preferred };
+
+  const sourceAtom = molecule.atoms.find((atom) => atom.id === atomId);
+  const centerAngle = sourceAtom && ringAttachmentCenterAngle(
+    sourceAtom, preferred.atoms.filter((atom) => !existingAtomIds.has(atom.id))
+  );
+  if (!sourceAtom || centerAngle === undefined) return { refusal: "sprout-page-edge" };
+  const bondLength = nativeTemplateBondLength(molecule);
+  const existingBondIds = new Set(molecule.bonds.map((bond) => bond.id));
+  // Turn the ring about the atom; keep each turn that fits the page and is clear of the drawing.
+  const turns = ringAttachmentRotationAims({ sourceAtom, centerAngle, aimDistance: bondLength * 2 })
+    .flatMap(({ rotationDegrees, point: aim }) => {
+      const candidate = attachNativeTemplateRingToAtom(molecule, atomId, aim, templateId);
+      if (!candidate || !fits(candidate)) return [];
+      const layout = {
+        atoms: molecule.atoms,
+        bonds: molecule.bonds,
+        addedAtoms: candidate.atoms.filter((atom) => !existingAtomIds.has(atom.id)),
+        addedBonds: candidate.bonds.filter((bond) => !existingBondIds.has(bond.id)),
+        sourceAtomId: atomId
+      };
+      const metrics = ringAttachmentIsClear({ ...layout, bondLength })
+        ? ringAttachmentAngleMetrics(layout) : undefined;
+      return metrics ? [{ candidate, rotationDegrees, ...metrics }] : [];
+    });
+  const chosen = selectRingAttachmentRotation(turns);
+  return chosen === undefined ? { refusal: "sprout-page-edge" } : { molecule: turns[chosen]!.candidate };
+}
+
 function attachNativeTemplateRingToAtom(
   molecule: MoleculeObject,
   atomId: string,
@@ -3772,6 +3925,17 @@ function isNativeChairTemplate(templateId: NativeMoleculeTemplateId): boolean {
   return templateId === "chairCyclohexaneA" || templateId === "chairCyclohexaneB";
 }
 
+function nativeTemplateBondLength(molecule: MoleculeObject): number {
+  // Perspective templates deliberately foreshorten bonds; grow at their nominal length.
+  if (molecule.style.projection === "perspective") {
+    return nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx;
+  }
+  // Imported molecules can have coordinates that disagree with the stored drawing style.
+  // Only a molecule without measurable bonds (such as a single atom) needs the style fallback.
+  return representativeMoleculeBondLength(molecule) ??
+    nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx;
+}
+
 function fuseNativeChairTemplateToBond(
   molecule: MoleculeObject,
   targetBond: MoleculeBond,
@@ -3787,7 +3951,7 @@ function fuseNativeChairTemplateToBond(
     return undefined;
   }
 
-  const basePoints = nativeChairCyclohexaneBasePoints(reflected);
+  const basePoints = nativeChairCyclohexaneBasePoints(reflected, nativeTemplateBondLength(molecule));
   const normal = { x: -dy / length, y: dx / length };
   const midpoint = { x: (fromAtom.x + toAtom.x) / 2, y: (fromAtom.y + toAtom.y) / 2 };
   const desiredSide = nativeTemplateSideForBond(molecule, fromAtom, toAtom, point, normal);
@@ -3884,7 +4048,7 @@ function attachNativeChairTemplateToAtom(
   point: PagePoint,
   reflected: boolean
 ): MoleculeObject | undefined {
-  const basePoints = nativeChairCyclohexaneBasePoints(reflected);
+  const basePoints = nativeChairCyclohexaneBasePoints(reflected, nativeTemplateBondLength(molecule));
   const desiredDirection = nativeTemplateDirectionForAtom(molecule, sharedAtom, point);
   const candidates = basePoints.map((basePoint, sharedIndex) => {
     const centerVector = { x: -basePoint.x, y: -basePoint.y };
@@ -3994,6 +4158,7 @@ function nativeChairTemplateCrowding(
   points: readonly PagePoint[],
   excludedAtomIds: ReadonlySet<string>
 ): number {
+  const nativeBondLength = nativeTemplateBondLength(molecule);
   return molecule.atoms
     .filter((atom) => !excludedAtomIds.has(atom.id))
     .reduce((score, atom) => (
@@ -4379,8 +4544,9 @@ function nativeBondWithOrderAndDoubleSide(
     delete display.doubleBondSide;
   }
 
+  const { stereo: _stereo, ...bondWithoutStereo } = bond;
   return {
-    ...bond,
+    ...(order === "double" ? bond : bondWithoutStereo),
     order,
     display: Object.keys(display).length > 0 ? display : undefined
   };
@@ -4466,6 +4632,7 @@ function nativeTemplateRingCrowding(
   points: readonly PagePoint[],
   excludedAtomIds: ReadonlySet<string>
 ): number {
+  const nativeBondLength = nativeTemplateBondLength(molecule);
   return molecule.atoms
     .filter((atom) => !excludedAtomIds.has(atom.id))
     .reduce((score, atom) => score + points.reduce((sum, point) => {
@@ -4480,6 +4647,7 @@ function nativeRingVerticesForSharedAtom(
   point: PagePoint,
   size: number
 ): PagePoint[] | undefined {
+  const nativeBondLength = nativeTemplateBondLength(molecule);
   const radius = nativeBondLength / (2 * Math.sin(Math.PI / size));
   const centerDirection = nativeTemplateDirectionForAtom(molecule, sharedAtom, point);
   const center = {
@@ -4539,6 +4707,7 @@ function nativeTemplateDirectionForAtom(
   atom: MoleculeAtom,
   point: PagePoint
 ): number {
+  // Keep grip tolerance fixed in page pixels, like the atom hit radius used by the hover target.
   const pointDistance = distance(atom, point);
   if (pointDistance > nativeBondLength * 0.35) {
     return Math.atan2(point.y - atom.y, point.x - atom.x);
@@ -4556,6 +4725,7 @@ function nativeTemplateSpiroCrowding(
   size: number,
   direction: 1 | -1
 ): number {
+  const nativeBondLength = nativeTemplateBondLength(molecule);
   const radius = nativeBondLength / (2 * Math.sin(Math.PI / size));
   const step = Math.PI * 2 / size;
   const candidatePoints = Array.from({ length: size - 1 }, (_, index) => ({
@@ -4619,6 +4789,12 @@ function nativeTextObjectToAtomLabelDisabledReason(
       ? "Atom labels cannot be empty"
       : "This molecule cannot be edited with the atom-label editor";
   }
+  const target = candidate.target;
+  const atom = target.kind === "atom" ? candidate.molecule.atoms.find(a => a.id === target.atomId) : undefined;
+  const label = normalizeNativeAtomElementLabel(candidate.text.text);
+  if (atom && labelOnBondedAtom(label, atom, candidate.molecule).kind !== "substituent") {
+    return atomLabelIsotopeRefusal(atom, label, candidate.molecule, true);
+  }
   return undefined;
 }
 
@@ -4657,6 +4833,9 @@ export function convertNativeTextObjectToAtomLabel(
   }
   const page = firstPage(document);
   const labeled = commitNativeAtomLabelTarget(document, target, text.text, { literal: true });
+  if (labeled.refusal) {
+    return { document, target, disabledReason: labeled.refusal, message: `Text kept: ${labeled.refusal}` };
+  }
   return {
     document: applyPatches(labeled.document, [
       { op: "removeObject", objectId },
@@ -4731,7 +4910,7 @@ export function convertNativeTextObjectToAtom(
     rotation: 0,
     transform: defaultNativeMoleculeTransform,
     style: {
-      ...stylePresetToObjectStyle(ChemDraftSyntheticStylePreset),
+      ...documentDrawingDefaults(document).objectStyle,
       source: "chemdraft-native-drawing"
     },
     compatibility: {
@@ -4874,114 +5053,6 @@ export function stretchNativeReactionArrowTo(
   );
 }
 
-/** Chemical-formula span formatting: digit runs that follow an element letter or closing
- *  parenthesis become subscripts, and a trailing charge (optional digits plus +, -, or −) becomes a
- *  superscript. Everything else stays a normal span. */
-/**
- * A run of element symbols, groupings, and counts — what a trailing sign must follow to be a charge
- * at all. "trans-", "Boc-", and "tert-" fail this and keep their hyphen.
- *
- * Written so that at most one alternative can match at any position: a digit is consumed only by a
- * `\d*` suffix, never by an alternative of its own. The earlier spelling offered both
- * `[A-Z][a-z]?\d*` and a standalone `\d+`, so a long digit run had 2^(n-1) parses and a
- * non-matching tail sent the engine through all of them — a pasted label of ~30 digits froze the
- * app. Same language, linear time.
- */
-const formulaBodyPattern = /^\d*(?:(?:[A-Z][a-z]?|[()[\]·])\d*)*$/;
-const singleElementPattern = /^[A-Z][a-z]?$/;
-
-/**
- * Index where a trailing charge begins, or `text.length` when there is none.
- *
- * The hard case is that a digit before the sign can be either a charge magnitude or an atom count,
- * and the two are spelled identically: in "Ca2+" the 2 is the charge, in "NH4+" the 4 is a count.
- * Two or more digits always split (the last is the magnitude, as in "SO42-"); a single digit is
- * read as the magnitude only when the body is one element symbol, which is what separates the
- * metal cations from the polyatomic ions.
- */
-function formulaChargeStart(text: string): number {
-  const match = /(\d*)([+\-±−])$/.exec(text);
-  if (!match) {
-    return text.length;
-  }
-
-  const signIndex = text.length - 1;
-  const digits = match[1];
-  const body = text.slice(0, text.length - match[0].length);
-  // The pattern below accepts the empty string; a bare sign is not a charged formula.
-  if (body.length === 0 || !formulaBodyPattern.test(body)) {
-    return text.length;
-  }
-  if (digits.length === 0) {
-    return signIndex;
-  }
-  if (digits.length >= 2) {
-    return signIndex - 1;
-  }
-  return singleElementPattern.test(body) ? signIndex - 1 : signIndex;
-}
-
-/** Per-character source styles, so reformatting keeps colour, font, and weight. */
-function formulaCharacterStyles(
-  text: string,
-  sourceSpans: readonly TextSpan[]
-): Array<TextSpan["style"] | undefined> {
-  const styles: Array<TextSpan["style"] | undefined> = [];
-  for (const span of sourceSpans) {
-    for (let index = 0; index < span.text.length; index += 1) {
-      styles.push(span.style);
-    }
-  }
-  while (styles.length < text.length) {
-    styles.push(styles[styles.length - 1]);
-  }
-  return styles;
-}
-
-export function formulaSpansFromText(text: string, sourceSpans: readonly TextSpan[] = []): TextSpan[] {
-  if (text.length === 0) {
-    return [{ text: "", script: "normal", style: {} }];
-  }
-
-  const styles = formulaCharacterStyles(text, sourceSpans);
-  const runs: Array<{ text: string; script: TextSpan["script"]; style: TextSpan["style"] | undefined }> = [];
-  const pushRun = (runText: string, script: TextSpan["script"], at: number) => {
-    if (runText.length === 0) {
-      return;
-    }
-    const style = styles[at];
-    const previous = runs[runs.length - 1];
-    // Styles come from the source spans, so identical styling is the same object reference.
-    if (previous && previous.script === script && previous.style === style) {
-      previous.text += runText;
-      return;
-    }
-    runs.push({ text: runText, script, style });
-  };
-
-  const chargeStart = formulaChargeStart(text);
-  let index = 0;
-  while (index < chargeStart) {
-    const character = text[index];
-    if (/\d/.test(character) && index > 0 && /[A-Za-z)\]]/.test(text[index - 1])) {
-      let end = index;
-      while (end < chargeStart && /\d/.test(text[end])) {
-        end += 1;
-      }
-      pushRun(text.slice(index, end), "subscript", index);
-      index = end;
-      continue;
-    }
-    pushRun(character, "normal", index);
-    index += 1;
-  }
-  if (chargeStart < text.length) {
-    pushRun(text.slice(chargeStart), "superscript", chargeStart);
-  }
-
-  return runs.map((run) => ({ text: run.text, script: run.script, style: { ...(run.style ?? {}) } }));
-}
-
 /** One-shot formula formatting over the selected text objects; returns the same document when the
  *  selection holds no text objects or nothing would change. */
 export function applyFormulaTextFormatting(document: ChemDraftDocument): ChemDraftDocument {
@@ -5049,9 +5120,11 @@ export function createNativeMolfileMolecule(
   }
 
   const page = firstPage(document);
-  const atoms = scaleParsedMolfileAtoms(graph, point, page).map((atom) => ({
+  const { bondLengthPx, objectStyle } = documentDrawingDefaults(document);
+  const atoms = scaleParsedMolfileAtoms(graph, point, page, bondLengthPx).map((atom) => ({
     id: atom.id,
     element: atom.element,
+    ...(atom.isotope === undefined ? {} : { isotope: atom.isotope }),
     x: atom.x,
     y: atom.y,
     formalCharge: atom.formalCharge
@@ -5064,6 +5137,7 @@ export function createNativeMolfileMolecule(
       fromAtomId: bond.fromAtomId,
       toAtomId: bond.toAtomId,
       order: bond.order,
+      ...(bond.stereo ? { stereo: bond.stereo } : {}),
       // Preserve wedge/hash stereo markers from the pasted molfile (V2000 bond stereo /
       // V3000 CFG) instead of silently dropping them (AGENTS.md §5.7).
       ...(bond.bondStyle ? { display: { bondStyle: bond.bondStyle } } : {})
@@ -5086,7 +5160,7 @@ export function createNativeMolfileMolecule(
     rotation: 0,
     transform: defaultNativeMoleculeTransform,
     style: {
-      ...stylePresetToObjectStyle(ChemDraftSyntheticStylePreset),
+      ...objectStyle,
       source: "clipboard-molfile"
     },
     compatibility: {
@@ -5104,10 +5178,13 @@ export function createNativeMolfileMolecule(
   });
 }
 
+/** Single and grid paste must verify the same open-E/Z graph they commit. */
+export const SMILES_PASTE_OPTIONS = { openUnspecifiedDoubleBonds: true } as const;
+
 export function insertSmilesMoleculeGrid(
   document: ChemDraftDocument,
   origin: PagePoint,
-  entries: readonly { smiles: string; depiction: PastedStructureDepiction }[],
+  entries: readonly { smiles: string; depiction: PastedStructureDepiction; molecule?: MoleculeObject }[],
   options: { gutterPx?: number } = {}
 ): { document: ChemDraftDocument; objectIds: string[]; columns: number; rows: number; pageResized: boolean } {
   if (entries.length === 0) {
@@ -5119,12 +5196,12 @@ export function insertSmilesMoleculeGrid(
   }
   const margin = 24;
   const page = firstPage(document);
-  const reservedObjectIds = new Set<string>();
+  const reservedObjectIds = new Set(entries.flatMap(entry => entry.molecule ? [entry.molecule.id] : []));
   const molecules = entries.map((entry) => {
-    const molecule = createSmilesMolecule(document, { x: margin, y: margin }, entry.depiction, entry.smiles, {
+    const molecule = entry.molecule ?? createSmilesMolecule(document, { x: margin, y: margin }, entry.depiction, entry.smiles, {
       ...SMILES_PASTE_SOURCE,
       reservedObjectIds
-    });
+    }, SMILES_PASTE_OPTIONS);
     reservedObjectIds.add(molecule.id);
     return molecule;
   });
@@ -5170,9 +5247,14 @@ export function insertSmilesMoleculeGrid(
   return { document: nextDocument, objectIds, columns, rows, pageResized };
 }
 
+export function visibleSkippedItems<T>(skippedItems: readonly T[]): T[] {
+  return skippedItems.slice(0, 3);
+}
+
 export function insertSmilesMoleculeGridStatus(
   result: ReturnType<typeof insertSmilesMoleculeGrid>,
-  skipped: number
+  skipped: number,
+  skippedItems: readonly { line: number; token: string; reason?: string }[] = []
 ): string {
   let status = `Pasted ${result.objectIds.length} SMILES structures in a ${result.columns} × ${result.rows} grid`;
   if (result.pageResized) {
@@ -5180,7 +5262,14 @@ export function insertSmilesMoleculeGridStatus(
     const unit = pageLayoutSourceUnit(page.layout);
     status += ` (page grown to Custom ${formatPageSizeValue(cssPxToPageSize(page.width, unit))} × ${formatPageSizeValue(cssPxToPageSize(page.height, unit))} ${pageSizeUnitLabel(unit)})`;
   }
-  if (skipped > 0) status += `; ${skipped} token${skipped === 1 ? "" : "s"} skipped`;
+  if (skippedItems.length > 0) {
+    const visibleItems = visibleSkippedItems(skippedItems);
+    for (const item of visibleItems) {
+      const token = item.token.length > 24 ? `${item.token.slice(0, 23)}…` : item.token;
+      status += `; skipped line ${item.line}: '${token}'${item.reason ? ` (${item.reason})` : ""}`;
+    }
+    if (skippedItems.length > visibleItems.length) status += `; and ${skippedItems.length - visibleItems.length} more`;
+  } else if (skipped > 0) status += `; ${skipped} token${skipped === 1 ? "" : "s"} skipped`;
   return status;
 }
 
@@ -5209,6 +5298,33 @@ export function applyClipboardPastePayload(
   point: PagePoint,
   textStyle: Partial<NativeTextStyle> = {}
 ): ClipboardPasteResult {
+  if (payload.kind === "image-refused") {
+    return { document, kind: payload.kind, status: payload.message, warnings: payload.warnings };
+  }
+
+  if (payload.kind === "image") {
+    try {
+      const page = firstPage(document);
+      const { type, bytesBase64, ...metadata } = payload.image;
+      const object = createImageGraphicObject({
+        ...metadata, id: nextObjectId(document, "image"), mimeType: type,
+        dataBase64: bytesBase64, center: point
+      });
+      return {
+        document: applyPatches(document, [
+          { op: "addObject", pageId: page.id, object },
+          { op: "setSelection", pageId: page.id, objectIds: [object.id] }
+        ], { now: phase4Timestamp }),
+        kind: payload.kind, status: "Pasted picture", selectedObjectId: object.id, warnings: payload.warnings
+      };
+    } catch (error) {
+      return {
+        document, kind: payload.kind, warnings: payload.warnings,
+        status: `Couldn't paste the picture: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+  }
+
   if (payload.kind === "plain-text") {
     const nextDocument = insertNativeTextObject(document, point, payload.text, textStyle);
     const selected = getSelectedTextObject(nextDocument);
@@ -5350,9 +5466,11 @@ export function updateNativeTextObjectText(
     return document;
   }
   const { object, page } = location;
+  const spans = textObjectSpansForTextChange(object, text);
   const fixedWidth = object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size";
   const fixedSize = object.style.textBoxSizingMode === "fixed-size";
   const size = nativeTextObjectSizeForText(text, object.style, {
+    spans,
     width: fixedWidth ? object.width : undefined,
     height: fixedSize ? object.height : undefined,
     maxWidth: Math.max(nativeTextObjectMinimumDimensions.width, page.width - object.x),
@@ -5368,7 +5486,7 @@ export function updateNativeTextObjectText(
         text,
         width: size.width,
         height: size.height,
-        spans: textObjectSpansForTextChange(object, text)
+        spans
       }
     },
     { now: phase4Timestamp }
@@ -5394,6 +5512,7 @@ export function resizeNativeTextObjectBox(
   );
   const fixedHeight = frame.height !== undefined;
   const size = nativeTextObjectSizeForText(object.text, object.style, {
+    spans: object.spans,
     width: nextWidth,
     height: fixedHeight ? frame.height : undefined,
     maxWidth: Math.max(nativeTextObjectMinimumDimensions.width, page.width - nextX),
@@ -5437,6 +5556,7 @@ export function updateNativeTextObjectStyle(
   const fixedWidth = object.style.textBoxSizingMode === "fixed-width" || object.style.textBoxSizingMode === "fixed-size";
   const fixedSize = object.style.textBoxSizingMode === "fixed-size";
   const size = nativeTextObjectSizeForText(object.text, nextStyle, {
+    spans: object.spans,
     width: fixedWidth ? object.width : undefined,
     height: fixedSize ? object.height : undefined,
     maxWidth: Math.max(nativeTextObjectMinimumDimensions.width, page.width - object.x),
@@ -6029,14 +6149,14 @@ export function applyMoleculeTargetBondLengthToBonds(
         anchoredAtomIds.add(to.id);
       });
 
-      const nextObject = normalizeNativeMoleculeGeometry({
+      const nextObject = withMeasuredNativeMoleculeBondLength(normalizeNativeMoleculeGeometry({
         ...object,
         atoms: object.atoms.map((atom) => atomById.get(atom.id) ?? atom),
         style: {
           ...object.style,
           bondLengths: nextBondLengths
         }
-      });
+      }));
       const changes = moleculeObjectChanges(object, nextObject);
       return Object.keys(changes).length === 0
         ? []
@@ -7168,26 +7288,59 @@ export function applySingleBondToolAtPoint(
   point: PagePoint,
   options: NativeBondToolOptions = {}
 ): ChemDraftDocument {
+  return nativeSingleBondToolAtPoint(document, point, options).document;
+}
+
+/**
+ * A bond-tool click: grows the selected molecule from the atom under `point`, or inserts a new
+ * bond. A click on an atom that only the page edge keeps from growing changes nothing and says
+ * so (`sprout-page-edge`), rather than dropping a separate bond on top of it.
+ */
+export function nativeSingleBondToolAtPoint(
+  document: ChemDraftDocument,
+  point: PagePoint,
+  options: NativeBondToolOptions = {}
+): { document: ChemDraftDocument; refusal?: NativeAtomSproutRefusal } {
   const page = firstPage(document);
   const selected = getSelectedMolecule(document);
   const extended = selected ? extendNativeCarbonChain(selected, point, page.width, page.height, options) : undefined;
 
   if (!selected) {
-    return insertNativeSingleBondMolecule(document, point, options);
+    return { document: insertNativeSingleBondMolecule(document, point, options) };
   }
 
   if (!extended) {
-    return insertNativeSingleBondMolecule(document, point, options);
+    const atomHit = findNativeMoleculeAtomHit(selected, point);
+    if (atomHit && nativeBondGrowthBlockedByPageEdge(selected, atomHit.atomId, point, page.width, page.height)) {
+      return { document, refusal: "sprout-page-edge" };
+    }
+    // A requested multiple bond at an atom must fail as a whole when valence refuses it.
+    if (options.bondOrder && options.bondOrder !== "single") {
+      const preview = previewNativeMoleculeBondGrowth(selected, point, page.width, page.height);
+      if (atomHit || preview) {
+        // With a preview, extendNativeCarbonChain already named its reason; without one, say why.
+        if (!preview && atomHit) {
+          const element = selected.atoms.find(atom => atom.id === atomHit.atomId)?.element ?? "the atom";
+          options.onRefusal?.(!isEditableNativeMoleculeGraph(selected)
+            ? "this molecule cannot be edited as a native graph"
+            : atomHit.availableBonds <= 0
+              ? `${element} has no available valence`
+              : `there is no room to place a bond from ${element}`);
+        }
+        return { document };
+      }
+    }
+    return { document: insertNativeSingleBondMolecule(document, point, options) };
   }
 
-  return applyPatches(
+  return { document: applyPatches(
     document,
     [
       { op: "updateObject", objectId: selected.id, changes: extended },
       { op: "setSelection", pageId: page.id, objectIds: [selected.id] }
     ],
     { now: phase4Timestamp }
-  );
+  ) };
 }
 
 export function applyFreeformSingleBondToolAtPoint(
@@ -7197,12 +7350,27 @@ export function applyFreeformSingleBondToolAtPoint(
   point: PagePoint,
   options: NativeFreeformBondGrowthOptions = {}
 ): ChemDraftDocument {
+  return nativeFreeformSingleBondToolAtPoint(document, objectId, sourceAtomId, point, options).document;
+}
+
+/**
+ * A bond-tool drag off `sourceAtomId` released at `point`. A drag that only the page edge keeps
+ * from placing a bond — an Alt/Option aim running off the page, which is never swapped for
+ * another angle — changes nothing and says so (`sprout-page-edge`).
+ */
+export function nativeFreeformSingleBondToolAtPoint(
+  document: ChemDraftDocument,
+  objectId: string,
+  sourceAtomId: string,
+  point: PagePoint,
+  options: NativeFreeformBondGrowthOptions = {}
+): { document: ChemDraftDocument; refusal?: NativeAtomSproutRefusal } {
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject =>
     object.id === objectId && object.type === "molecule"
   );
   if (!molecule) {
-    return document;
+    return { document };
   }
 
   // A drop on another molecule object's atom joins the two: merge that object into this one
@@ -7216,9 +7384,10 @@ export function applyFreeformSingleBondToolAtPoint(
       ? connectNativeCarbonAtoms(merged.molecule, sourceAtomId, mergedTargetAtomId, options)
       : undefined;
     if (!merged || !connected) {
-      return document;
+      if (!merged) options.onRefusal?.("those molecules cannot be merged into one");
+      return { document };
     }
-    return applyPatches(
+    return { document: applyPatches(
       document,
       [
         { op: "updateObject", objectId: molecule.id, changes: connected },
@@ -7227,36 +7396,54 @@ export function applyFreeformSingleBondToolAtPoint(
         { op: "setSelection", pageId: page.id, objectIds: [molecule.id] }
       ],
       { now: phase4Timestamp }
-    );
+    ) };
   }
 
-  const preview = previewNativeMoleculeFreeformBondGrowth(
-    molecule,
-    sourceAtomId,
-    point,
-    page.width,
-    page.height,
-    options
-  );
+  const pageBounds = { x: 0, y: 0, width: page.width, height: page.height };
+  const preview = previewNativeMoleculeFreeformBondGrowthInBounds(molecule, sourceAtomId, point, pageBounds, options);
   if (!preview) {
-    return document;
+    // Diagnostics only: the same drag with the page lifted says whether the edge alone refused it.
+    const margin = nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 4;
+    const unbounded = previewNativeMoleculeFreeformBondGrowthInBounds(molecule, sourceAtomId, point, {
+      x: -margin, y: -margin, width: page.width + margin * 2, height: page.height + margin * 2
+    }, options);
+    if (unbounded) return { document, refusal: "sprout-page-edge" };
+    options.onRefusal?.(nativeAtomGrowRefusalReason(molecule, sourceAtomId) ??
+      (isEditableNativeMoleculeGraph(molecule)
+        ? "there is no room to place that bond"
+        : "this molecule cannot be edited as a native graph"));
+    return { document };
   }
 
   const extended = preview.targetAtomId
     ? connectNativeCarbonAtoms(molecule, preview.atomId, preview.targetAtomId, options)
     : extendNativeCarbonGraph(molecule, preview.atomId, preview.newAtomPoint, options);
   if (!extended) {
-    return document;
+    return { document };
   }
 
-  return applyPatches(
+  return { document: applyPatches(
     document,
     [
       { op: "updateObject", objectId: molecule.id, changes: extended },
       { op: "setSelection", pageId: page.id, objectIds: [molecule.id] }
     ],
     { now: phase4Timestamp }
-  );
+  ) };
+}
+
+/**
+ * The atom a bond-tool press on `molecule` at `point` may drag a new bond from: an atom under the
+ * pointer that can take another bond. It does not depend on whether a click there would grow a
+ * bond — an atom the page edge boxes in for the default directions can still be dragged off with
+ * Alt/Option toward open room; only a click (a release without dragging) reports the refusal.
+ */
+export function nativeBondDragSourceAtomId(molecule: MoleculeObject, point: PagePoint): string | undefined {
+  if (!isEditableNativeMoleculeGraph(molecule)) {
+    return undefined;
+  }
+  const atomHit = findNativeMoleculeAtomHit(molecule, point);
+  return atomHit && canGrowNativeAtom(molecule, atomHit.atomId) ? atomHit.atomId : undefined;
 }
 
 export function applyNativeBondDisplayStyleTarget(
@@ -7273,8 +7460,25 @@ export function applyNativeBondDisplayStyleTarget(
   }
 
   const bond = molecule.bonds.find((candidate) => candidate.id === target.bondId);
-  if (!bond || bond.display?.bondStyle === bondStyle) {
+  if (!bond) {
     return document;
+  }
+  if (bond.display?.bondStyle === bondStyle) {
+    return nativeBondDisplayStyleReverses(bond, bondStyle)
+      ? applyPatch(
+          document,
+          {
+            op: "updateObject",
+            objectId: molecule.id,
+            changes: refreshNativeSingleBondGraph(
+              molecule,
+              molecule.atoms,
+              molecule.bonds.map((candidate) => candidate.id === bond.id ? reversedNativeBond(candidate) : candidate)
+            )
+          },
+          { now: phase4Timestamp }
+        )
+      : document;
   }
   // Dashed bonds are dative chemistry rather than decoration, and the interchange writers cannot
   // represent a double or higher-order coordination bond without silently changing its meaning.
@@ -7292,6 +7496,29 @@ export function applyNativeBondDisplayStyleTarget(
     { op: "updateObject", objectId: molecule.id, changes: nextMolecule },
     { now: phase4Timestamp }
   );
+}
+
+/**
+ * Whether applying `bondStyle` to a bond already drawn that way reverses it rather than doing
+ * nothing: a wedge or hashed wedge clicked again with its own tool swaps its narrow end to the
+ * other atom. The narrow end marks the stereocentre, so this is a stereo edit the user asked for
+ * by clicking, and its undo restores the bond exactly. Every other style is direction-free.
+ */
+export function nativeBondDisplayStyleReverses(bond: MoleculeBond, bondStyle: NativeBondDisplayStyle): boolean {
+  return bond.display?.bondStyle === bondStyle && (bondStyle === "wedge" || bondStyle === "hashed");
+}
+
+/** The same bond drawn from its other end; a left/right double-bond side is mirrored to stay put. */
+function reversedNativeBond(bond: MoleculeBond): MoleculeBond {
+  const side = bond.display?.doubleBondSide;
+  return {
+    ...bond,
+    fromAtomId: bond.toAtomId,
+    toAtomId: bond.fromAtomId,
+    ...(bond.display && (side === "left" || side === "right")
+      ? { display: { ...bond.display, doubleBondSide: side === "left" ? "right" : "left" } }
+      : {})
+  };
 }
 
 /**
@@ -7659,7 +7886,9 @@ export function nativeSingleBondHotkeyAtAtomTarget(
   // picks the pure geometric direction — ChemDraw's hotkey behavior.
   const planned = plan ?? nativeBondGrowthPlanForAtom(molecule, target.atomId, page.width, page.height);
   if (!planned) {
-    return { document, refusal: nativeSproutFailureReason(molecule, target.atomId) };
+    return { document, refusal: nativeBondGrowthBlockedByPageEdge(molecule, target.atomId, atom, page.width, page.height)
+      ? "sprout-page-edge"
+      : nativeSproutFailureReason(molecule, target.atomId) };
   }
 
   const extended = planned.targetAtomId
@@ -7999,6 +8228,7 @@ export type NativeRingHotkeyResult = {
  */
 export type NativeRingHotkeyRefusal =
   | NativeTemplateFallbackReason
+  | "sprout-page-edge"
   | "atom-label-not-element"
   | "ring-geometry-unavailable";
 
@@ -8052,14 +8282,24 @@ export function nativeRingHotkeyAttachAtAtomTarget(
   if (nativeElementFromAtomLabel(sourceAtom.element) === undefined) {
     return { document, refusal: "atom-label-not-element" };
   }
-  const direction = (plan && !plan.targetAtomId ? plan.direction : undefined)
-    ?? nativeBondGrowthPlanForAtom(molecule, target.atomId, page.width, page.height)?.direction
-    ?? { x: 0, y: -1 };
-  const orientationPoint = {
-    x: sourceAtom.x + direction.x * nativeBondLength,
-    y: sourceAtom.y + direction.y * nativeBondLength
-  };
-  const attached = attachNativeTemplateRingToAtom(molecule, target.atomId, orientationPoint, templateId);
+  // On a bonded atom the ring centres on the bisector of the atom's largest open angle, as a ring
+  // tool click on the atom does: a methyl then sits at 120° to both hexagon bonds (126° on a
+  // pentagon). The growth arrow points where one new bond would go, ±120° off the parent bond, and
+  // a ring centred along it came out 60° off that exterior bisector. A bare atom has no bisector
+  // and still follows the arrow.
+  const bonded = molecule.bonds.some((bond) => bond.fromAtomId === sourceAtom.id || bond.toAtomId === sourceAtom.id);
+  const direction = bonded
+    ? undefined
+    : (plan && !plan.targetAtomId ? plan.direction : undefined)
+      ?? nativeBondGrowthPlanForAtom(molecule, target.atomId, page.width, page.height)?.direction
+      ?? { x: 0, y: -1 };
+  const nativeBondLength = nativeTemplateBondLength(molecule);
+  const orientationPoint = direction
+    ? { x: sourceAtom.x + direction.x * nativeBondLength, y: sourceAtom.y + direction.y * nativeBondLength }
+    : { x: sourceAtom.x, y: sourceAtom.y };
+  const attachment = attachNativeTemplateRingToAtomOnPage(molecule, target.atomId, orientationPoint, templateId, page);
+  if (attachment.refusal) return { document, refusal: attachment.refusal };
+  const attached = attachment.molecule;
   if (!attached) {
     return {
       document,
@@ -8128,6 +8368,7 @@ export function nativeRingHotkeyFuseAtBondTarget(
   const outward = awayLength > 1e-3
     ? { x: away.x / awayLength, y: away.y / awayLength }
     : { x: normal.x / normalLength, y: normal.y / normalLength };
+  const nativeBondLength = nativeTemplateBondLength(molecule);
   const orientationPoint = {
     x: midpoint.x + outward.x * nativeBondLength,
     y: midpoint.y + outward.y * nativeBondLength
@@ -8896,20 +9137,272 @@ export function applyNativeMoleculeBondOrderValueTarget(
     return document;
   }
 
-  if (order === bond.order || !canSetNativeBondOrder(molecule, bond, order)) {
+  if ((order === bond.order && bond.stereo !== "either") || !canSetNativeBondOrder(molecule, bond, order)) {
     return document;
   }
 
   const bonds = molecule.bonds.map((candidate) =>
-    candidate.id === bond.id ? nativeBondWithOrderAndDisplay(molecule, candidate, order) : candidate
+    candidate.id === bond.id ? nativeBondWithOrderAndDisplay(molecule, withoutDoubleBondStereo(candidate), order) : candidate
   );
-  const nextMolecule = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  const refreshed = refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  const nextMolecule = bond.stereo === "either" ? withStoredBondStereoMolfile(refreshed) : refreshed;
 
   return applyPatch(
     document,
     { op: "updateObject", objectId: molecule.id, changes: nextMolecule },
     { now: phase4Timestamp }
   );
+}
+
+/**
+ * Why {@link applyNativeMoleculeBondOrderValueTarget} would leave the document alone, as a
+ * status-line sentence; undefined when it would change the bond.
+ */
+export function nativeBondOrderTargetRefusal(
+  document: ChemDraftDocument,
+  target: NativeBondOrderTarget,
+  order: NativeBondOrderValue
+): string | undefined {
+  const molecule = firstPage(document).objects.find((object): object is MoleculeObject =>
+    object.id === target.objectId && object.type === "molecule"
+  );
+  const bond = molecule?.bonds.find((candidate) => candidate.id === target.bondId);
+  if (!molecule || !bond) return "Bond order not changed: the bond no longer exists";
+  if (!isEditableNativeMoleculeGraph(molecule)) {
+    return "Bond order not changed: this molecule cannot be edited as a native graph";
+  }
+  if (order === bond.order && bond.stereo !== "either") return `Bond is already ${order}`;
+  const reason = nativeBondOrderRefusalReason(molecule, bond, order);
+  return reason ? `Bond order not changed: ${reason}` : undefined;
+}
+
+export type BondStereoValue = "either" | "geometry" | "flipped";
+export interface BondStereoAvailability {
+  eitherDisabledReason?: string;
+  geometryDisabledReason?: string;
+  descriptor?: "E" | "Z";
+  value?: BondStereoValue;
+}
+
+function withoutDoubleBondStereo(bond: MoleculeBond): MoleculeBond {
+  const { stereo: _stereo, ...rest } = bond;
+  return rest;
+}
+
+const atomMappedBondStereoDisabledReason = "Atom mapping must be removed before changing E/Z";
+
+/** Atom maps exist only in the source structure, not in the native atom model. */
+function bondStereoSourceHasAtomMapping(molecule: MoleculeObject): boolean {
+  if (molecule.structureFormat === "smiles") return /\[[^\]]*:\d+\]/.test(molecule.structure);
+  if (molecule.structureFormat === "molfile-v3000") {
+    if (/\bAAMAP\s*=\s*[1-9]\d*\b/.test(molecule.structure)) return true;
+    // Standard V3000 also has a positional atom-map field after x/y/z.
+    const atomBlock = molecule.structure.split("M  V30 BEGIN ATOM")[1]?.split("M  V30 END ATOM")[0];
+    return atomBlock?.split(/\r?\n/).some(line => {
+      const fields = line.trim().split(/\s+/);
+      return fields[0] === "M" && fields[1] === "V30" && Number(fields[7]) > 0;
+    }) ?? false;
+  }
+  const source = molecule.structure.split(/\r?\n/);
+  const counts = source.findIndex(line => line.includes("V2000"));
+  return counts >= 0 && source.slice(counts + 1, counts + 1 + Number(source[counts].slice(0, 3)))
+    .some(line => Number(line.slice(60, 63)) > 0);
+}
+
+function withStoredBondStereoMolfile(molecule: MoleculeObject): MoleculeObject {
+  if (bondStereoSourceHasAtomMapping(molecule)) throw new Error(atomMappedBondStereoDisabledReason);
+  const { molecule: expanded, expansions, placeholderAtoms } = expandNativeMoleculeLabelGroups(molecule);
+  const molfile = moleculeToMolfileV2000(expanded, {
+    fromDocFrame: true, unknownBondOrders: "refuse",
+    abbreviations: "rgroup", superatomGroups: expansions, placeholderAtoms,
+    kekuleBondOrders: nativeBondOrderResolution(expanded.atoms, expanded.bonds).kekuleOrders
+  });
+  if (molfile.warnings.length) throw new Error(`Cannot preserve chemistry while changing E/Z: ${molfile.warnings.join("; ")}`);
+  return { ...molecule, structureFormat: "molfile-v2000", structure: preserveBondStereoSourceProperties(molecule, molfile.contents) };
+}
+
+class BondStereoAtomMappingError extends Error {}
+
+/** Isotopes are regenerated from native atoms (including D/T). Check normalized identities
+ * before retaining source-only radicals; never copy isotope records over the writer's output. */
+function preserveBondStereoSourceProperties(molecule: MoleculeObject, contents: string): string {
+  const source = molecule.structure.split(/\r?\nM  END/)[0].split(/\r?\n/);
+  const sourceCounts = source.findIndex(line => line.includes("V2000"));
+  if (sourceCounts < 0) return contents;
+  const atomCount = Number(source[sourceCounts].slice(0, 3));
+  const originalAtoms = source.slice(sourceCounts + 1, sourceCounts + 1 + atomCount);
+  const radicals = source.filter(line => line.startsWith("M  RAD"));
+  const radicalAtoms = originalAtoms.flatMap((line, i) => Number(line.slice(36, 39)) === 4 ? [i + 1] : []);
+  // Only source properties need an index mapping; native isotopes (including D/T)
+  // are already in contents, even when label expansion changes the atom count.
+  if (!source.some(line => line.startsWith("M  ISO")) && !radicals.length && !radicalAtoms.length &&
+    !originalAtoms.some(line => Number(line.slice(34, 36)))) return contents;
+  const next = contents.split("\n");
+  const counts = next.findIndex(line => line.includes("V2000"));
+  if (counts < 0 || Number(next[counts].slice(0, 3)) !== atomCount) {
+    throw new Error("Cannot preserve isotope/radical atom mapping while changing double-bond geometry");
+  }
+  // The shared MOL parser normalizes H + M ISO 2/3 to D/T and resolves atom-block
+  // mass differences. Raw element columns would mistake that normalization for a remap.
+  const original = parseMolfileGraph(molecule.structure);
+  const regenerated = parseMolfileGraph(contents);
+  if (original.warnings.some(warning => warning.code === "clipboard.isotope_default_mass_unknown")) {
+    throw new BondStereoAtomMappingError("Cannot preserve isotope/radical atom mapping: source isotope mass is unknown");
+  }
+  original.atoms.forEach((atom, i) => {
+    const generated = regenerated.atoms[i];
+    if (atom.element !== generated.element || atom.isotope !== generated.isotope) {
+      const identity = (value: { element: string; isotope?: number }) => `${value.isotope ?? ""}${value.element}`;
+      throw new BondStereoAtomMappingError(
+        `Cannot preserve isotope/radical atom mapping while changing double-bond geometry: atom ${i + 1} ` +
+        `is ${identity(atom)} in the source but ${identity(generated)} in the regenerated structure`
+      );
+    }
+  });
+  const sourceRadicals = new Map(radicalAtoms.map(index => [index, 2]));
+  for (const line of radicals) {
+    const fields = line.trim().split(/\s+/).slice(3).map(Number);
+    for (let i = 0; i < fields.length; i += 2) sourceRadicals.set(fields[i], fields[i + 1]);
+  }
+  // A native radical annotation wins for that atom. A generated M RAD line for
+  // some other atom must not discard all the source-only radicals in the molecule.
+  const retainedRadicals = [...sourceRadicals].filter(([index]) => molecule.atoms[index - 1]?.markRadicals === undefined)
+    .map(([index, code]) => `M  RAD  1${String(index).padStart(4)}${String(code).padStart(4)}`);
+  next.splice(next.findIndex(line => line.startsWith("M  END")), 0, ...retainedRadicals);
+  return next.join("\n");
+}
+
+/** Engine perception is injected; clearing the open marker asks OCL about drawn geometry. */
+export function nativeBondStereoAvailability(
+  document: ChemDraftDocument, targets: readonly { objectId: string; bondId: string }[],
+  reader?: DoubleBondStereoReader
+): BondStereoAvailability {
+  const disabled = (reason: string): BondStereoAvailability => ({ eitherDisabledReason: reason, geometryDisabledReason: reason });
+  if (targets.length !== 1) return disabled("Select one double bond");
+  const target = targets[0];
+  const molecule = firstPage(document).objects.find((o): o is MoleculeObject => o.type === "molecule" && o.id === target.objectId);
+  const bond = molecule?.bonds.find(b => b.id === target.bondId);
+  if (!molecule || !bond || bond.order !== "double") return disabled("E/Z requires a double bond");
+  if (bondStereoSourceHasAtomMapping(molecule)) return disabled(atomMappedBondStereoDisabledReason);
+  if ((molecule.structureFormat === "smiles" && /\[\d+/.test(molecule.structure)) ||
+    (molecule.structureFormat === "molfile-v3000" && /\b(?:MASS|RAD)=/.test(molecule.structure))) {
+    return disabled("Retained isotope/radical data requires a V2000 molfile before changing E/Z");
+  }
+  const alreadyUnspecified = bond.stereo === "either";
+  const eitherReason = (reason: string) => alreadyUnspecified ? "E/Z is already unspecified" : reason;
+  if (molecule.bonds.some(b => b.order === "unknown")) return { ...disabled("Resolve unknown bond orders before changing E/Z"), eitherDisabledReason: eitherReason("Resolve unknown bond orders before changing E/Z") };
+  const unmarked = { ...molecule, bonds: molecule.bonds.map(b => b.id === bond.id ? withoutDoubleBondStereo(b) : b) };
+  let geometryStructure: string;
+  try {
+    geometryStructure = withStoredBondStereoMolfile(unmarked).structure;
+  } catch (error) {
+    // Both choices rebuild this molfile. A source-only property without a safe
+    // atom mapping must disable both, including clearing an existing open marker.
+    return disabled(error instanceof BondStereoAtomMappingError ? error.message : "Cannot preserve all stored properties while changing E/Z");
+  }
+  const state: BondStereoAvailability = { value: alreadyUnspecified ? "either" : "geometry", ...(alreadyUnspecified ? { eitherDisabledReason: "E/Z is already unspecified" } : {}) };
+  if ([bond.fromAtomId, bond.toAtomId].some(id => molecule.atoms.find(a => a.id === id)?.element !== "C")) {
+    return { ...state, eitherDisabledReason: eitherReason("E/Z unspecified requires a stereogenic carbon–carbon double bond") };
+  }
+  if (nativeMoleculeRings(molecule).some(ring => ring.atomIds.length < 8 && ring.bondIds.includes(bond.id))) {
+    return { ...state, eitherDisabledReason: eitherReason("This double bond is not stereogenic (small ring)") };
+  }
+  if (!reader) return { ...state, eitherDisabledReason: eitherReason("E/Z perception is still loading") };
+  try {
+    const from = molecule.atoms.findIndex(a => a.id === bond.fromAtomId);
+    const to = molecule.atoms.findIndex(a => a.id === bond.toAtomId);
+    // Expand real label groups before CIP perception: Me and a drawn methyl are equivalent.
+    // The shared builder appends expansion atoms, retaining the drawn endpoint indices.
+    const perceived = reader(geometryStructure).find(b =>
+      (b.from === from && b.to === to) || (b.from === to && b.to === from));
+    return perceived ? { ...state, descriptor: perceived.descriptor === "unspecified" ? undefined : perceived.descriptor }
+      : { ...state, eitherDisabledReason: eitherReason("This double bond is not stereogenic (equivalent substituents or a small ring)") };
+  } catch {
+    return { ...state, eitherDisabledReason: eitherReason("E/Z could not be perceived for this structure") };
+  }
+}
+
+/** Atoms on one end of an acyclic bond. Ring bonds cannot be reflected independently. */
+function doubleBondReflectionEnd(molecule: MoleculeObject, bond: MoleculeBond): Set<string> | undefined {
+  const component = (start: string) => {
+    const ids = new Set([start]);
+    for (const id of ids) for (const edge of molecule.bonds) {
+      if (edge.id === bond.id) continue;
+      if (edge.fromAtomId === id) ids.add(edge.toAtomId);
+      if (edge.toAtomId === id) ids.add(edge.fromAtomId);
+    }
+    return ids;
+  };
+  const from = component(bond.fromAtomId);
+  if (from.has(bond.toAtomId)) return undefined;
+  const to = component(bond.toAtomId);
+  return from.size < to.size ? from : to;
+}
+
+export function nativeBondStereoFlipDisabledReason(
+  document: ChemDraftDocument, targets: readonly { objectId: string; bondId: string }[], reader?: DoubleBondStereoReader
+): string | undefined {
+  const state = nativeBondStereoAvailability(document, targets, reader);
+  if (state.geometryDisabledReason) return state.geometryDisabledReason;
+  if (!state.descriptor) return "A stereogenic double bond with drawn E/Z geometry is required";
+  const molecule = firstPage(document).objects.find((o): o is MoleculeObject => o.type === "molecule" && o.id === targets[0].objectId)!;
+  const bond = molecule.bonds.find(b => b.id === targets[0].bondId)!;
+  if (!doubleBondReflectionEnd(molecule, bond)) return "Ring geometry cannot be flipped independently";
+  const from = molecule.atoms.find(a => a.id === bond.fromAtomId)!;
+  const to = molecule.atoms.find(a => a.id === bond.toAtomId)!;
+  if (Math.hypot(to.x - from.x, to.y - from.y) < 0.001) return "Draw a nonzero double bond before flipping geometry";
+  return undefined;
+}
+
+function applyFlippedMoleculeBondStereo(
+  document: ChemDraftDocument, targets: readonly { objectId: string; bondId: string }[], reader?: DoubleBondStereoReader
+): ChemDraftDocument {
+  if (nativeBondStereoFlipDisabledReason(document, targets, reader)) return document;
+  const target = targets[0];
+  const page = firstPage(document);
+  const molecule = page.objects.find((o): o is MoleculeObject => o.type === "molecule" && o.id === target.objectId)!;
+  const bond = molecule.bonds.find(b => b.id === target.bondId)!;
+  const end = doubleBondReflectionEnd(molecule, bond)!;
+  const from = molecule.atoms.find(a => a.id === bond.fromAtomId)!;
+  const to = molecule.atoms.find(a => a.id === bond.toAtomId)!;
+  const dx = to.x - from.x, dy = to.y - from.y, squared = dx * dx + dy * dy;
+  const reflect = (point: PagePoint): PagePoint => {
+    const projection = ((point.x - from.x) * dx + (point.y - from.y) * dy) / squared;
+    return { x: 2 * (from.x + projection * dx) - point.x, y: 2 * (from.y + projection * dy) - point.y };
+  };
+  const atoms = molecule.atoms.map(atom => end.has(atom.id) ? { ...atom, ...reflect(atom) } : atom);
+  const bonds = molecule.bonds.map(edge => {
+    if (edge.id === bond.id) return withoutDoubleBondStereo(edge);
+    // Reflection reverses the drawing plane: swap wedges/hashes on the reflected end
+    // to retain tetrahedral stereo. Other double bonds have both ends reflected.
+    const style = edge.display?.bondStyle;
+    return end.has(edge.fromAtomId) && end.has(edge.toAtomId) && (style === "wedge" || style === "hashed")
+      ? { ...edge, display: { ...edge.display, bondStyle: style === "wedge" ? "hashed" as const : "wedge" as const } } : edge;
+  });
+  const changes = withStoredBondStereoMolfile(normalizeNativeMoleculeGeometry({ ...molecule, atoms, bonds }));
+  return applyPatches(document, [
+    { op: "updateObject", objectId: molecule.id, changes },
+    ...anchoredElectronMarkTransformPatches(page.objects, molecule.id, end, reflect, {
+      reflectionAxisDegrees: radiansToDegrees(Math.atan2(dy, dx))
+    })
+  ], { now: phase4Timestamp });
+}
+
+/** One graph patch; callers record one labelled history entry and retain their part selection. */
+export function applyMoleculeBondStereo(
+  document: ChemDraftDocument, targets: readonly { objectId: string; bondId: string }[],
+  value: BondStereoValue, reader?: DoubleBondStereoReader
+): ChemDraftDocument {
+  if (value === "flipped") return applyFlippedMoleculeBondStereo(document, targets, reader);
+  const state = nativeBondStereoAvailability(document, targets, reader);
+  if (value === "either" ? state.eitherDisabledReason : state.geometryDisabledReason) return document;
+  const target = targets[0];
+  const molecule = firstPage(document).objects.find((o): o is MoleculeObject => o.type === "molecule" && o.id === target.objectId)!;
+  const bond = molecule.bonds.find(b => b.id === target.bondId)!;
+  if ((bond.stereo === "either") === (value === "either")) return document;
+  const bonds = molecule.bonds.map(b => b.id === bond.id ? value === "either" ? { ...b, stereo: "either" as const } : withoutDoubleBondStereo(b) : b);
+  const changes = withStoredBondStereoMolfile({ ...molecule, bonds });
+  return applyPatch(document, { op: "updateObject", objectId: molecule.id, changes }, { now: phase4Timestamp });
 }
 
 /** Display-only edit: retain chemistry, coordinates, and the current selection. */
@@ -9157,6 +9650,7 @@ export function applyNativeAtomElementTarget(
   if (!atom || normalizedElement.length === 0) {
     return document;
   }
+  if (atomLabelIsotopeRefusal(atom, normalizedElement, molecule, literal)) return document;
 
   const restoredSide = options.labelBondSide;
   if (
@@ -9262,7 +9756,7 @@ export function commitNativeAtomLabelTarget(
   target: NativeMoleculeDeleteTarget,
   label: string,
   options: { literal?: boolean; beforeAtom?: MoleculeAtom; beforeMolecule?: MoleculeObject } = {}
-): { document: ChemDraftDocument; target: NativeMoleculeDeleteTarget; message?: string } {
+): { document: ChemDraftDocument; target: NativeMoleculeDeleteTarget; message?: string; refusal?: string } {
   const page = firstPage(document);
   const molecule = page.objects.find((object): object is MoleculeObject => object.id === target.objectId && object.type === "molecule");
   const atom = target.kind === "atom" ? molecule?.atoms.find(a => a.id === target.atomId) : undefined;
@@ -9271,11 +9765,16 @@ export function commitNativeAtomLabelTarget(
   const beforeMolecule = options.beforeMolecule ?? molecule;
   const normalized = normalizeNativeAtomElementLabel(label);
   const decision = labelOnBondedAtom(normalized, beforeAtom, beforeMolecule);
-  const relabel = () => applyNativeAtomElementTarget(document, target, label, options);
-  if (decision.kind !== "substituent") return {
-    document: relabel(), target,
-    ...(decision.reason === "source-valence" ? { message: `Relabeled ${normalized}: the original ${beforeAtom.element} atom cannot take another bond` } : {})
+  const relabel = (reason?: string) => {
+    const refusal = atomLabelIsotopeRefusal(beforeAtom, normalized, beforeMolecule, options.literal === true);
+    if (refusal) return { document, target, message: refusal, refusal };
+    return {
+      document: applyNativeAtomElementTarget(document, target, label, options), target,
+      ...(reason ? { message: `Relabeled ${normalized}: ${reason}` } : {})
+    };
   };
+  if (decision.kind !== "substituent") return relabel(decision.reason === "source-valence"
+    ? `the original ${beforeAtom.element} atom cannot take another bond` : undefined);
   const atoms = molecule.atoms.map(a => a.id === atom.id ? { ...beforeAtom, x: a.x, y: a.y } : a);
   const source = atoms.find(a => a.id === atom.id)!;
   const style = nativeDrawingStyleFromObjectStyle(molecule.style);
@@ -9287,7 +9786,7 @@ export function commitNativeAtomLabelTarget(
   });
   const pageMolecules = page.objects.filter((o): o is MoleculeObject => o.type === "molecule");
   if (!placement || pageMolecules.some(m => m.atoms.some(a => Math.hypot(a.x - placement.newAtomPoint.x, a.y - placement.newAtomPoint.y) < style.bondLengthPx * 0.5))) {
-    return { document: relabel(), target, message: `Relabeled ${normalized}: no clear substituent position on the page` };
+    return relabel("no clear substituent position on the page");
   }
   // The substituent keeps the reading the user typed — the label as written, bond on its left — on
   // whichever side the open position puts its bond: a cyano label ("CN", "SCN") placed to the
@@ -9317,7 +9816,7 @@ export function commitNativeAtomLabelTarget(
   const nextMolecule = refreshNativeSingleBondGraph({ ...molecule, style: nextStyle }, [...atoms, newAtom], [...molecule.bonds, bond]);
   const declined = substituentLosesTypedReading(nextMolecule, newAtom.id, source, decision);
   if (declined) {
-    return { document: relabel(), target, message: `Relabeled ${normalized}: ${declined}` };
+    return relabel(declined);
   }
   return {
     document: applyPatch(document, { op: "updateObject", objectId: molecule.id, changes: nextMolecule }, { now: phase4Timestamp }),
@@ -9370,46 +9869,136 @@ export function previewNativeMoleculeBondGrowth(
     return undefined;
   }
 
-  const drawingStyle = nativeDrawingStyleFromObjectStyle(molecule.style);
-  const extension = planBondExtension({
-    atoms: molecule.atoms,
-    bonds: molecule.bonds,
-    clickPoint: point,
-    bondLength: drawingStyle.bondLengthPx,
-    hitRadius: atomHitRadius,
-    maxBondsPerAtom: nativeAtomInvalidGrowthLimit,
-    targetBondAngleDegrees: drawingStyle.chainAngleDegrees,
-    preferredAtomId: atomHit.atomId,
-    pageBounds: { x: 0, y: 0, width: pageWidth, height: pageHeight },
-    objectBounds: {
-      x: molecule.x,
-      y: molecule.y,
-      width: molecule.width,
-      height: molecule.height
-    }
+  const pageBounds = { x: 0, y: 0, width: pageWidth, height: pageHeight };
+  const extension = connectableNativeBondGrowthPlan(molecule, point, atomHit.atomId, pageBounds, {
+    x: molecule.x,
+    y: molecule.y,
+    width: molecule.width,
+    height: molecule.height
   });
-
   if (!extension) {
     return undefined;
   }
-  if (extension.targetAtomId && !canConnectNativeAtoms(molecule, extension.sourceAtomId, extension.targetAtomId)) {
-    return undefined;
-  }
 
+  const direction = nativeBondGrowthPlacedDirection(molecule, extension);
   return {
     atomId: extension.sourceAtomId,
     targetAtomId: extension.targetAtomId,
-    direction: extension.direction,
-    candidateDirections: nativeBondGrowthCandidateDirections(
-      molecule,
-      extension.sourceAtomId,
-      extension.direction,
-      drawingStyle.chainAngleDegrees
-    ),
+    direction,
+    candidateDirections: nativeBondGrowthPlacedCandidateDirections(molecule, extension.sourceAtomId, direction, pageBounds),
     newAtomPoint: extension.newAtomPoint,
     distanceToPointer: extension.distanceToClick,
     availableBonds: atomHit.availableBonds
   };
+}
+
+/** `planBondExtension` with the molecule's own style, declining a plan that closes onto an atom it cannot bond to. */
+function connectableNativeBondGrowthPlan(
+  molecule: MoleculeObject,
+  clickPoint: PagePoint,
+  preferredAtomId: string,
+  pageBounds: { x: number; y: number; width: number; height: number },
+  objectBounds?: { x: number; y: number; width: number; height: number }
+): ReturnType<typeof planBondExtension> {
+  const drawingStyle = nativeDrawingStyleFromObjectStyle(molecule.style);
+  const extension = planBondExtension({
+    atoms: molecule.atoms,
+    bonds: molecule.bonds,
+    clickPoint,
+    bondLength: drawingStyle.bondLengthPx,
+    hitRadius: atomHitRadius,
+    maxBondsPerAtom: nativeAtomInvalidGrowthLimit,
+    targetBondAngleDegrees: drawingStyle.chainAngleDegrees,
+    preferredAtomId,
+    pageBounds,
+    ...(objectBounds ? { objectBounds } : {})
+  });
+  if (extension?.targetAtomId && !canConnectNativeAtoms(molecule, extension.sourceAtomId, extension.targetAtomId)) {
+    return undefined;
+  }
+  return extension;
+}
+
+/**
+ * The unit direction of the bond a plan actually draws: from the source atom to where the new atom
+ * lands after the page clamp (or to the atom it closes onto). At a page edge the clamp turns the
+ * planned direction, and the growth arrow must show the turned one.
+ */
+function nativeBondGrowthPlacedDirection(
+  molecule: MoleculeObject,
+  extension: NonNullable<ReturnType<typeof planBondExtension>>
+): PagePoint {
+  const source = molecule.atoms.find((atom) => atom.id === extension.sourceAtomId);
+  const length = source ? distance(source, extension.newAtomPoint) : 0;
+  return source && length > 1e-9
+    ? { x: (extension.newAtomPoint.x - source.x) / length, y: (extension.newAtomPoint.y - source.y) / length }
+    : extension.direction;
+}
+
+/**
+ * The growth arrow's options, `selectedDirection` first: each alternate the arrow offers is a
+ * direction `planBondExtension` really places when steered toward it, so at the page edge an
+ * option the clamp would cut short (the straight-through aim off an sp end) shows as the
+ * direction the bond takes instead, never as an arrow off the page.
+ */
+function nativeBondGrowthPlacedCandidateDirections(
+  molecule: MoleculeObject,
+  atomId: string,
+  selectedDirection: PagePoint,
+  pageBounds: { x: number; y: number; width: number; height: number }
+): PagePoint[] {
+  const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
+  if (!atom) {
+    return [selectedDirection];
+  }
+  const chainAngleDegrees = nativeDrawingStyleFromObjectStyle(molecule.style).chainAngleDegrees;
+  const growthAngleDegrees = bondGrowthAngleDegrees(atomId, molecule.bonds, chainAngleDegrees);
+  const steeringDirections = [
+    ...nativeBondGrowthCandidateDirections(molecule, atomId, selectedDirection, growthAngleDegrees),
+    ...(growthAngleDegrees === chainAngleDegrees
+      ? []
+      : nativeBondGrowthCandidateDirections(molecule, atomId, selectedDirection, chainAngleDegrees))
+  ];
+  const steeringOffset = atomHitRadius / 2;
+  const placed = steeringDirections.flatMap((steer) => {
+    const plan = connectableNativeBondGrowthPlan(
+      molecule,
+      { x: atom.x + steer.x * steeringOffset, y: atom.y + steer.y * steeringOffset },
+      atomId,
+      pageBounds
+    );
+    return plan && plan.sourceAtomId === atomId ? [nativeBondGrowthPlacedDirection(molecule, plan)] : [];
+  });
+  return [selectedDirection, ...placed].reduce<PagePoint[]>((unique, direction) => {
+    if (!unique.some((existing) => Math.hypot(existing.x - direction.x, existing.y - direction.y) < 0.01)) {
+      unique.push(direction);
+    }
+    return unique;
+  }, []);
+}
+
+/**
+ * Whether only the page edge keeps `atomId` from growing a bond: the atom can take one, the planner
+ * finds no usable direction on the page, and it finds one once the page is lifted. Diagnostics
+ * only; the planner alone decides where a bond goes.
+ */
+function nativeBondGrowthBlockedByPageEdge(
+  molecule: MoleculeObject,
+  atomId: string,
+  clickPoint: PagePoint,
+  pageWidth: number,
+  pageHeight: number
+): boolean {
+  if (!isEditableNativeMoleculeGraph(molecule) || !canGrowNativeAtom(molecule, atomId)) {
+    return false;
+  }
+  if (connectableNativeBondGrowthPlan(molecule, clickPoint, atomId, { x: 0, y: 0, width: pageWidth, height: pageHeight })) {
+    return false;
+  }
+  const margin = nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx * 4;
+  return connectableNativeBondGrowthPlan(molecule, clickPoint, atomId, {
+    x: -margin, y: -margin, width: pageWidth + margin * 2, height: pageHeight + margin * 2
+  }) !== undefined;
 }
 
 function nativeBondGrowthCandidateDirections(
@@ -9476,6 +10065,27 @@ function largestOpenAngle(angles: readonly number[]): number | undefined {
   return gaps.sort((left, right) => right.gap - left.gap || left.midpoint - right.midpoint)[0]?.midpoint;
 }
 
+/**
+ * The aim of a bond dragged off `sourceAtom`. Off an sp end (a triple bond, or two double bonds) it
+ * stays collinear with the existing bond; elsewhere it rides the absolute 15° placement grid.
+ * Alt/Option frees the angle in both cases; `undefined` leaves the legacy unaimed behaviour.
+ */
+function freeformBondGrowthDirectionDegrees(
+  molecule: MoleculeObject,
+  sourceAtom: PagePoint & { id: string },
+  point: PagePoint,
+  placementAltKey: boolean | undefined
+): number | undefined {
+  if (placementAltKey === undefined) {
+    return undefined;
+  }
+  const aim = placementAimDegrees(sourceAtom, point);
+  if (placementAltKey) {
+    return aim;
+  }
+  return linearBondGrowthAimDegrees(sourceAtom.id, molecule.atoms, molecule.bonds) ?? snapPlacementDegrees(aim);
+}
+
 export function previewNativeMoleculeFreeformBondGrowth(
   molecule: MoleculeObject,
   sourceAtomId: string,
@@ -9483,6 +10093,18 @@ export function previewNativeMoleculeFreeformBondGrowth(
   pageWidth: number,
   pageHeight: number,
   options: NativeFreeformBondGrowthOptions = {}
+): NativeFreeformBondGrowthPreview | undefined {
+  return previewNativeMoleculeFreeformBondGrowthInBounds(
+    molecule, sourceAtomId, point, { x: 0, y: 0, width: pageWidth, height: pageHeight }, options
+  );
+}
+
+function previewNativeMoleculeFreeformBondGrowthInBounds(
+  molecule: MoleculeObject,
+  sourceAtomId: string,
+  point: PagePoint,
+  pageBounds: { x: number; y: number; width: number; height: number },
+  options: NativeFreeformBondGrowthOptions
 ): NativeFreeformBondGrowthPreview | undefined {
   if (!isEditableNativeMoleculeGraph(molecule)) {
     return undefined;
@@ -9505,15 +10127,15 @@ export function previewNativeMoleculeFreeformBondGrowth(
     sourceAtomId,
     endPoint: point,
     bondLength: drawingStyle.bondLengthPx,
-    pageBounds: { x: 0, y: 0, width: pageWidth, height: pageHeight },
+    pageBounds,
     maxBondsPerAtom: nativeAtomInvalidGrowthLimit,
     minimumBondLength: freeformMinimumBondLength,
     customLengthBreakawayDistance: freeformCustomLengthBreakawayDistance,
     forceCustomLength: options.forceCustomLength,
-    directionDegrees: options.placementAltKey === undefined
-      ? undefined
-      : snapPlacementDegrees(placementAimDegrees(sourceAtom, point), options.placementAltKey),
-    snapHitRadius: atomHitRadius
+    directionDegrees: freeformBondGrowthDirectionDegrees(molecule, sourceAtom, point, options.placementAltKey),
+    freeAngle: options.placementAltKey === true,
+    snapHitRadius: atomHitRadius,
+    targetBondAngleDegrees: drawingStyle.chainAngleDegrees
   });
   if (!extension) {
     return undefined;
@@ -12656,6 +13278,15 @@ export function tiltNativeMoleculeObjectsProjectedPlane(
   return params.result(applyPatches(document, patches, { now: phase4Timestamp }), true);
 }
 
+/** Record the resized geometry's growth length without scaling strokes or typography. */
+function withMeasuredNativeMoleculeBondLength(molecule: MoleculeObject): MoleculeObject {
+  const bondLengthPx = representativeMoleculeBondLength(molecule);
+  return bondLengthPx === undefined ? molecule : {
+    ...molecule,
+    style: { ...molecule.style, bondLengthPx }
+  };
+}
+
 export function resizeNativeMoleculeParts(
   document: ChemDraftDocument,
   target: NativeMoleculePartMoveTarget,
@@ -12682,7 +13313,7 @@ export function resizeNativeMoleculeParts(
   }
 
   const center = objectCenter(bounds);
-  const resized = normalizeNativeMoleculeGeometry({
+  const resized = withMeasuredNativeMoleculeBondLength(normalizeNativeMoleculeGeometry({
     ...molecule,
     atoms: molecule.atoms.map((atom) => targetAtomIds.has(atom.id)
       ? {
@@ -12691,7 +13322,7 @@ export function resizeNativeMoleculeParts(
           y: center.y + (atom.y - center.y) * scaleY
         }
       : atom)
-  });
+  }));
 
   return applyPatch(
     document,
@@ -12719,7 +13350,7 @@ export function resizeNativeMoleculeObject(
 
   const center = objectCenter(molecule);
   const transform = nativeMoleculeTransformState(molecule);
-  const resized = withNativeMoleculeTransform(normalizeNativeMoleculeGeometry({
+  const resized = withMeasuredNativeMoleculeBondLength(withNativeMoleculeTransform(normalizeNativeMoleculeGeometry({
     ...molecule,
     atoms: molecule.atoms.map((atom) => ({
       ...atom,
@@ -12730,7 +13361,7 @@ export function resizeNativeMoleculeObject(
     ...transform,
     scaleX: transform.scaleX * scaleX,
     scaleY: transform.scaleY * scaleY
-  });
+  }));
 
   return applyPatch(
     document,
@@ -12783,6 +13414,9 @@ export function documentObjectInteractionBounds(
   object: DocumentObject,
   objects: readonly DocumentObject[]
 ): ObjectBounds {
+  if (object.type === "table") {
+    return tableVisualBoundsForArrangement(object);
+  }
   if (object.type === "mechanism-arrow") {
     let snapshot = mechanismBoundsSnapshots.get(objects);
     if (!snapshot) {
@@ -13372,7 +14006,7 @@ function anchoredElectronMarkTransformPatches(
   moleculeId: string,
   atomIds: ReadonlySet<string>,
   transformPoint: (point: PagePoint) => PagePoint,
-  frame: { rotationDeltaDegrees?: number; scaleX?: number; scaleY?: number; flipAxis?: DocumentFlipAxis } = {}
+  frame: { rotationDeltaDegrees?: number; scaleX?: number; scaleY?: number; flipAxis?: DocumentFlipAxis; reflectionAxisDegrees?: number } = {}
 ): DocumentPatch[] {
   const scaleX = frame.scaleX ?? 1;
   const scaleY = frame.scaleY ?? 1;
@@ -13388,7 +14022,11 @@ function anchoredElectronMarkTransformPatches(
       changes.width = nextWidth;
       changes.height = nextHeight;
     }
-    if (frame.flipAxis !== undefined) {
+    if (frame.reflectionAxisDegrees !== undefined) {
+      // Angles run clockwise in the y-down canvas: reflection about α maps θ to 2α−θ.
+      // A horizontal flip reverses x (α=90°); a vertical flip reverses y (α=0°).
+      changes.rotation = normalizeDegrees(2 * frame.reflectionAxisDegrees - mark.rotation);
+    } else if (frame.flipAxis !== undefined) {
       // The mirror of a glyph at angle θ sits at 180−θ (horizontal axis) or −θ (vertical) — the
       // same rule flipOtherObjectAroundPointPatches applies to a directly-flipped mark.
       changes.rotation = normalizeDegrees(frame.flipAxis === "horizontal" ? 180 - mark.rotation : -mark.rotation);
@@ -13488,6 +14126,21 @@ export function moveDocumentObjects(
       : []
   );
   return patches.length > 0 ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
+}
+
+/** Translate precisely the new objects in a plugin insertion. Unlike selection dragging,
+ * never expand groups/anchors into pre-existing objects outside the write's scope. */
+export function translateInsertedDocumentObjects(
+  document: ChemDraftDocument, ids: readonly string[], dx: number, dy: number
+): ChemDraftDocument {
+  const inserted = new Set(ids);
+  const patches = document.pages.flatMap(page => page.objects.flatMap(object => inserted.has(object.id)
+    ? translateDocumentObjectByPatches(document, object.id, dx, dy, {
+      translateAnchoredGeometry: groupMoveTranslatesArrowGeometry(object, inserted),
+      preserveChargeAnchor: object.type === "electron-mark" && object.anchor.kind === "atom" &&
+        object.anchor.objectId !== undefined && inserted.has(object.anchor.objectId)
+    }) : []));
+  return patches.length ? applyPatches(document, patches, { now: phase4Timestamp }) : document;
 }
 
 export type DocumentAlignMode = "left" | "center" | "right" | "top" | "middle" | "bottom";
@@ -14547,7 +15200,7 @@ function scaleNativeMoleculeObjectAroundPointPatches(
   }
 
   const transform = nativeMoleculeTransformState(molecule);
-  const resized = withNativeMoleculeTransform(normalizeNativeMoleculeGeometry({
+  const resized = withMeasuredNativeMoleculeBondLength(withNativeMoleculeTransform(normalizeNativeMoleculeGeometry({
     ...molecule,
     atoms: molecule.atoms.map((atom) => ({
       ...atom,
@@ -14558,7 +15211,7 @@ function scaleNativeMoleculeObjectAroundPointPatches(
     ...transform,
     scaleX: transform.scaleX * scaleX,
     scaleY: transform.scaleY * scaleY
-  });
+  }));
   const markPatches = anchoredElectronMarkTransformPatches(
     page.objects,
     molecule.id,
@@ -14598,8 +15251,9 @@ function transformOtherObjectAroundPointPatches(
   const newCenter = Math.abs(degrees) >= 0.05
     ? rotatePointAround(scaledCenter, center, degrees * Math.PI / 180)
     : scaledCenter;
-  const nextWidth = object.width * scaleX;
-  const nextHeight = object.height * scaleY;
+  const tableLayout = object.type === "table" ? planTableLayout(object) : undefined;
+  const nextWidth = tableLayout?.width ?? object.width * scaleX;
+  const nextHeight = tableLayout?.height ?? object.height * scaleY;
   const nextX = newCenter.x - nextWidth / 2;
   const nextY = newCenter.y - nextHeight / 2;
 
@@ -14989,7 +15643,8 @@ export function cleanUpNativeMolecules2d(
     // Stripped perspective depth weights are a real change even when the geometry
     // was already ideal (the changed-check below only compares atoms/transform).
     const strippedDepthWeights = molecule.bonds.some((bond) => bond.display?.depthWeight !== undefined);
-    return nativeMoleculeGeometryOrTransformChanged(molecule, cleaned) || strippedDepthWeights
+    return nativeMoleculeGeometryOrTransformChanged(molecule, cleaned) || strippedDepthWeights ||
+      molecule.style.projection !== cleaned.style.projection
       ? [{ op: "updateObject" as const, objectId: molecule.id, changes: cleaned }]
       : [];
   });
@@ -15038,6 +15693,9 @@ function skipUnknownBondStereoGuard(molecule: MoleculeObject): boolean {
  * back (atom count/element mismatch) — the caller surfaces that as a status, nothing commits.
  */
 export interface NativeEngineRelayoutOptions {
+  /** Tried in order only after the primary fails quality or identity/stereo validation.
+   * Supplying this list (even empty) enables the 2D quality gate without a style length. */
+  alternateRelayouts?: readonly NativeMoleculeRelayoutEngine[];
   /** MOL/perception warnings surfaced by the cleanup command. */
   warnings?: string[];
   /**
@@ -15055,6 +15713,231 @@ export interface NativeEngineRelayoutOptions {
    * engine's own wedge assignment is trusted as before.
    */
   perceiveStereo?: StereoPerceiver;
+}
+
+export type NativeMoleculeRelayoutEngine = (molfile: string) => PastedStructureDepiction;
+
+interface EngineRelayoutCandidate {
+  document: ChemDraftDocument;
+  quality?: LayoutQuality;
+  drawnQuality?: LayoutQuality;
+  warnings: string[];
+  placementAddsHardDefects?: boolean;
+  repairSource?: { depiction: PastedStructureDepiction; bonds: LayoutBond[];
+    labelBoxes: (points: readonly { x: number; y: number }[]) => LayoutLabelBox[] };
+}
+type EngineRelayoutAttempt = { ok: true; candidate: EngineRelayoutCandidate } | { ok: false; error: unknown };
+
+/** Only topology can exempt a repair from the drawn double-bond geometry guard.
+ * Removing the bond and finding its shortest alternate path gives the smallest ring
+ * containing that bond, including Kekulé doubles. Six alternate edges make a seven-ring;
+ * eight-rings and acyclic bonds retain the conservative guard regardless of perception. */
+function cleanupDoubleBondGeometryExemptions(molecule: MoleculeObject): ReadonlySet<string> {
+  const adjacent = new Map(molecule.atoms.map(atom => [atom.id, [] as { atom: string; bond: string }[]]));
+  for (const bond of molecule.bonds) {
+    adjacent.get(bond.fromAtomId)?.push({ atom: bond.toAtomId, bond: bond.id });
+    adjacent.get(bond.toAtomId)?.push({ atom: bond.fromAtomId, bond: bond.id });
+  }
+  const exempt = new Set<string>();
+  for (const bond of molecule.bonds) {
+    if (bond.order === "aromatic") { exempt.add(bond.id); continue; }
+    if (bond.order !== "double") continue;
+    const seen = new Set([bond.fromAtomId]);
+    const queue = [{ atom: bond.fromAtomId, distance: 0 }];
+    for (let i = 0; i < queue.length && !exempt.has(bond.id); i++) {
+      const { atom, distance } = queue[i];
+      if (distance >= 6) continue;
+      for (const edge of adjacent.get(atom) ?? []) {
+        if (edge.bond === bond.id || seen.has(edge.atom)) continue;
+        if (edge.atom === bond.toAtomId) { exempt.add(bond.id); break; }
+        seen.add(edge.atom);
+        queue.push({ atom: edge.atom, distance: distance + 1 });
+      }
+    }
+  }
+  return exempt;
+}
+
+/** Avoid replacing an ordinary drawing for a negligible soft-geometry improvement. */
+export const MIN_CLEANUP_SOFT_SCORE_IMPROVEMENT = 0.05;
+
+export function cleanUpStructureStatus(
+  document: ChemDraftDocument, objectIds: readonly string[], changed: boolean, warnings: readonly string[] = []
+): string {
+  const label = objectIds.length === 1 ? "structure" : "structures";
+  const defective = objectIds.map(id => {
+    const molecule = findMoleculeObject(document, id);
+    return molecule ? nativeMoleculeLayoutQuality(molecule) : undefined;
+  }).find(quality => quality && layoutAtomAndLabelDefects(quality) > 0);
+  const overlap = defective?.overlappingAtoms.length ? "overlapping atoms"
+    : defective?.atomBondOverlaps.length ? "atoms overlapping bonds"
+    : defective?.collinearBondOverlaps.length ? "overlapping bonds" : "overlapping atom labels";
+  const status = changed ? `Cleaned up selected ${label}` : defective
+    ? `Clean Up couldn't fix the selected ${label}: the drawing still has ${overlap}.`
+    : `Selected ${label} already clean`;
+  const details = [...new Set(warnings)].filter(warning => warning !== status);
+  return status + (details.length ? ` — ${details.join(" ")}` : "");
+}
+
+function evaluateEngineRelayoutCandidate(
+  document: ChemDraftDocument, objectId: string, relayout: NativeMoleculeRelayoutEngine,
+  options: NativeEngineRelayoutOptions, conventionalOrientation = false
+): EngineRelayoutAttempt {
+  // Failed or rejected candidates must not leak their warnings into the committed result.
+  const warnings: string[] = [];
+  let quality: LayoutQuality | undefined;
+  let drawnQuality: LayoutQuality | undefined;
+  let repairSource: EngineRelayoutCandidate["repairSource"];
+  let placementAddsHardDefects = false;
+  try {
+    const next = buildNativeMoleculeEngineRelayout(document, objectId, relayout, { ...options, warnings }, (generated, drawn, depiction, bonds, placementDefect, labelBoxes) => {
+      placementAddsHardDefects = placementDefect;
+      quality = generated;
+      drawnQuality = drawn;
+      repairSource = { depiction, bonds, labelBoxes };
+    }, conventionalOrientation);
+    return { ok: true, candidate: { document: next, quality, drawnQuality, warnings, repairSource, placementAddsHardDefects } };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+function chooseEngineRelayout(
+  document: ChemDraftDocument, objectId: string, primary: EngineRelayoutAttempt,
+  alternates: readonly NativeMoleculeRelayoutEngine[], options: NativeEngineRelayoutOptions
+): ChemDraftDocument {
+  const finish = (candidate: EngineRelayoutCandidate) => {
+    options.warnings?.push(...candidate.warnings);
+    return candidate.document;
+  };
+  if (primary.ok && (!primary.candidate.quality || primary.candidate.quality.passes)) return finish(primary.candidate);
+  let best = primary.ok ? primary.candidate : undefined;
+  const candidates = primary.ok ? [primary.candidate] : [];
+  let bestRelaxed = primary.ok && primary.candidate.quality?.passesRelaxed ? primary.candidate : undefined;
+  for (const alternate of alternates) {
+    const attempt = evaluateEngineRelayoutCandidate(document, objectId, alternate, options, true);
+    if (!attempt.ok) continue;
+    const candidate = attempt.candidate;
+    candidates.push(candidate);
+    if (!candidate.quality || candidate.quality.passes) return finish(candidate);
+    if (!best?.quality || compareLayoutQuality(candidate.quality, best.quality) < 0) best = candidate;
+    if (candidate.quality.passesRelaxed &&
+        (!bestRelaxed?.quality || candidate.quality.softScore < bestRelaxed.quality.softScore)) bestRelaxed = candidate;
+  }
+  // Unmodified strict passes above keep their existing engine priority. Repairs precede the
+  // relaxed/soft fallback and are rebuilt through the identical identity and stereo guard.
+  const repairs = candidates.flatMap(candidate => {
+    const source = candidate.repairSource;
+    return source ? repairLayoutOverlaps(source.depiction.atoms, source.bonds, {
+      labelBoxes: source.labelBoxes, conventionalOrientation: true, belowSign: -1
+    }).map(repair => ({ source, repair })) : [];
+  }).sort((a, b) => compareLayoutRepairs(a.repair, b.repair));
+  const before = findMoleculeObject(document, objectId);
+  const exemptDoubleBonds = before ? cleanupDoubleBondGeometryExemptions(before) : new Set<string>();
+  const guardedRepair = (source: NonNullable<EngineRelayoutCandidate["repairSource"]>, points: readonly PagePoint[]) => {
+    const depiction = { ...source.depiction, atoms: source.depiction.atoms.map((atom, i) => ({ ...atom, ...points[i] })) };
+    const attempt = evaluateEngineRelayoutCandidate(document, objectId, () => depiction, options, true);
+    if (!attempt.ok || !attempt.candidate.quality || layoutAtomAndLabelDefects(attempt.candidate.quality) !== 0) return undefined;
+    const after = findMoleculeObject(attempt.candidate.document, objectId);
+    if (!before || !after) return undefined;
+    // R/S has already passed the normal read-back/reconciliation above. A swing can also move
+    // an alkene ligand across its axis; guard its drawn E/Z with the same conservative state
+    // comparison used by flatten. Only aromatic/small-ring topology exempts geometry;
+    // an empty engine perception is never evidence of non-stereogenicity. Either markers
+    // stay unspecified even on exempt bonds.
+    const actualDoubleStereo = doubleBondStereoState(after);
+    if ([...doubleBondStereoState(before)].some(([id, expected]) =>
+      (expected === "either" || !exemptDoubleBonds.has(id)) &&
+      expected !== 0 && actualDoubleStereo.get(id) !== expected)) return undefined;
+    return attempt.candidate;
+  };
+  for (const { source, repair } of repairs) {
+    const candidate = guardedRepair(source, repair.atoms);
+    if (!candidate) continue;
+    if (candidate.quality?.passes || candidate.quality?.passesRelaxed) return finish(candidate);
+    // Terminal labels can be cleared while the fixed macrocycle retains soft distortion.
+    // Compare that fully guarded, hard-clear repair with the drawing in the normal fallback;
+    // a repair never gets to bypass the final atom/label veto or the improvement requirement.
+    candidates.push(candidate);
+  }
+  // A cage may need crossings in every projection. Separate local atom contacts only after
+  // ordinary rigid repairs fail, then use exactly the same identity and R/S + E/Z guards.
+  if (!candidates.some(candidate => candidate.quality && layoutAtomAndLabelDefects(candidate.quality) === 0)) {
+    for (const candidate of [...candidates]) {
+      const source = candidate.repairSource;
+      if (!source || !candidate.quality?.hasBridgedRings) continue;
+      const points = repairBridgedLayoutContacts(source.depiction.atoms, source.bonds, source.labelBoxes);
+      const repaired = points && guardedRepair(source, points);
+      if (repaired) candidates.push(repaired);
+    }
+  }
+  if (!best) {
+    if (!primary.ok) throw primary.error;
+    return document;
+  }
+  // A rejected placement or overlapping geometry must not outrank a usable crossing-only
+  // alternative merely because its total hard-defect count is smaller.
+  const usable = candidates.filter(candidate => !candidate.placementAddsHardDefects &&
+    candidate.quality && layoutAtomAndLabelDefects(candidate.quality) === 0);
+  if (usable.length) best = usable.reduce((a, b) => compareLayoutQuality(a.quality!, b.quality!) <= 0 ? a : b);
+  // Preserve the existing bridged/cage policy; regular planar geometry may be impossible there.
+  const bridged = best.quality?.hasBridgedRings;
+  if (!bridged && bestRelaxed) return finish(bestRelaxed);
+  const generated = best.quality;
+  const drawn = best.drawnQuality;
+  // Clearing atom/label collisions is an improvement regardless of unavoidable cage crossings.
+  if (generated && drawn && usable.includes(best) && layoutAtomAndLabelDefects(drawn) > 0) return finish(best);
+  const improvesOrdinary = generated && drawn && (generated.hardDefects < drawn.hardDefects ||
+    (generated.hardDefects === 0 && generated.softScore <= drawn.softScore - MIN_CLEANUP_SOFT_SCORE_IMPROVEMENT));
+  if (generated && drawn && (best.placementAddsHardDefects || generated.overlappingAtoms.length > 0 ||
+      generated.atomBondOverlaps.length > 0 || generated.collinearBondOverlaps.length > 0 ||
+      generated.labelBondOverlaps.length > 0 || generated.labelLabelOverlaps.length > 0 ||
+      (bridged ? drawn.hardDefects < generated.hardDefects : !improvesOrdinary))) {
+    options.warnings?.push(...best.warnings);
+    const reason = generated.overlappingAtoms.length > 0 && generated.crossings.length > 0
+      ? "put atoms on top of each other and crossed bonds"
+      : generated.overlappingAtoms.length > 0 ? "put atoms on top of each other"
+      : generated.atomBondOverlaps.length > 0 ? "put atoms on bonds"
+      : generated.labelBondOverlaps.length > 0 || generated.labelLabelOverlaps.length > 0 ? "overlapped atom labels"
+      : generated.collinearBondOverlaps.length > 0 ? "overlapped bonds"
+      : generated.crossings.length > 0 ? "crossed bonds" : "distorted bonds or rings beyond the cleanup limits";
+    options.warnings?.push(`Clean Up kept the drawn layout of this structure: the generated layouts ${reason}.`);
+    return document;
+  }
+  // Bridged/cage graphs may have unavoidable crossings or distorted rings. Equal hard-defect
+  // counts still allow their cleanup without atom overlaps; a better drawing blocks the result.
+  return finish(best);
+}
+
+export function applyNativeMoleculeEngineRelayout(
+  document: ChemDraftDocument, objectId: string, relayout: NativeMoleculeRelayoutEngine,
+  options: NativeEngineRelayoutOptions = {}
+): ChemDraftDocument {
+  // The legacy 3D Cleanup caller preserves the drawing's scale and metal-placement behavior.
+  // 2D Cleanup supplies a style length (or uses the asynchronous preparation entry below).
+  if (options.targetBondLengthPx === undefined && options.alternateRelayouts === undefined) {
+    return buildNativeMoleculeEngineRelayout(document, objectId, relayout, options);
+  }
+  const primary = evaluateEngineRelayoutCandidate(document, objectId, relayout, options);
+  return chooseEngineRelayout(document, objectId, primary, options.alternateRelayouts ?? [], options);
+}
+
+/** Pure preparation for the command's single commit. Passing OCL layouts never invoke the
+ * loader. Every candidate, including alternates, goes through the same complete read-back guard. */
+export async function prepareNativeMoleculeEngineRelayout(
+  document: ChemDraftDocument, objectId: string, relayout: NativeMoleculeRelayoutEngine,
+  loadAlternates: () => Promise<readonly NativeMoleculeRelayoutEngine[]>,
+  options: NativeEngineRelayoutOptions = {}
+): Promise<ChemDraftDocument> {
+  const primary = evaluateEngineRelayoutCandidate(document, objectId, relayout, options);
+  if (primary.ok && (!primary.candidate.quality || primary.candidate.quality.passes)) {
+    return chooseEngineRelayout(document, objectId, primary, [], options);
+  }
+  let alternates: readonly NativeMoleculeRelayoutEngine[] = [];
+  try { alternates = await loadAlternates(); } catch (error) {
+    options.warnings?.push(`Clean Up could not load alternate layouts: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return chooseEngineRelayout(document, objectId, primary, alternates, options);
 }
 
 /**
@@ -15171,11 +16054,14 @@ function placeEngineFragmentsOnDrawing(
   return placed;
 }
 
-export function applyNativeMoleculeEngineRelayout(
+function buildNativeMoleculeEngineRelayout(
   document: ChemDraftDocument,
   objectId: string,
   relayout: (molfile: string) => PastedStructureDepiction,
-  options: NativeEngineRelayoutOptions = {}
+  options: NativeEngineRelayoutOptions,
+  reportQuality?: (generated: LayoutQuality, drawn: LayoutQuality, depiction: PastedStructureDepiction, bonds: LayoutBond[], placementAddsHardDefects: boolean,
+    labelBoxes: (points: readonly { x: number; y: number }[]) => LayoutLabelBox[]) => void,
+  conventionalOrientation = false
 ): ChemDraftDocument {
   const molecule = findMoleculeObject(document, objectId);
   if (!molecule || !isEditableNativeMoleculeGraph(molecule) || molecule.atoms.length === 0) {
@@ -15223,7 +16109,7 @@ export function applyNativeMoleculeEngineRelayout(
     kekuleBondOrders: nativeBondOrderResolution(ligand.atoms, ligand.bonds).kekuleOrders
   }).contents;
   const emittedAtoms = parseMolfileGraph(molfile).atoms;
-  const depiction = relayout(molfile);
+  let depiction = relayout(molfile);
   if (depiction.atoms.length !== ligandAtoms.length) {
     throw new Error(
       `Engine re-layout returned ${depiction.atoms.length} atoms for a ${ligandAtoms.length}-atom structure.`
@@ -15240,6 +16126,10 @@ export function applyNativeMoleculeEngineRelayout(
       throw new Error(`Engine re-layout atom ${index + 1} is ${atom.element}, expected ${expected}.`);
     }
   });
+  const ligandIndexById = new Map(ligandAtoms.map((atom, index) => [atom.id, index]));
+  const qualityBonds = ligandBonds.map(bond => ({
+    from: ligandIndexById.get(bond.fromAtomId)!, to: ligandIndexById.get(bond.toAtomId)!
+  }));
   // Engine bonds re-indexed onto the molecule's own atom order.
   const engineBonds = depiction.bonds.map((bond) => ({
     ...bond,
@@ -15291,6 +16181,29 @@ export function applyNativeMoleculeEngineRelayout(
   const engineBondLength = mean(engineBondLengths);
   const scale = engineBondLength > 0.001 ? targetBondLength / engineBondLength : 1;
 
+  // Plan with the FULL native graph, just as the renderer does. Removing the metals and
+  // their dative bonds for the engine must not invent donor hydrogens (S becoming SH),
+  // change charge display, or lose isotope/abbreviation styles. Only then filter/remap
+  // the boxes onto the ligand indices and convert document y-down to engine y-up.
+  const labelBoxes = (points: readonly { x: number; y: number }[]): LayoutLabelBox[] => {
+    const fullAtoms = molecule.atoms.map(atom => {
+      const i = ligandIndexById.get(atom.id);
+      return i === undefined ? atom : { ...atom, x: points[i].x * scale, y: -points[i].y * scale };
+    });
+    return moleculeLayoutLabelBoxes({ ...molecule, atoms: fullAtoms }).flatMap(box => {
+      const atom = ligandIndexById.get(fullAtoms[box.atom].id);
+      return atom === undefined ? [] : [{ ...box, atom,
+        x: box.x / scale, y: -(box.y + box.height) / scale, width: box.width / scale, height: box.height / scale }];
+    });
+  };
+  if (conventionalOrientation) {
+    const oriented = orientLayoutForLabels(depiction.atoms, qualityBonds, labelBoxes, -1);
+    depiction = { ...depiction, atoms: depiction.atoms.map((atom, i) => ({ ...atom, ...oriented.atoms[i] })) };
+    depiction.atoms.forEach((atom, index) => {
+      enginePointByIndex.set(ligandToOriginalIndex[index], { x: atom.x, y: -atom.y });
+    });
+  }
+
   const placedEnginePoints = placeEngineFragmentsOnDrawing(
     ligandAtoms,
     ligandBonds,
@@ -15323,7 +16236,8 @@ export function applyNativeMoleculeEngineRelayout(
         settleNativeMetalsInDonorPockets(foldedAtoms, molecule.bonds, targetBondLength),
         molecule.bonds,
         targetBondLength,
-        molecule.atoms
+        molecule.atoms,
+        reportQuality !== undefined
       );
   // The metals stay where the user drew them and the ligands are rebuilt around them: the whole
   // result is translated so the free metals' centroid is back on its drawn spot. Recentring the
@@ -15347,6 +16261,40 @@ export function applyNativeMoleculeEngineRelayout(
         x: roundGeometryCoordinate(atom.x + metalShift.x),
         y: roundGeometryCoordinate(atom.y + metalShift.y)
       }));
+
+  if (reportQuality) {
+    // Keep raw ring/bond scoring and engine priority, but judge hard geometry on the final
+    // placed and folded skeleton, including free metals as collision obstacles. Dative edges
+    // are not covalent layout constraints; no metal-to-ligand atom overlap is exempted.
+    const raw = evaluateLayoutQuality(depiction.atoms, qualityBonds, undefined, undefined, undefined, labelBoxes(depiction.atoms));
+    const placedOrder = [...ligandToOriginalIndex.map(i => atoms[i]), ...atoms.filter(atom => freeMetalIds.has(atom.id))];
+    const placedIndexById = new Map(placedOrder.map((atom, i) => [atom.id, i]));
+    // Only a free metal and its own directly coordinated donor may touch labels in the pocket.
+    // Keep every label box: non-donors, donor/donor contacts and ligand label/bond collisions
+    // still veto placement. Dative bonds remain outside the covalent skeleton checks, and a
+    // metal's own dative bonds are incident to its label (already exempt from label clearance).
+    const pocketLabelPairs = dashedBondsById
+      .filter(bond => freeMetalIds.has(bond.fromAtomId) || freeMetalIds.has(bond.toAtomId))
+      .map(bond => [placedIndexById.get(bond.fromAtomId)!, placedIndexById.get(bond.toAtomId)!] as const);
+    const placed = evaluateLayoutQuality(placedOrder, qualityBonds, undefined, undefined, undefined,
+      moleculeLayoutLabelBoxes({ ...molecule, atoms: placedOrder }), pocketLabelPairs);
+    const introduced = (after: [number, number][], before: [number, number][]) => {
+      const keys = new Set(before.map(pair => pair.join(":")));
+      return after.some(pair => !keys.has(pair.join(":")));
+    };
+    const addsHardDefects = introduced(placed.overlappingAtoms, raw.overlappingAtoms) ||
+      introduced(placed.crossings, raw.crossings) ||
+      introduced(placed.collinearBondOverlaps, raw.collinearBondOverlaps) || introduced(placed.atomBondOverlaps, raw.atomBondOverlaps) ||
+      introduced(placed.labelBondOverlaps, raw.labelBondOverlaps) || introduced(placed.labelLabelOverlaps, raw.labelLabelOverlaps);
+    reportQuality({ ...raw, overlappingAtoms: placed.overlappingAtoms, crossings: placed.crossings,
+      atomBondOverlaps: placed.atomBondOverlaps, collinearBondOverlaps: placed.collinearBondOverlaps, hardDefects: placed.hardDefects,
+      labelBondOverlaps: placed.labelBondOverlaps, labelLabelOverlaps: placed.labelLabelOverlaps,
+      smallestLabelBondClearance: placed.smallestLabelBondClearance,
+      passes: raw.passes && placed.hardDefects === 0,
+      passesRelaxed: raw.passesRelaxed && placed.hardDefects === 0 },
+      evaluateLayoutQuality([...ligandAtoms, ...drawnFreeMetals], qualityBonds, undefined, undefined, undefined,
+        moleculeLayoutLabelBoxes({ ...molecule, atoms: [...ligandAtoms, ...drawnFreeMetals] }), pocketLabelPairs), depiction, qualityBonds, addsHardDefects, labelBoxes);
+  }
 
   // Wedge/hash assignments follow the parities on the NEW geometry; index bonds by their endpoint
   // atom indices (the engine's bonds were re-indexed onto the molecule's own atom order above, so
@@ -15431,7 +16379,7 @@ export function applyNativeMoleculeEngineRelayout(
   }
 
   const cleaned = withNativeMoleculeTransform(
-    normalizeNativeMoleculeGeometry({ ...molecule, atoms, bonds }),
+    normalizeNativeMoleculeGeometry({ ...molecule, atoms, bonds, style: flatNativeMoleculeStyle(molecule) }),
     defaultNativeMoleculeTransform
   );
   const atomMetadataChanged = JSON.stringify(molecule.atoms) !== JSON.stringify(cleaned.atoms);
@@ -15445,7 +16393,8 @@ export function applyNativeMoleculeEngineRelayout(
     !nativeMoleculeGeometryOrTransformChanged(molecule, cleaned) &&
     !atomMetadataChanged &&
     !bondDisplayOrDirectionChanged &&
-    !normalizedBoundsChanged
+    !normalizedBoundsChanged &&
+    molecule.style.projection === cleaned.style.projection
   ) {
     return document;
   }
@@ -16545,7 +17494,8 @@ function arrangeNativeMonodentateLigands(
   /** The atoms as drawn before the engine ran: slot choice follows where the DRAWING had each
    *  ligand, not where the engine's row happens to put it, so a second cleanup reproduces the
    *  first exactly instead of shuffling ligands between slots. */
-  drawnAtoms: readonly MoleculeAtom[] = atoms
+  drawnAtoms: readonly MoleculeAtom[] = atoms,
+  avoidHardDefects = false
 ): MoleculeAtom[] {
   const L = bondLengthPx;
   if (!(L > 0)) {
@@ -16640,6 +17590,7 @@ function arrangeNativeMonodentateLigands(
   });
   const pending = (index: number): boolean => pendingComponents.has(componentOf[index]) && !moved.has(index);
 
+  const mirrorAlternatives: { indices: number[]; alternative: PagePoint[] }[] = [];
   donorsByMetal.forEach((donorIndices, metalIndex) => {
     const metal = points[metalIndex];
     const donorsByComponent = new Map<number, number[]>();
@@ -16736,14 +17687,37 @@ function arrangeNativeMonodentateLigands(
       const preferred = drawnHandedness !== 0 && handednessOf(mirrored) === drawnHandedness ? mirrored : straight;
       const alternative = preferred === straight ? mirrored : straight;
       const chosen = clearance(preferred) < 0.5 * L && clearance(alternative) > clearance(preferred) + 1e-6
-        ? alternative
-        : preferred;
+        ? alternative : preferred;
+      mirrorAlternatives.push({ indices: fragmentIndices, alternative: chosen === preferred ? alternative : preferred });
       fragmentIndices.forEach((index, position) => {
         points[index] = chosen[position];
         moved.add(index);
       });
     });
   });
+
+  if (avoidHardDefects && mirrorAlternatives.length) {
+    const qualityBonds = bonds.filter(b => !isDashed(b)).map(b => ({
+      from: indexById.get(b.fromAtomId)!, to: indexById.get(b.toAtomId)!
+    }));
+    const topology = prepareLayoutTopology(atoms.length, qualityBonds);
+    let bestDefects = evaluateLayoutQuality(points, qualityBonds, L, topology).hardDefects;
+    // Greedy atom clearance can trap the final ligand between two substituent bonds. Try the
+    // existing mirror choices together, at most 256 combinations, before rejecting placement.
+    // Reflections still pass the normal final stereochemistry read-back guard.
+    const original = points.map(p => ({ ...p }));
+    for (let mask = 1; bestDefects > 0 && mask < 2 ** Math.min(8, mirrorAlternatives.length); mask++) {
+      const trial = [...original];
+      mirrorAlternatives.slice(0, 8).forEach(({ indices, alternative }, i) => {
+        if (mask & (1 << i)) indices.forEach((index, j) => { trial[index] = alternative[j]; });
+      });
+      const defects = evaluateLayoutQuality(trial, qualityBonds, L, topology).hardDefects;
+      if (defects < bestDefects) {
+        bestDefects = defects;
+        trial.forEach((point, i) => { points[i] = point; });
+      }
+    }
+  }
 
   return atoms.map((atom, index) => (
     moved.has(index)
@@ -16809,7 +17783,7 @@ export interface FlattenSpunOutcome {
 // permissive `compatibility.unknown` record (NOT a strict schema field) using a
 // versioned, namespaced key — so it survives save/reload while older builds can
 // still open new files (the key is simply ignored there). Validated on read; a
-// stale model (graph edited since it was written) is ignored via the
+// stale model (graph or drawn stereo edited since it was written) is ignored via the
 // graph-signature gate, so we never have to proactively clear it.
 // ---------------------------------------------------------------------------
 export const SPIN3D_MODEL_KEY = "chemdraft.spin3d.model.v1";
@@ -16836,14 +17810,63 @@ export interface Spin3dDocumentModelV1 {
   updatedAt: string;
 }
 
-// Deliberately position-independent: dragging or flattening a molecule (which only
-// moves its 2D x/y) keeps the signature stable, so a stored spin model survives those.
-// Editing the graph (add/remove atom, change element/charge/bond order) changes it,
-// invalidating a stale model.
-export function conformerGraphSignature(molecule: MoleculeObject): string {
+/** Exact pre-stereo signature (373f5111), used only to recognize saved legacy models. */
+export function legacyConformerGraphSignature(molecule: MoleculeObject): string {
   const atoms = molecule.atoms.map((atom) => `${atom.id}:${atom.element}:${atom.formalCharge}`).join(",");
   const bonds = molecule.bonds.map((bond) => `${bond.fromAtomId}>${bond.toAtomId}:${bond.order}`).join(",");
   return `${atoms}|${bonds}`;
+}
+
+// Fingerprint drawing stereo intent without an engine or conformer geometry. Double-bond
+// relative sides and wedged-centre neighbour turns are conservative drawing checks, not perception.
+export function conformerGraphSignature(molecule: MoleculeObject): string {
+  const atoms = molecule.atoms.map((atom) => `${atom.id}:${atom.element}:${atom.formalCharge}`).join(",");
+  const doubleStereo = doubleBondStereoState(molecule);
+  const bonds = molecule.bonds.map((bond) => `${bond.fromAtomId}>${bond.toAtomId}:${bond.order}` +
+    (doubleStereo.has(bond.id) ? `:${doubleStereo.get(bond.id)}` : "") +
+    (["wedge", "hashed"].includes(bond.display?.bondStyle ?? "") ? `:${bond.display!.bondStyle}` : "")).join(",");
+  const atomsById = new Map(molecule.atoms.map(atom => [atom.id, atom]));
+  const neighbors = new Map<string, string[]>();
+  const wedgedCenters = new Set<string>();
+  for (const bond of molecule.bonds) {
+    for (const [a, b] of [[bond.fromAtomId, bond.toAtomId], [bond.toAtomId, bond.fromAtomId]]) {
+      const adjacent = neighbors.get(a) ?? [];
+      adjacent.push(b);
+      neighbors.set(a, adjacent);
+    }
+    if (["wedge", "hashed"].includes(bond.display?.bondStyle ?? "")) wedgedCenters.add(bond.fromAtomId);
+  }
+  // Bond styles above record which ligands point towards/away. Signed turns of every
+  // id-ordered neighbour pair record ligand-order changes. Neighbour-triangle turns
+  // also catch inversion with four explicit ligands when one moves across the other
+  // ligands' line without changing its direction from the centre.
+  // Translation and in-plane rotation preserve them; reflection reverses them. This may
+  // invalidate a harmless geometry edit too, which is safer than reusing the wrong enantiomer.
+  const parity = [...wedgedCenters].sort().map(id => {
+    const center = atomsById.get(id);
+    const adjacent = [...new Set(neighbors.get(id))].sort();
+    const turns: number[] = [];
+    for (let i = 0; i < adjacent.length; i++) {
+      for (let j = i + 1; j < adjacent.length; j++) {
+        const a = atomsById.get(adjacent[i]), b = atomsById.get(adjacent[j]);
+        if (!center || !a || !b) { turns.push(0); continue; }
+        const ax = a.x - center.x, ay = a.y - center.y;
+        const bx = b.x - center.x, by = b.y - center.y;
+        const cross = (ax * by - ay * bx) / (Math.hypot(ax, ay) * Math.hypot(bx, by));
+        turns.push(!Number.isFinite(cross) || Math.abs(cross) < 1e-8 ? 0 : Math.sign(cross));
+        for (let k = j + 1; k < adjacent.length; k++) {
+          const c = atomsById.get(adjacent[k]);
+          if (!c) { turns.push(0); continue; }
+          const abx = b.x - a.x, aby = b.y - a.y;
+          const acx = c.x - a.x, acy = c.y - a.y;
+          const triangle = (abx * acy - aby * acx) / (Math.hypot(abx, aby) * Math.hypot(acx, acy));
+          turns.push(!Number.isFinite(triangle) || Math.abs(triangle) < 1e-8 ? 0 : Math.sign(triangle));
+        }
+      }
+    }
+    return `${id}:${adjacent.join(",")}:${turns.join(",")}`;
+  });
+  return `${atoms}|${bonds}${parity.length ? `|wedge-turns:${parity.join(";")}` : ""}`;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -16874,13 +17897,38 @@ export function readSpin3dModel(molecule: MoleculeObject): Spin3dDocumentModelV1
   return model as Spin3dDocumentModelV1;
 }
 
-/** The persisted model only if it matches a graph with fully known bond orders. */
-export function validSpin3dModelFor(molecule: MoleculeObject): Spin3dDocumentModelV1 | undefined {
+/** The persisted model only if it matches a graph with fully known bond orders.
+ * Legacy signatures require an injected stereo read-back; without one, regenerate. */
+export function validSpin3dModelFor(molecule: MoleculeObject, reader?: typeof storedCoordinatesMatchStereo): Spin3dDocumentModelV1 | undefined {
   // Older releases could persist a conformer built on guessed unknown bond orders.
   // Even a matching signature cannot make that model chemically valid.
   if (molecule.bonds.some((bond) => bond.order === "unknown")) return undefined;
-  const model = readSpin3dModel(molecule);
-  return model && model.graphSignature === conformerGraphSignature(molecule) ? model : undefined;
+  try {
+    const model = readSpin3dModel(molecule);
+    if (!model) return undefined;
+    if (model.graphSignature === conformerGraphSignature(molecule)) return model;
+    if (model.graphSignature !== legacyConformerGraphSignature(molecule)) return undefined;
+    return reader && legacySpin3dStereoMatches(molecule, model, reader) ? model : undefined;
+  } catch {
+    // An unverifiable legacy conformer must be regenerated, never trusted on a failed read-back.
+    return undefined;
+  }
+}
+
+/** Read the actual coordinates with the same OCL perception used by the flatten guard.
+ * No projection/reconciliation here: repairing a depiction could conceal a wrong conformer. */
+function legacySpin3dStereoMatches(
+  molecule: MoleculeObject, model: Spin3dDocumentModelV1, reader: typeof storedCoordinatesMatchStereo
+): boolean {
+  const coords = spin3dModelCoordsForMolecule(model, molecule);
+  if (!coords) return false;
+  const hasWedges = molecule.bonds.some(bond => ["wedge", "hashed"].includes(bond.display?.bondStyle ?? ""));
+  if (hasWedges && new Set(molecule.atoms.map(atom => atom.element)
+    .filter(label => nativeElementFromAtomLabel(label) === undefined)).size > stereoPerceptionDistinctLabelLimit) return false;
+
+  return reader(stereoPerceptionMolfile(molecule), stereoPerceptionMolfile({
+    ...molecule, bonds: molecule.bonds.map(bond => ({ ...bond, display: undefined }))
+  }), coords);
 }
 
 /** coords3d reordered from the model's atomIds order into the molecule's current atom order. */
@@ -17004,8 +18052,8 @@ function atomsCentroid(atoms: readonly { x: number; y: number }[]): { x: number;
 
 /**
  * Reads a 2D depiction's molfile and reports, per atom (index-aligned), whether it is a true
- * stereocenter and its CIP descriptor. Injected (not imported) so this module stays independent of
- * the chemistry engine and the reconcile logic is unit-testable with a fake reader.
+ * stereocenter and its CIP descriptor. The flatten/reconcile paths accept an injected reader so
+ * their logic is unit-testable with a fake reader.
  */
 export type StereoPerceiver = (
   molfile: string
@@ -17473,7 +18521,8 @@ export function flattenSpunMolecule(
   objectId: string,
   coords3d: ArrayLike<number>,
   viewMatrix: ViewMatrix,
-  options: { placement?: ScreenPlacement; stereoCenterAtomIds?: ReadonlySet<string>; perceiveStereo?: StereoPerceiver } = {}
+  options: { placement?: ScreenPlacement; stereoCenterAtomIds?: ReadonlySet<string>; perceiveStereo?: StereoPerceiver;
+    perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string> } = {}
 ): FlattenSpunOutcome {
   let pageId: string | undefined;
   let molecule: MoleculeObject | undefined;
@@ -17494,9 +18543,62 @@ export function flattenSpunMolecule(
       stereoCenters: []
     };
   }
+  const page = document.pages.find(candidate => candidate.id === pageId);
+  const result = flattenNativeMolecule3d(molecule, coords3d, viewMatrix, { ...options, bounds: page });
+  const { molecule: flattened, crossings, ...outcome } = result;
+  if (!flattened || result.status !== "committed") return { document, ...outcome };
+  const patches: DocumentPatch[] = [{
+    op: "updateObject", objectId, changes: {
+      atoms: flattened.atoms, bonds: flattened.bonds, x: flattened.x, y: flattened.y,
+      width: flattened.width, height: flattened.height, structure: flattened.structure,
+      structureFormat: flattened.structureFormat
+    }
+  }];
+  for (const crossing of page?.crossings ?? []) {
+    if (crossing.bonds.every(ref => ref.objectId === objectId)) {
+      patches.push({ op: "clearCrossingOverride", pageId, bonds: crossing.bonds });
+    }
+  }
+  for (const crossing of crossings ?? []) patches.push({ op: "setCrossingOverride", pageId, crossing });
+  return { document: applyPatches(document, patches, { now: phase4Timestamp }), ...outcome };
+}
+
+/** Pure molecule-level Spin 3D flatten. Shared by document commits and plugin 3D chemistry:
+ * frame conversion, ScreenPlacement, wedge reconciliation, depth styling and stored molfile
+ * all have one implementation. Document patching and page crossing ownership stay in the wrapper. */
+export interface FlattenNative3DOutcome extends Omit<FlattenSpunOutcome, "document"> {
+  molecule?: MoleculeObject;
+  crossings?: ReturnType<typeof flattenPerspectiveFrom3D>["crossings"];
+}
+
+/** Snapshot perceived E/Z once for repeated projections. Undefined keeps the conservative
+ * drawn-geometry guard when the caller has no reader or the drawing cannot be perceived. */
+export function specifiedDoubleBondIdsForFlatten(
+  molecule: MoleculeObject, reader?: DoubleBondStereoReader
+): ReadonlySet<string> | undefined {
+  if (!reader || skipUnknownBondStereoGuard(molecule)) return undefined;
+  if (!molecule.bonds.some(bond => bond.order === "double" && bond.stereo !== "either")) return new Set<string>();
+  return perceivedSpecifiedDoubleBondIds(molecule, stereoPerceptionMolfile(molecule), reader);
+}
+
+export function flattenNativeMolecule3d(
+  molecule: MoleculeObject,
+  coords3d: ArrayLike<number>,
+  viewMatrix: ViewMatrix,
+  options: { placement?: ScreenPlacement; stereoCenterAtomIds?: ReadonlySet<string>; perceiveStereo?: StereoPerceiver;
+    perceiveDoubleBondStereo?: DoubleBondStereoReader; specifiedDoubleBondIds?: ReadonlySet<string>;
+    bounds?: { width: number; height: number }; onTiming?: (stage: string, ms: number) => void } = {}
+): FlattenNative3DOutcome {
+  let stageStarted = options.onTiming ? performance.now() : 0;
+  const mark = (stage: string) => {
+    if (!options.onTiming) return;
+    const now = performance.now();
+    options.onTiming(stage, now - stageStarted);
+    stageStarted = now;
+  };
+  const objectId = molecule.id;
   if (coords3d.length !== molecule.atoms.length * 3) {
     return {
-      document,
       status: "refused",
       warnings: [],
       refusalReasons: [`conformer atom count ${coords3d.length / 3} ≠ molecule atom count ${molecule.atoms.length}`],
@@ -17513,7 +18615,6 @@ export function flattenSpunMolecule(
   const hasWedges = molecule.bonds.some((bond) => bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed");
   if (hasWedges && distinctAbbreviations > stereoPerceptionDistinctLabelLimit) {
     return {
-      document,
       status: "refused",
       warnings: [],
       refusalReasons: [
@@ -17523,6 +18624,13 @@ export function flattenSpunMolecule(
     };
   }
 
+  const structureWarnings: string[] = [];
+  const perceive = !skipUnknownBondStereoGuard(molecule) ? options.perceiveStereo : undefined;
+  const referenceStereo = perceive?.(stereoPerceptionMolfile(molecule, structureWarnings));
+  const specifiedCenterIds = options.stereoCenterAtomIds ?? (referenceStereo
+    ? new Set(molecule.atoms.flatMap((atom, i) =>
+      referenceStereo[i]?.descriptor === "R" || referenceStereo[i]?.descriptor === "S" ? [atom.id] : []))
+    : undefined);
   // Frame recipe IN: document (y-down) → math (y-up), styles untouched.
   const mathMol: MoleculeObject = {
     ...molecule,
@@ -17530,11 +18638,11 @@ export function flattenSpunMolecule(
   };
   const result = flattenPerspectiveFrom3D(mathMol, coords3d, viewMatrix, {
     objectId,
-    stereoCenterAtomIds: options.stereoCenterAtomIds
+    stereoCenterAtomIds: specifiedCenterIds
   });
+  mark("flatten.projection+crossings");
   if (result.status !== "committed" || !result.mol2dProjected) {
     return {
-      document,
       status: "refused",
       warnings: result.warnings,
       refusalReasons: result.refusalReasons,
@@ -17578,7 +18686,7 @@ export function flattenSpunMolecule(
     };
   });
   // Clamp into the page bounds (mirrors scaleParsedMolfileAtoms).
-  const page = document.pages.find((candidate) => candidate.id === pageId);
+  const page = options.bounds;
   if (page) {
     const geometry = moleculeGeometryFromAtoms(nextAtoms);
     const boundedX = clamp(geometry.x, 0, Math.max(0, page.width - geometry.width));
@@ -17641,6 +18749,7 @@ export function flattenSpunMolecule(
   // ring double bonds default to the wrong side and render OUTSIDE the ring. Reuse the
   // app's own neighbor-mass heuristic so flattened depictions match drawn ones.
   const sideMolecule: MoleculeObject = { ...molecule, atoms: nextAtoms, bonds: projectedBonds, ...geometry };
+  mark("flatten.placement+depth");
   const nextBonds = projectedDoubleBondSides(sideMolecule).map((bond, bondIndex) => {
     const display: NonNullable<MoleculeBond["display"]> = { ...(bond.display ?? {}) };
     const depthWeight = depthWeightFor(bondIndex);
@@ -17648,16 +18757,14 @@ export function flattenSpunMolecule(
     else delete display.depthWeight;
     return Object.keys(display).length > 0 ? { ...bond, display } : { ...bond, display: undefined };
   });
+  mark("flatten.double-bond-sides");
   // Read-back stereo guard: the encoder proved its wedges sound against its own geometric model,
   // but that model can mis-read the squished projection of a dense fused cage. Ask the real CIP
   // perceiver (injected) what the drawing actually says and flip any center that reads the wrong
   // hand; if the depiction can't be made to read back as the original stereochemistry, refuse the
   // view (document untouched) instead of silently committing a different stereoisomer.
-  const structureWarnings: string[] = [];
   let committedBonds = nextBonds;
-  if (options.perceiveStereo && !skipUnknownBondStereoGuard(molecule)) {
-    const perceive = options.perceiveStereo;
-    const referenceStereo = perceive(stereoPerceptionMolfile(molecule, structureWarnings));
+  if (perceive && referenceStereo) {
     const reference = new Map<number, "R" | "S">();
     molecule.atoms.forEach((_, index) => {
       const entry = referenceStereo[index];
@@ -17680,7 +18787,6 @@ export function flattenSpunMolecule(
     );
     if (!reconciled.ok) {
       return {
-        document,
         status: "refused",
         warnings: result.warnings,
         refusalReasons: [
@@ -17692,7 +18798,17 @@ export function flattenSpunMolecule(
       };
     }
     committedBonds = reconciled.bonds;
+    // Reconciliation validates assigned centres. Also read every originally open atom:
+    // a neighbouring wedge must never introduce a new assignment there.
+    const actual = perceive(stereoPerceptionMolfile({ ...molecule, atoms: nextAtoms, bonds: committedBonds }, structureWarnings));
+    const gained = molecule.atoms.filter((_, i) => referenceStereo[i]?.descriptor === "unspecified" &&
+      (actual[i]?.descriptor === "R" || actual[i]?.descriptor === "S"));
+    if (gained.length) return {
+      status: "refused", warnings: result.warnings, stereoCenters: result.stereoCenters,
+      refusalReasons: [`flatten would specify ${gained.length} open tetrahedral center(s); re-orient and try again`]
+    };
   }
+  mark("flatten.reconcile-stereo");
 
   const stagedMolecule: MoleculeObject = {
     ...molecule,
@@ -17700,44 +18816,35 @@ export function flattenSpunMolecule(
     bonds: committedBonds,
     ...geometry
   };
+  // An injected engine reader can exclude non-stereogenic bonds (equivalent ligands).
+  // Without perception or explicit ids, conservatively guard every non-zero drawn state.
+  // Either markers are always checked, independently of perceived stereogenicity.
+  const specifiedDoubleBondIds = options.specifiedDoubleBondIds ??
+    specifiedDoubleBondIdsForFlatten(molecule, options.perceiveDoubleBondStereo);
+  const actualDoubleStereo = doubleBondStereoState(stagedMolecule);
+  for (const [id, expected] of doubleBondStereoState(molecule)) {
+    if (expected !== "either" && specifiedDoubleBondIds && !specifiedDoubleBondIds.has(id)) continue;
+    if (expected === 0 || actualDoubleStereo.get(id) === expected) continue;
+    return {
+      status: "refused", warnings: result.warnings, stereoCenters: result.stereoCenters,
+      refusalReasons: [`flatten would change ${expected === "either" ? "unspecified" : "specified E/Z"} stereo at bond ${id}; re-orient and try again`]
+    };
+  }
   // Stored-structure spelling (dummy "*" for an abbreviated label), not the perception one —
   // see the note where a new molecule's structure is first written. Aromatic bonds pass their Kekulé
   // orders so a literal atom keeps its valence, and anything the writer could not keep is reported
   // with the flatten rather than stored silently.
-  const structure = moleculeToMolfileV2000(stagedMolecule, {
+  const useV3000 = stagedMolecule.atoms.length > 999 || stagedMolecule.bonds.length > 999;
+  const structure = (useV3000 ? moleculeToMolfileV3000 : moleculeToMolfileV2000)(stagedMolecule, {
     fromDocFrame: true,
     warnings: structureWarnings,
     kekuleBondOrders: nativeBondOrderResolution(stagedMolecule.atoms, stagedMolecule.bonds).kekuleOrders
   }).contents;
-
-  const patches: DocumentPatch[] = [
-    {
-      op: "updateObject",
-      objectId,
-      changes: {
-        atoms: nextAtoms,
-        bonds: committedBonds,
-        x: geometry.x,
-        y: geometry.y,
-        width: geometry.width,
-        height: geometry.height,
-        structure,
-        structureFormat: "molfile-v2000"
-      }
-    }
-  ];
-  // Replace this molecule's stale crossing overrides with the freshly baked ones.
-  for (const crossing of page?.crossings ?? []) {
-    if (crossing.bonds.every((ref) => ref.objectId === objectId)) {
-      patches.push({ op: "clearCrossingOverride", pageId, bonds: crossing.bonds });
-    }
-  }
-  for (const crossing of result.crossings) {
-    patches.push({ op: "setCrossingOverride", pageId, crossing });
-  }
+  mark("flatten.serialize");
 
   return {
-    document: applyPatches(document, patches, { now: phase4Timestamp }),
+    molecule: { ...stagedMolecule, structure, structureFormat: useV3000 ? "molfile-v3000" : "molfile-v2000" },
+    crossings: result.crossings,
     status: "committed",
     warnings: [
       ...result.warnings,
@@ -17778,13 +18885,21 @@ function withNativeMoleculeTransform(
   };
 }
 
+// A successful flat re-layout no longer has a projection's nominal-length contract.
+function flatNativeMoleculeStyle(molecule: MoleculeObject): MoleculeObject["style"] {
+  if (molecule.style.projection !== "perspective") return molecule.style;
+  const { projection: _projection, ...style } = molecule.style;
+  return style;
+}
+
 // Drops per-atom projected-plane depth so a 2D cleanup leaves a genuinely flat molecule.
 // Without this, atoms keep stale `z` from a prior 3D tilt and `pointZ()` would still read
 // that depth on the next projected-plane operation even though the transform reset to 2D.
 function flattenNativeMoleculeDepth(molecule: MoleculeObject): MoleculeObject {
   return {
     ...molecule,
-    atoms: molecule.atoms.map(({ z: _z, ...atom }) => atom)
+    atoms: molecule.atoms.map(({ z: _z, ...atom }) => atom),
+    style: flatNativeMoleculeStyle(molecule)
   };
 }
 
@@ -17854,7 +18969,9 @@ function cleanUpNativeMoleculeGeometry2d(molecule: MoleculeObject): MoleculeObje
     normalizeNativeMoleculeGeometry({
       ...molecule,
       atoms,
-      bonds
+      bonds,
+      // A multi-ring component skipped by this simple layout is still projected.
+      style: nextAtomPoints.size === molecule.atoms.length ? flatNativeMoleculeStyle(molecule) : molecule.style
     }),
     defaultNativeMoleculeTransform
   );
@@ -18902,10 +20019,34 @@ export function copyAsScopedDocument(document: ChemDraftDocument): ChemDraftDocu
     return document;
   }
 
-  const minX = Math.min(...objects.map((object) => object.x));
-  const minY = Math.min(...objects.map((object) => object.y));
-  const maxX = Math.max(...objects.map((object) => object.x + object.width));
-  const maxY = Math.max(...objects.map((object) => object.y + object.height));
+  const bounds = objects.map((object): ObjectBounds => {
+    // Preserve the exact legacy crop for unrotated objects, including stored frames
+    // that differ from their ink bounds (labels, table overflow and art effects).
+    if (object.rotation === 0) return object;
+    if (object.type === "graphic") return documentObjectVisualBounds(object, page.objects);
+    if (object.type === "text") return textVisualBoundsForArrangement(object);
+    if (object.type === "molecule") return moleculeVisualBoundsForArrangement(object);
+    if (object.type === "table") return tableVisualBoundsForArrangement(object);
+
+    // The non-graphic visual-bounds fallback does not rotate arrows, brackets or
+    // other stored frames. Transform their page-space corners about the SVG pivot.
+    const frame = documentObjectVisualBounds(object, page.objects);
+    const points = [
+      { x: frame.x, y: frame.y },
+      { x: frame.x + frame.width, y: frame.y },
+      { x: frame.x + frame.width, y: frame.y + frame.height },
+      { x: frame.x, y: frame.y + frame.height }
+    ].map((point) => transformPointForObject(object, point));
+    const x = Math.min(...points.map((point) => point.x));
+    const y = Math.min(...points.map((point) => point.y));
+    return { x, y,
+      width: Math.max(...points.map((point) => point.x)) - x,
+      height: Math.max(...points.map((point) => point.y)) - y };
+  });
+  const minX = Math.min(...bounds.map((bound) => bound.x));
+  const minY = Math.min(...bounds.map((bound) => bound.y));
+  const maxX = Math.max(...bounds.map((bound) => bound.x + bound.width));
+  const maxY = Math.max(...bounds.map((bound) => bound.y + bound.height));
 
   const scopedWidth = maxX - minX + copyAsPagePaddingPx * 2;
   const scopedHeight = maxY - minY + copyAsPagePaddingPx * 2;
@@ -19069,7 +20210,7 @@ function createClipboardTextStructureMolecule(
     rotation: 0,
     transform: defaultNativeMoleculeTransform,
     style: {
-      ...stylePresetToObjectStyle(ChemDraftSyntheticStylePreset),
+      ...documentDrawingDefaults(document).objectStyle,
       source: "clipboard-chemical-text"
     },
     compatibility: {
@@ -19150,7 +20291,9 @@ function extendNativeCarbonGraph(
   newAtomPoint: PagePoint,
   options: NativeBondToolOptions = {}
 ): MoleculeObject | undefined {
-  if (!canGrowNativeAtom(molecule, sourceAtomId)) {
+  const growRefusal = nativeAtomGrowRefusalReason(molecule, sourceAtomId);
+  if (growRefusal) {
+    options.onRefusal?.(growRefusal);
     return undefined;
   }
 
@@ -19173,7 +20316,30 @@ function extendNativeCarbonGraph(
     }
   ];
 
-  return refreshNativeSingleBondGraph(molecule, atoms, bonds);
+  const orderedBonds = nativeBondsWithToolOrder(molecule, { ...molecule, atoms, bonds }, options);
+  return orderedBonds ? refreshNativeSingleBondGraph(molecule, atoms, orderedBonds) : undefined;
+}
+
+/**
+ * Give the bond a tool just added the tool's order, through the same path as order cycling so a
+ * double bond also stores its side. Returns the bonds unchanged for a single bond; reports the
+ * reason through `onRefusal` and returns undefined when the order would break an endpoint.
+ */
+function nativeBondsWithToolOrder(
+  baseline: MoleculeObject,
+  molecule: MoleculeObject,
+  options: NativeBondToolOptions
+): MoleculeBond[] | undefined {
+  const order = options.bondOrder ?? "single";
+  const addedBond = molecule.bonds[molecule.bonds.length - 1];
+  if (order === "single") return molecule.bonds;
+  const refusal = nativeBondOrderRefusalReason(molecule, addedBond, order, baseline);
+  if (refusal) {
+    options.onRefusal?.(refusal);
+    return undefined;
+  }
+  return molecule.bonds.map(bond =>
+    bond.id === addedBond.id ? nativeBondWithOrderAndDisplay(molecule, bond, order) : bond);
 }
 
 /**
@@ -19329,6 +20495,7 @@ function carbonylOxygenPointForAtom(
   pageHeight: number,
   direction?: PagePoint
 ): PagePoint {
+  const nativeBondLength = nativeTemplateBondLength(molecule);
   const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
   if (!atom) {
     return { x: nativeBondLength, y: 0 };
@@ -19574,7 +20741,9 @@ function connectNativeCarbonAtoms(
   targetAtomId: string,
   options: NativeBondToolOptions = {}
 ): MoleculeObject | undefined {
-  if (!canConnectNativeAtoms(molecule, sourceAtomId, targetAtomId)) {
+  const connectRefusal = nativeAtomsConnectRefusalReason(molecule, sourceAtomId, targetAtomId);
+  if (connectRefusal) {
+    options.onRefusal?.(connectRefusal);
     return undefined;
   }
 
@@ -19589,7 +20758,16 @@ function connectNativeCarbonAtoms(
     }
   ];
 
-  return refreshNativeSingleBondGraph(molecule, molecule.atoms, bonds);
+  const orderedBonds = nativeBondsWithToolOrder(molecule, { ...molecule, bonds }, options);
+  return orderedBonds ? refreshNativeSingleBondGraph(molecule, molecule.atoms, orderedBonds) : undefined;
+}
+
+function atomLabelIsotopeRefusal(atom: MoleculeAtom, label: string, molecule: MoleculeObject, literal: boolean): string | undefined {
+  if (atom.isotope === undefined) return undefined;
+  const bonded = molecule.bonds.some(b => b.fromAtomId === atom.id || b.toAtomId === atom.id);
+  const reading = nativeAtomLabelReading(label, { bonded, typed: literal });
+  if (reading.kind === "element" || reading.kind === "heavy-hydrogen") return undefined;
+  return `Cannot relabel ${atom.isotope}${atom.element} as ${label}: the label cannot keep isotope ${atom.isotope}; clear the isotope first to relabel`;
 }
 
 function nativeAtomWithElement(
@@ -19603,6 +20781,7 @@ function nativeAtomWithElement(
     labelVisible: _labelVisible,
     labelLiteral: _labelLiteral,
     labelBondSide: _labelBondSide,
+    isotope: _isotope,
     warningSuppressed,
     ...baseAtom
   } = atom;
@@ -19618,6 +20797,8 @@ function nativeAtomWithElement(
   return {
     ...baseAtom,
     element,
+    ...(sameElement && element !== "D" && element !== "T" && atom.isotope !== undefined
+      ? { isotope: atom.isotope } : {}),
     ...(labelVisible ? { labelVisible: true } : {}),
     ...(labelLiteral ? { labelLiteral: true } : {}),
     ...(warningSuppressed === true && sameElement && sameRule ? { warningSuppressed: true } : {})
@@ -19656,7 +20837,7 @@ function nativeBondWithOrderAndDisplay(
     };
   }
 
-  const { display: _display, ...bondWithoutDisplay } = bond;
+  const { display: _display, stereo: _stereo, ...bondWithoutDisplay } = bond;
   return {
     ...bondWithoutDisplay,
     order,
@@ -19710,25 +20891,41 @@ function canSetNativeBondOrder(
   bond: MoleculeBond,
   order: MoleculeBond["order"]
 ): boolean {
+  return nativeBondOrderRefusalReason(molecule, bond, order) === undefined;
+}
+
+/**
+ * Why a bond cannot take `order`, in words for the status line; undefined when it can. For a bond
+ * a tool has just added, pass the molecule as it was before the addition as `baseline`, so the
+ * endpoints are judged against what they were rather than against the single bond just added.
+ */
+function nativeBondOrderRefusalReason(
+  molecule: MoleculeObject,
+  bond: MoleculeBond,
+  order: MoleculeBond["order"],
+  baseline: MoleculeObject = molecule
+): string | undefined {
   if (order !== "single" && order !== "double" && order !== "triple") {
-    return false;
+    return `a ${order} bond cannot be set with this tool`;
   }
 
   const atomById = new Map(molecule.atoms.map((atom) => [atom.id, atom]));
   const fromAtom = atomById.get(bond.fromAtomId);
   const toAtom = atomById.get(bond.toAtomId);
   if (!fromAtom || !toAtom) {
-    return false;
+    return "the bond's atoms are missing";
   }
 
-  if (!nativeElementFromAtomLabel(fromAtom.element) || !nativeElementFromAtomLabel(toAtom.element)) {
-    return false;
+  for (const atom of [fromAtom, toAtom]) {
+    if (!nativeElementFromAtomLabel(atom.element)) {
+      return `${atom.element} is not a plain element, so its bond order is left alone`;
+    }
   }
   // The dashed style is the dative style, and dative means single: the dashed tool refuses a
   // double or triple bond for that reason, so a dashed bond may not be raised past single
   // either — a "dashed double" would draw as a dative bond and export as a covalent double.
   if (bond.display?.bondStyle === "dashed" && !isDativeBond({ ...bond, order })) {
-    return false;
+    return `a dashed (dative) bond stays single, not ${order}`;
   }
 
   // Judge the change by the validator the badges use, on the bonds as they WOULD be: the order
@@ -19743,24 +20940,63 @@ function canSetNativeBondOrder(
   const nextBonds = molecule.bonds.map((candidate) => (candidate.id === bond.id ? { ...candidate, order } : candidate));
   const nextAtoms = clearChangedAtomHydrogenHints(molecule, molecule.atoms, nextBonds);
   const nextAtomById = new Map(nextAtoms.map((atom) => [atom.id, atom]));
-  const beforeResolution = nativeBondOrderResolution(molecule.atoms, molecule.bonds);
+  const beforeResolution = nativeBondOrderResolution(baseline.atoms, baseline.bonds);
   const afterResolution = nativeBondOrderResolution(nextAtoms, nextBonds);
   const breaks = (atom: MoleculeAtom): boolean => {
     // A dismissed badge must not license the edit: judge the bare arithmetic.
-    const { warningSuppressed: _warningSuppressed, ...bare } = atom;
     const { warningSuppressed: _nextSuppressed, ...nextBare } = nextAtomById.get(atom.id)!;
+    const nextState = nativeAtomValidationState(nextBare, nextBonds, nextBare.formalCharge, nextAtoms, afterResolution);
+    const nextInvalid = !nextState.valid;
+    const priorAtom = baseline.atoms.find((candidate) => candidate.id === atom.id);
+    // An atom the tool just created has no earlier state: it is judged only as it ends up.
+    if (!priorAtom) return nextInvalid;
+    // The baseline excuses a problem the atom already had, never a result past its valence: a
+    // hypovalent literal atom (three bonds on a typed "C") is flagged before the addition, yet
+    // a double bond from it would still make a pentavalent carbon. The same holds when the change
+    // is a RAISED order on an existing bond (baseline === molecule), judged against the atom's own
+    // bond-order sum; lowering an order only reduces valence, so it is never refused here.
+    const { warningSuppressed: _warningSuppressed, ...bare } = priorAtom;
+    const priorState = nativeAtomValidationState(bare, baseline.bonds, bare.formalCharge, baseline.atoms, beforeResolution);
+    const nextElement = nativeElementFromAtomLabel(nextBare.element);
+    const raisesValence = baseline !== molecule || nextState.valenceUsed > priorState.valenceUsed;
+    if (raisesValence && nextInvalid && nextElement &&
+      !nativeAtomChargeSupportsValence(nextElement, nextState.valenceUsed, nextBare.formalCharge)) {
+      return true;
+    }
     // The proposed graph has already invalidated import-time hints. Judging it against the old
     // H count would refuse ordinary edits such as converting imported ethane to ethene.
-    return nativeAtomValidationState(bare, molecule.bonds, bare.formalCharge, molecule.atoms, beforeResolution).valid &&
-      !nativeAtomValidationState(nextBare, nextBonds, nextBare.formalCharge, nextAtoms, afterResolution).valid;
+    return priorState.valid && nextInvalid;
   };
-  return !breaks(fromAtom) && !breaks(toAtom);
+  const broken = [fromAtom, toAtom].find(breaks);
+  if (!broken) return undefined;
+  // Say "exceed" only when the change really adds valence; a lowering that leaves a typed atom
+  // short, or an aromatic ring unresolvable, is named by the validator's own reason.
+  const { warningSuppressed: _brokenSuppressed, ...brokenBare } = nextAtomById.get(broken.id)!;
+  const brokenState = nativeAtomValidationState(brokenBare, nextBonds, brokenBare.formalCharge, nextAtoms, afterResolution);
+  const priorBroken = baseline.atoms.find((candidate) => candidate.id === broken.id);
+  const priorBrokenState = priorBroken
+    ? nativeAtomValidationState(
+      (({ warningSuppressed: _w, ...bare }) => bare)(priorBroken),
+      baseline.bonds, priorBroken.formalCharge, baseline.atoms, beforeResolution)
+    : undefined;
+  const addsValence = baseline !== molecule || !priorBrokenState || brokenState.valenceUsed > priorBrokenState.valenceUsed;
+  if (addsValence || !brokenState.invalidReason) {
+    return `${broken.element} would exceed its valence with a ${order} bond`;
+  }
+  return `a ${order} bond would leave ${broken.element} invalid: ${brokenState.invalidReason}`;
 }
 
 function canGrowNativeAtom(molecule: MoleculeObject, atomId: string): boolean {
+  return nativeAtomGrowRefusalReason(molecule, atomId) === undefined;
+}
+
+function nativeAtomGrowRefusalReason(molecule: MoleculeObject, atomId: string): string | undefined {
   const valenceUsage = atomBondOrderUsageMap(molecule.atoms, molecule.bonds);
   const atom = molecule.atoms.find((candidate) => candidate.id === atomId);
-  return atom !== undefined && nativeAtomAvailableBondCount(atom, valenceUsage.get(atomId) ?? 0, molecule) > 0;
+  if (!atom) return "the atom to grow from is missing";
+  return nativeAtomAvailableBondCount(atom, valenceUsage.get(atomId) ?? 0, molecule) > 0
+    ? undefined
+    : `${atom.element} has no available valence`;
 }
 
 function canConnectNativeAtoms(
@@ -19768,32 +21004,36 @@ function canConnectNativeAtoms(
   sourceAtomId: string,
   targetAtomId: string
 ): boolean {
+  return nativeAtomsConnectRefusalReason(molecule, sourceAtomId, targetAtomId) === undefined;
+}
+
+function nativeAtomsConnectRefusalReason(
+  molecule: MoleculeObject,
+  sourceAtomId: string,
+  targetAtomId: string
+): string | undefined {
   if (sourceAtomId === targetAtomId) {
-    return false;
+    return "an atom cannot bond to itself";
   }
 
-  const atomIds = new Set(molecule.atoms.map((atom) => atom.id));
-  if (!atomIds.has(sourceAtomId) || !atomIds.has(targetAtomId)) {
-    return false;
+  const atomById = new Map(molecule.atoms.map((atom) => [atom.id, atom]));
+  const sourceAtom = atomById.get(sourceAtomId);
+  const targetAtom = atomById.get(targetAtomId);
+  if (!sourceAtom || !targetAtom) {
+    return "an atom to connect is missing";
   }
 
   if (molecule.bonds.some((bond) =>
     (bond.fromAtomId === sourceAtomId && bond.toAtomId === targetAtomId) ||
     (bond.fromAtomId === targetAtomId && bond.toAtomId === sourceAtomId)
   )) {
-    return false;
+    return "those atoms are already bonded";
   }
 
   const valenceUsage = atomBondOrderUsageMap(molecule.atoms, molecule.bonds);
-  const atomById = new Map(molecule.atoms.map((atom) => [atom.id, atom]));
-  const sourceAtom = atomById.get(sourceAtomId);
-  const targetAtom = atomById.get(targetAtomId);
-  return (
-    sourceAtom !== undefined &&
-    targetAtom !== undefined &&
-    nativeAtomAvailableBondCount(sourceAtom, valenceUsage.get(sourceAtomId) ?? 0, molecule) > 0 &&
-    nativeAtomAvailableBondCount(targetAtom, valenceUsage.get(targetAtomId) ?? 0, molecule) > 0
-  );
+  const full = [sourceAtom, targetAtom].find((atom) =>
+    nativeAtomAvailableBondCount(atom, valenceUsage.get(atom.id) ?? 0, molecule) <= 0);
+  return full ? `${full.element} has no available valence` : undefined;
 }
 
 function deleteNativeCarbonAtom(
@@ -19930,8 +21170,10 @@ function parseV3000MoleculeGraph(
   molfile: string,
   previous: MoleculeObject
 ): (Pick<MoleculeObject, "atoms" | "bonds"> & { labelWarnings: EditorSaveLabelWarning[] }) | undefined {
-  const rawAtoms: Array<{ sourceId: string; element: string; x: number; y: number; formalCharge: number }> = [];
-  const rawBonds: Array<{ sourceId: string; fromSourceId: string; toSourceId: string; order: MoleculeBond["order"]; dative: boolean }> = [];
+  const rawAtoms: Array<{
+    sourceId: string; element: string; isotope?: number; x: number; y: number; formalCharge: number
+  }> = [];
+  const rawBonds: Array<{ sourceId: string; fromSourceId: string; toSourceId: string; order: MoleculeBond["order"]; stereo?: "either"; dative: boolean }> = [];
   let section: "atom" | "bond" | undefined;
 
   for (const rawLine of molfile.split(/\r?\n/)) {
@@ -19961,13 +21203,15 @@ function parseV3000MoleculeGraph(
         continue;
       }
 
-      rawAtoms.push({
+      const mass = line.match(/\bMASS=([^\s]+)/);
+      rawAtoms.push(normalizeAtomIsotope({
         sourceId,
         element,
+        ...(mass ? { isotope: Number(mass[1]) } : {}),
         x,
         y,
         formalCharge: formalChargeFromV3000AtomLine(line)
-      });
+      }));
       continue;
     }
 
@@ -19981,6 +21225,7 @@ function parseV3000MoleculeGraph(
       fromSourceId,
       toSourceId,
       order: bondOrderFromV3000(rawOrder),
+      ...(rawOrder === "2" && /\bCFG=2\b/.test(line) ? { stereo: "either" as const } : {}),
       // V3000 bond type 9 is the coordination (dative) bond — restore the dashed display style.
       dative: rawOrder === "9"
     });
@@ -20009,6 +21254,7 @@ function parseV3000MoleculeGraph(
       id,
       element: atom.element,
       x: placed[index]!.x,
+      ...(atom.isotope === undefined ? {} : { isotope: atom.isotope }),
       y: placed[index]!.y,
       formalCharge: atom.formalCharge
     } satisfies MoleculeAtom;
@@ -20025,6 +21271,7 @@ function parseV3000MoleculeGraph(
       fromAtomId,
       toAtomId,
       order: bond.order,
+      ...(bond.stereo ? { stereo: bond.stereo } : {}),
       ...(bond.dative ? { display: { bondStyle: "dashed" as const } } : {})
     } satisfies MoleculeBond];
   });
@@ -20487,4 +21734,44 @@ function normalizeAngle(angle: number): number {
 function normalizeSignedAngle(angle: number): number {
   const normalized = normalizeAngle(angle);
   return normalized > Math.PI ? normalized - Math.PI * 2 : normalized;
+}
+
+/** Build an empty native table using the same text-style conversion as the text tool. */
+export function insertTableIntoDocument(document: ChemDraftDocument, options: TableInsertDimensions & {
+  preset: "three-line" | "grid"; center: { x: number; y: number }; newId: (prefix: string) => string;
+  textStyle?: Partial<NativeTextStyle>;
+}): ChemDraftDocument {
+  if (!validTableDimensions(options)) throw new Error("Invalid table dimensions");
+  const page = firstPage(document);
+  const blankRow = () => Array.from({ length: options.columns }, () => "");
+  const { object } = buildTableObject({
+    columns: Array.from({ length: options.columns }, () => ({ align: "left" })),
+    headerRows: Array.from({ length: options.headerRows }, blankRow),
+    rows: Array.from({ length: options.rows - options.headerRows }, blankRow),
+    style: { preset: options.preset }
+  }, { id: options.newId("table"), x: 0, y: 0, newId: options.newId,
+    style: textStyleToObjectStyle(options.textStyle ?? {}) });
+  const table = { ...object, tableStyle: { ...object.tableStyle, autoColumnMinEm: 3 } };
+  const layout = planTableLayout(table);
+  return addTableCenteredOnPage(document, { ...table, width: layout.width, height: layout.height }, options.center);
+}
+
+/**
+ * Add a new table centred on `center` and select it (Insert Table and table paste). Its drawn
+ * extent, including rule strokes and fixed-column text overflow, is kept on the page by the same
+ * pageConstrainedShift structure paste uses (document-workflow-core).
+ */
+export function addTableCenteredOnPage(
+  document: ChemDraftDocument,
+  table: Extract<DocumentObject, { type: "table" }>,
+  center: PagePoint
+): ChemDraftDocument {
+  const page = firstPage(document);
+  const centered = { ...table, x: center.x - table.width / 2, y: center.y - table.height / 2 };
+  const shift = pageConstrainedShift(page, tableVisualBoundsForArrangement(centered));
+  const placed = shift.x === 0 && shift.y === 0 ? centered : { ...centered, x: centered.x + shift.x, y: centered.y + shift.y };
+  return applyPatches(document, [
+    { op: "addObject", pageId: page.id, object: placed },
+    { op: "setSelection", pageId: page.id, objectIds: [placed.id] }
+  ], { now: phase4Timestamp });
 }

@@ -1,5 +1,6 @@
 import { defaultArrangementDraft } from "@chemdraft/layout-engine";
 import { describe, expect, it } from "vitest";
+import { structureTemplates } from "@chemdraft/template-library";
 import { engineInstallFixture } from "./engineInstallTestFixtures";
 import { toolInstallFixture } from "./toolInstallTestFixtures";
 import { DIALOG_PREVIEW_MAX_BYTES, DIALOG_MAX_BYTES, parseDialogMessage, validateDialogDelivery, type DialogMessage } from "./dialogProtocol";
@@ -45,6 +46,32 @@ it("validates spacing kinds, bounded preview chunks and typed actions without br
   expect(parseDialogMessage({...s,type:"result",data:{status:"accepted"}})).toBeDefined();
   expect(parseDialogMessage({...s,type:"result",data:{status:"exported"}})).toBeUndefined();
   expect(parseDialogMessage({...preview,dialogKind:"export"})).toBeUndefined();
+});
+
+it("validates insert-table snapshots and actions without accepting other dialog payloads", () => {
+  const options = { rows: 4, columns: 3, headerRows: 1, preset: "three-line" };
+  const message = { ...snapshot(), dialogKind: "insertTable", data: { title: "Drawing", ...options } };
+  expect(parseDialogMessage(message)).toEqual(message);
+  for (const preset of ["three-line", "grid"]) {
+    expect(parseDialogMessage({ ...message, type: "action", data: { action: "apply", ...options, preset } })).toBeDefined();
+  }
+  for (const change of [
+    { rows: 0 }, { rows: 501 }, { rows: 1.5 }, { rows: "4" },
+    { columns: 0 }, { columns: 65 }, { columns: 1.5 },
+    { headerRows: -1 }, { headerRows: 5 }, { headerRows: 0.5 },
+    { preset: "unknown" }, { path: "/private" }
+  ]) {
+    expect(parseDialogMessage({ ...message, data: { ...message.data, ...change } })).toBeUndefined();
+    expect(parseDialogMessage({ ...message, type: "action", data: { action: "apply", ...options, ...change } })).toBeUndefined();
+  }
+  for (const headerRows of [0, 500]) {
+    expect(parseDialogMessage({ ...message, data: { ...message.data, rows: 500, columns: 64, headerRows } })).toBeDefined();
+  }
+  expect(parseDialogMessage({ ...message, type: "action", data: { action: "cancel" } })).toBeDefined();
+  expect(parseDialogMessage({ ...message, type: "action", data: { action: "cancel", ...options } })).toBeUndefined();
+  expect(parseDialogMessage({ ...message, type: "action", data: { action: "preview", percent: 80 } })).toBeUndefined();
+  expect(parseDialogMessage({ ...message, data: snapshot().data })).toBeUndefined();
+  expect(parseDialogMessage({ ...message, dialogKind: "pageSize" })).toBeUndefined();
 });
 
 it("restricts large payloads to typed inline image/PDF previews", () => {
@@ -128,4 +155,19 @@ it("accepts only the bounded typed arrangement options on spacing snapshots and 
     for (const change of [{ layout: "spiral" }, { arrows: 1 }, { reverse: "false" }, { closeCycle: null }, { gridOrder: "implicit" }, { gridAlignment: "justify" }, { commandId: "edit.undo" },{arrowLength:29},{arrowLength:101},{arrowLength:NaN},{arrowLength:'70'},{arrowLength:null}])
       expect(parseDialogMessage({ ...m, data: { ...m.data, arrangement: { ...defaultArrangementDraft, ...change } } })).toBeUndefined();
   }
+});
+
+it("validates the template picker snapshot and its restricted actions", () => {
+  const message = { ...snapshot(), dialogKind: "structureTemplates", data: { title: "Drawing", templateIds: structureTemplates.map(template => template.id) } };
+  expect(parseDialogMessage(message)).toEqual(message);
+  for (const data of [{ title: "Drawing" }, { title: "", templateIds: [] }, { ...message.data, templateIds: ["unknown"] },
+    { ...message.data, templateIds: [structureTemplates[0]!.id, structureTemplates[0]!.id] }, { ...message.data, svg: "<script/>" }]) {
+    expect(parseDialogMessage({ ...message, data })).toBeUndefined();
+  }
+  expect(parseDialogMessage({ ...message, type: "action", data: { action: "insert", templateId: structureTemplates[0]!.id } })).toBeDefined();
+  for (const data of [{ action: "insert" }, { action: "insert", templateId: "../main" }, { action: "insert", templateId: "unknown" },
+    { action: "insert", templateId: structureTemplates[0]!.id, commandId: "document.new" }, { action: "apply" }]) {
+    expect(parseDialogMessage({ ...message, type: "action", data })).toBeUndefined();
+  }
+  expect(parseDialogMessage({ ...message, type: "result", data: { status: "inserted" } })).toBeDefined();
 });

@@ -61,7 +61,18 @@ into core — e.g. `import type { ChemDraftDocument, DocumentPatch } from "@chem
 ```
 
 `apiVersion` in your manifest declares the SDK contract you target (`PluginApiVersion`, currently
-`0.1.14`). API 0.1.14 adds one-shot draft restoration to overlay content; plugins using it
+`0.1.20`). API 0.1.20 adds optional `tableStyle.autoColumnMinEm`, the minimum auto column width in em. API 0.1.19 bounds panel reports: strings, collection sizes, aggregate work and UTF-8 JSON
+size are validated before a report is forwarded to the renderer (see [Panel report limits](#panel-report-limits)).
+API 0.1.17 adds optional `MoleculeBond.stereo: "either"` for an E/Z-unspecified double bond.
+It is allowed only on double bonds; plugins must preserve it when copying bonds and must not set it on other orders.
+API 0.1.16 adds optional positive integer `isotope` mass numbers to native document atoms.
+Native molecule objects returned by `chemistry.structureFromSmiles` and passed through document
+patches also preserve isotope masses. Hydrogen-2 and hydrogen-3 use elements `D` and `T` without an
+`isotope` field; other labelled atoms (including hydrogen-1) carry the mass number in `isotope`.
+Plugins using isotope fields should declare `^0.1.16`.
+API 0.1.18 adds command-scoped `documents.insertTable`; plugins using it should declare `^0.1.18`.
+API 0.1.15 adds command-scoped 3D embedding, minimization, and flattening; plugins using
+any of those methods should declare `^0.1.15`. API 0.1.14 adds one-shot draft restoration to overlay content; plugins using it
 should declare `^0.1.14`. API 0.1.13 adds live prompt disabled state to overlay content; plugins using it
 should declare `^0.1.13`. API 0.1.12 adds overlay content and command-scoped opening; plugins that use either
 should declare `^0.1.12`. API 0.1.10 adds panel input and canvas overlays; plugins that use either should declare
@@ -71,7 +82,17 @@ API 0.1.7 adds host-owned `context.chemistry.structureToName`; plugins that use 
 use it should declare `^0.1.6`. API 0.1.5 added command-scoped `context.images.requestImage`, 0.1.4 added
 `context.documents.applyPatch`, and 0.1.3 added the host-owned `context.dialogs.promptText`
 capability. API 0.1.9 adds `context.assistant` for request-scoped tools and MCP sessions.
-Existing `^0.1.0` through `^0.1.14` packages remain compatible, each on a host at or above the version it declares.
+Existing `^0.1.0` through `^0.1.20` packages remain compatible, each on a host at or above the version
+it declares.
+
+| API version | Additive capability | Permission |
+| --- | --- | --- |
+| 0.1.20 | Optional `tableStyle.autoColumnMinEm` | No new permission |
+| 0.1.19 | Bounded panel reports (`PluginPanelReportLimits`) and the exported `snapshotPanelReport` walk | No new permission |
+| 0.1.18 | `documents.insertTable(spec)` | `document.write`, during the plugin's own command |
+| 0.1.17 | Optional bond `stereo: "either"` for E/Z-unspecified double bonds | No new permission |
+| 0.1.16 | Optional atom `isotope` fields | No new permission |
+| 0.1.15 | `chemistry.embed3d`, `minimize3d`, `flatten3d` | `chemistry.compute`, during the plugin's own command |
 
 ## Manifest + registration
 
@@ -120,6 +141,55 @@ const runWidget: PluginCommandHandler = async (context) => {
 
 Report section kinds: `text`, `keyValue`, `table`, `svg`, `chemicalName`, and `linkedFigure` (an interactive
 spectrum/structure figure with a generic primary/alternative method model).
+
+### Panel report limits
+
+API 0.1.19 rejects an entire report when any limit is exceeded; it never truncates content.
+`PluginPanelReportLimits` exports the ceilings. `panels.showReport` validates before forwarding
+anything to a panel, preserving the previous report on failure. Its rejected promise carries a
+specific Zod issue, for example `linkedFigure peaks: 50001 exceeds the limit of 50000`.
+The existing command failure path displays the error in the desktop status line (and analyzer
+notice for analyzer commands); the worker capability error preserves the same message.
+
+| Content | Maximum |
+| --- | --- |
+| Entire report, UTF-8 JSON including field names and escaping | 134,217,728 bytes (128 MiB) |
+| Sections | 300 |
+| Each string (titles, labels, captions, method labels, nucleus, cells, text, source ids, etc.) | 1,048,576 UTF-16 code units |
+| SVG / image data URI | 512,000 / 1,048,576 code units |
+| Peaks, across all linked figures | 50,000 |
+| Atom indices per peak / across the report | 4,000 / 100,000 |
+| Couplings per peak / across the report | 16 / 160,000 |
+| Structure atoms / bonds, across all figures | 10,000 / 20,000 |
+| Table rows, across tables | 50,000 |
+| Table columns / cells per row | 256 / 256 |
+| Table cells, including column headers, across tables | 256,000 |
+| Key/value rows, across sections | 5,000 |
+| Chemical-name warnings, across sections | 10,000 |
+
+These are independent ceilings: a report must satisfy all of them together. Existing smaller
+limits still apply: solvent 120, alternative marker 8, control ids 64, select values 100,
+20 select options, 8 action buttons, prompt `maxLength` 20,000 and `rows` 12, and control
+payloads 4,000 serialized characters. Numbers anywhere in a report must be finite; `NaN`
+and positive/negative infinity are refused. Atom and bond endpoint indices and peak assignments
+must be non-negative integers; with structure geometry present, each must name a declared atom
+index, and structure atom indices must be unique. Without geometry there is no upper reference
+bound. The SDK also refuses cycles, accessors, non-JSON objects, nesting deeper than 128,
+objects with more than 256 own fields, and traversal beyond 2,000,000 nodes before schema parsing.
+The byte limit applies both before parsing and after defaults are filled in; an early size error
+reports the observed lower bound as `report serialized bytes (at least)`.
+
+The capacity tests generate synthetic data in memory: a 300-heavy-atom example expanded to
+900 explicit atoms/assignments and 14,400 coupling entries, and a long Assistant reply with
+eight near-1-MiB image sections. These test capacities, not prediction accuracy.
+
+Unreleased **0.1.19** also exports snapshotPanelReport(raw, overrides?), the bounded detached
+plain-data walk used before Zod. Overrides parameterise the existing ceilings. The overlay host
+snapshots the request directly with a 2 MiB traversal envelope, then applies
+PluginOverlayContentRequestSchema: 20 sections and 64 KiB of UTF-8 section JSON remain the
+overlay contract. It never wraps content in an action payload (whose separate limit is 4,000
+serialized characters). Getters, iterators, cycles and shared mutable references remain refused
+or detached before schema parsing.
 
 ## Plugin storage
 
@@ -316,6 +386,143 @@ command ends is refused. A plugin that holds `document.read` receives the insert
 The official MolScribe plugin declares `document.proposePatch`, not `document.read`, and spreads
 `proposedPatch` unchanged, so it takes this path with no code change.
 
+## 3D chemistry (0.1.15)
+
+Declare `chemistry.compute` and `apiVersion: "^0.1.15"` to receive the optional
+`context.chemistry` methods `embed3d`, `minimize3d`, and `flatten3d`. They are available only while
+one of the plugin's own commands is running. They use the app's in-process RDKit WASM worker: they
+do not start a process, use the network, or require a new permission.
+
+Use this sequence for a genuine host–guest or other multi-component complex. It embeds each
+component independently, lets the plugin arrange their relative positions, then relaxes the complex
+and writes the returned native molecules through the normal patch capability:
+
+```ts
+const embedded = await context.chemistry?.embed3d?.({
+  components: [{ smiles: hostSmiles }, { smiles: guestSmiles }],
+  seed: 42
+});
+if (!embedded) throw new Error("3D chemistry is unavailable");
+
+// Arrange the guest relative to the host by changing coordinates only.
+const arranged = moveComponent(embedded.model, 1, { x: 4, y: 0, z: 0 });
+const minimized = await context.chemistry?.minimize3d?.({
+  model: arranged,
+  interfragment: true,
+  maxIters: 10_000
+});
+if (!minimized) throw new Error("3D chemistry is unavailable");
+if (minimized.clash) throw new Error("Clashing 3D model; retry with another arrangement before insertion.");
+
+const flattened = await context.chemistry?.flatten3d?.({
+  model: minimized.model,
+  view: "auto"
+});
+if (!flattened) throw new Error("3D chemistry is unavailable");
+
+// Declare document.read and document.write for this insertion sequence.
+const documents = context.documents;
+if (!documents?.applyPatch) throw new Error("Document writing is unavailable");
+const document = await documents.getActiveDocument();
+const pageId = document?.pages[0]?.id;
+if (!pageId) throw new Error("No document page is available");
+await documents.applyPatch({
+  reason: "Insert complex",
+  patch: {
+    op: "batch",
+    patches: flattened.objects.map((object) => ({ op: "addObject", pageId, object }))
+  }
+});
+```
+
+`embed3d({ components, seed? })` accepts 1–8 `{ smiles }` components and defaults `seed` to 42. It
+creates explicit hydrogens, uses ETKDGv3 per component, and puts components side by side. The plugin
+is responsible for positioning one component relative to another before minimization. It returns
+`{ model, method, warnings }`.
+`minimize3d({ model, forceField?, interfragment, maxIters? })` accepts `mmff94s` (the default),
+`mmff94`, or `uff`; `maxIters` is at most 20,000. `interfragment` is required. Set it to `true` for
+the forces between components of a complex; it is refused for a single component. The returned force
+field result names the field, reports `converged`, `not-converged`, or `setup-failed`, energy, and
+the iterations budget; it may also report the closest inter-component heavy-atom distance in Angstrom. The complete
+result is `{ model, forceField, clash, closestInterComponentHeavyAtomA?, method, warnings }`.
+`clash` is a boolean, true when the closest inter-component heavy-atom contact is below 2.2 A,
+even when the force field reports `converged` or interactions are off. Single-component models
+return `clash: false` and omit the distance. A clash adds a specific warning naming the distance
+and the two atoms. Callers must not insert a clashing model. Screen starting arrangements for
+contacts and interpenetrating rings/chains, and retry with another arrangement; local minimization
+does not search for an unthreaded geometry or guarantee that a converged structure is usable.
+`flatten3d` independently refuses contacts below 2.2 A, including plugin-edited coordinates.
+The host screens the verified model before worker dispatch, so even a cold worker cannot delay
+this refusal behind RDKit startup:
+`flatten3d refused a clashing model: closest inter-component heavy-atom contact is 1.850 A between C atom 1 (component 1) and O atom 10 (component 2); below 2.2 A. Retry with another arrangement.`
+These atom indices are one-based in the complete model; component numbers are one-based too.
+
+The model includes a host-signed `modelToken` over its atoms and bonds. A plugin may change its
+coordinates, but never its chemical graph. `flatten3d({ model, view })` accepts an orthonormal,
+row-major 3×3 rotation (nine numbers) or `"auto"`; it returns one native molecule per component,
+2D coordinates, wedges/hashes for input-specified centres, `depthByAtom`, and warnings. It uses the same
+flattening as Spin 3D and refuses a component whose stereochemistry would not survive. It returns
+`{ objects, depthByAtom, method, warnings }`: inserting them requires `document.write` and
+`documents.applyPatch`, so each call (including one batch) creates one labelled undo entry.
+Returned molecule frames use the same padded atom/label bounds as SMILES paste, without changing
+projected atoms or `depthByAtom`. Placement measures molecules by the union of their frame and atom
+extents, even for plugin-supplied objects with inconsistent frames; other objects use their existing bounds.
+The host preserves authored positions when the inserted group's combined bounds are fully inside
+the page. A group overlapping the page but sticking out is nudged by the smallest translation
+that brings the whole group inside. A group entirely outside the page is translated to the visible
+page center, clamped inside page bounds, before that commit. A group referencing any object that
+existed before the patch (including atom-anchored charges and arrows) is never moved. Relative positions are preserved and
+changed objects stay selected. Only groups needing translation can be refused as too large, atomically with
+`Plugin insertion is larger than the page; choose a larger page or a smaller drawing before inserting.`
+Colliding inserted object ids are rebased to fresh ids. All native references within the batch,
+including attachment points on superatoms and R-groups (standalone or inside molecules), follow
+the rebased objects, including self and forward insertion references. Atom and bond ids remain local
+to their molecule and unchanged; opaque strings and original source ids are preserved.
+Flatten outputs retain input atoms, including separate explicit H atoms from the input SMILES,
+and omit H atoms added only to build the 3D model. Wedges/hashes are reconciled on the retained
+graph; canonical isomeric SMILES must still match. `depthByAtom` is indexed by each returned native
+molecule's atom order, centered on that retained atom centroid and rotated into view, in Angstrom.
+It is not indexed by the model's full explicit-H atom list.
+
+Each SMILES is limited to 5,000 characters; all components together are limited to 500 heavy atoms.
+Embedding has one total budget of 15 seconds multiplied by the supplied component count;
+minimization has 60 seconds and flattening 5 seconds. Queue time counts inside that budget,
+including both the plugin queue and the app-wide worker queue; component progress never resets it.
+An assigned cold worker's module/WASM startup has its own bounded 30-second budget, excluded from
+both work timers. Readiness resumes the remaining work budget, preserving queue time already spent.
+The refusal is `<method> worker startup timed out after 30 seconds.`; work/queue expiry remains
+`<method> timed out after <seconds> seconds including queue time.`. Queueing behind another call's
+startup still counts. Warm PEG2/PEG8 Node measurements and the rationale for keeping the fixed
+five-second flatten budget are in `apps/desktop/src/chemistry3d/README.md`.
+Each plugin may run one 3D call and queue eight; further calls
+fail with `Plugin "<id>" 3D chemistry is busy: at most 1 running call and 8 queued calls are allowed.`
+The app shares at most two reusable RDKit 3D workers. Command end cancels running work and clears
+that plugin's queue; timeout or cancellation terminates the affected worker.
+Minimization checks only the tetrahedral centres and E/Z bonds explicitly specified in each
+component's signed SMILES, both before and after optimization. Unspecified sites are ignored.
+Refusals identify the component and one-based centre or bond, for example
+`Component 1: minimize3d input would change specified tetrahedral stereo at centre 2; restore the input geometry.`
+or `Component 1: minimize3d result would change specified E/Z stereo at bond 2-3; restore the input geometry.`
+Flattening checks incoming geometry by the same rule (phase `flatten3d input`), keeps specified
+stereo, and never adds wedges/hashes at unspecified tetrahedral sites. A stereogenic double bond
+without E/Z in the signed SMILES becomes a native `stereo: "either"` bond, preserving unspecified
+intent through MOL serialization and later Spin 3D flattening. Specified `/` or `\` stereo must
+survive projection and final canonical isomeric SMILES read-back. RDKit perceives potential E/Z;
+carbonyls, terminal and symmetric alkenes, small-ring double bonds, aromatic rings, and a symmetric
+TTF central double bond receive no either flag. `embed3d` and `minimize3d` also accept unspecified E/Z.
+
+Native drawing atoms have no isotope mass field. `flatten3d` therefore refuses isotopic components
+before depiction or view search:
+`Component 1 ([13CH3]CO) carries isotope labels (13C), which ChemDraft drawings cannot store yet; flatten3d refuses rather than drop them.`
+`embed3d` and `minimize3d` still accept and preserve isotopes in the 3D-only model.
+Do not call `minimize3d` for a single
+molecule: normal 2D layout (`structureFromSmiles`) is its appropriate path and does not pay for 3D.
+
+Every result records this method contract: **RDKit MinimalLib Release_2026_03_3 + patches
+0001-0008; ETKDGv3 seed; force field; nonbonded cutoff 10 A; gas phase; no counterions or solvent;
+energies rank starting geometries only and are not binding energies; a local minimum, not an
+equilibrium structure.** A plugin must never present the energy to users as meaningful.
+
 ## Panel input and canvas overlays (0.1.10–0.1.14)
 
 API 0.1.10 lets a report contain interactive, host-rendered sections. Declare
@@ -507,12 +714,52 @@ const receipt = await context.documents.applyPatch?.({
 ```
 
 `applyPatch` is absent without `document.write`, and a retained method reference rejects after the
-command invocation ends. It accepts **insertion only** — `addObject` and `addAnnotation`, both of which
-refuse an id that already exists. Any other op (`removeObject`, `updateObject`, `moveObject`,
-`updatePageLayout`, `setSelection`, …) is refused with an error naming the op: changing or removing what
-is already in the document is not deterministic insertion of user input, so it goes through
-`proposePatch` and the user's review. The direct write is one undo entry labelled with the plugin and command; it
-does not open the proposal review tray/window.
+command invocation ends. It may insert objects and annotations, and update, move, remove, or reorder
+only objects selected when that command started plus its accepted insertions. Flat batches of
+1–256 operations are atomic. The direct write is one undo entry labelled with the plugin and command;
+it does not open the proposal review tray/window. Assistant writes join one transaction per request.
+
+### Native tables (0.1.18)
+
+Plugins may read the optional `tableStyle.autoColumnMinEm` minimum auto column width in em.
+`documents.insertTable` does not set it.
+
+Declare `document.write` and `apiVersion: "^0.1.18"`. The optional
+`context.documents.insertTable(spec: PluginTableSpec)` validates untrusted input with the shared
+table builder, places it beside the command's selection (or at the viewport centre), and uses the
+same command-scoped direct-patch path. It returns `AppliedPatchReceipt`, leaves the native table
+selected, and creates one undo entry labelled **Insert table**. The inserted table is in scope for
+later `applyPatch` calls during that command. A retained method rejects after the command ends.
+
+```ts
+import type { PluginCommandContext, PluginTableSpec } from "@chemdraft/plugin-api";
+
+export async function insertMeasuredValues(context: PluginCommandContext) {
+  const spec: PluginTableSpec = {
+    columns: [{ header: "Formula" }, { header: "Mass (g)", align: "decimal" }],
+    rows: [["H2O", "18.015"], ["CO2", "44.01"]],
+    caption: "Measured values",
+    footnotes: ["Values supplied by the user."],
+    style: { preset: "three-line", headerBold: true }
+  };
+  return context.documents.insertTable!(spec);
+}
+```
+
+`PluginTableSpec` accepts column `header`, `align`, `widthPx`, and `formula` (`auto` or `off`),
+body `rows`, optional explicit `headerRows`, `caption`, `footnotes`, and `style` (`preset`,
+`headerBold`, `fontFamily`, `fontSizePx`). A cell is a string or `{ text, spans?, formula? }`;
+spans accept `text`, `script` (`normal`, `subscript`, `superscript`), `bold`, and `italic`, and their
+text must concatenate to the cell text. Limits are 64 columns, 500 total rows including headers,
+2,000 characters per cell, and 50 footnotes. Invalid input rejects with the same typed validation
+errors as patches; ragged rows name the row, and cell errors carry their row/column path.
+
+Plain strings in text columns receive formula subscripts automatically; decimal columns default
+to formula formatting off. Put numbers in decimal columns and units in headers. Tables never compute
+values. The assistant's `insert_table` tool accepts this same spec plus optional `besideObjectId`
+(placement to its right, using the same host placement rules as `insert_text`). It joins the request's
+single undo transaction, and its table is in scope for later tools in that request. `listTools()` and
+MCP tool sessions advertise the schema automatically.
 
 Use `applyPatch` only when the user supplied the input and the result is deterministic, such as a
 name-to-structure command acting on text entered in the host prompt. Use `proposePatch` for uncertain
@@ -659,7 +906,15 @@ manual package installs and updates. Before either an official install or an upd
 ordinary package-review screen discloses permissions and provenance. The plugin worker remains under
 its same-origin-only CSP and receives no network or filesystem capability for this workflow.
 
-Update checks and installs are user-initiated. ChemDraft first shows an available version, then
+On macOS and Windows, ChemDraft automatically checks installed official plugins daily, starting
+15 seconds after the installed catalog is ready. **Check for plugin updates automatically** in
+Preferences is on by default; turning it off leaves the Plugin Manager's manual **Check** available.
+Checks fetch release metadata only. Available updates appear in **Plugins ▸ Plugin Updates
+Available (N)…** and in each Plugin Manager row. A status-line notice appears once per new
+plugin version; automatic failures are logged quietly. No check runs in the web preview or when
+no official plugin is installed. A daily timestamp is saved only when at least one source answers.
+
+Installs remain user-initiated. ChemDraft first shows an available version, then
 downloads and inspects the package for a second review screen; only an explicit **Update** action
 starts the replacement transaction. The active package stays intact until the candidate has passed
 its worker handshake and the new install record commits.

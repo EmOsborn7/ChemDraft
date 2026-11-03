@@ -1,4 +1,35 @@
-import { inflateSync } from "node:zlib";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
+import { jsPDF } from "jspdf";
+
+/** A valid ~16.8 MB PNG whose base64 exceeds the 20 MiB SVG markup budget. */
+export function largePicturePng(): Buffer {
+  const side = 2048;
+  const stride = side * 4 + 1;
+  const pixels = Buffer.alloc(stride * side, 255);
+  for (let row = 0; row < side; row++) pixels[row * stride] = 0; // Unfiltered RGBA scanlines.
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(side, 0);
+  header.writeUInt32BE(side, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const chunk = (type: string, data: Buffer) => {
+    const bytes = Buffer.alloc(data.length + 12);
+    bytes.writeUInt32BE(data.length, 0);
+    bytes.write(type, 4, "ascii");
+    data.copy(bytes, 8);
+    bytes.writeUInt32BE(crc32(bytes.subarray(4, -4)), bytes.length - 4);
+    return bytes;
+  };
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk("IHDR", header), chunk("IDAT", deflateSync(pixels, { level: 0 })), chunk("IEND", Buffer.alloc(0))]);
+}
+
+/** Deterministic Helvetica advances for the headless ASCII alignment tests (SVG px in/out). */
+export function standardFontTextWidth(text: string, fontSizePx: number): number {
+  const metrics = new jsPDF({ unit: "pt" });
+  metrics.setFont("helvetica").setFontSize(fontSizePx);
+  return metrics.getTextWidth(text);
+}
 
 // Decode actual jsPDF objects and streams, including compressed content and CMaps.
 function pdfObjects(bytes: Uint8Array): Map<number, string> {
@@ -51,6 +82,49 @@ export function extractPdfTextRuns(bytes: Uint8Array): string[] {
         result.push(fontObject.includes("/Encoding /WinAnsiEncoding")
           ? new TextDecoder("windows-1252").decode(Buffer.from(literal, "latin1"))
           : literal);
+      }
+    }
+  }
+  return result;
+}
+
+/** Positions and effective sizes in PDF page points (y increases upwards), after cm/Tm.
+ * This reads the real Tj operators, rather than trusting the input SVG's attributes.
+ */
+export function extractPdfPositionedTextRuns(bytes: Uint8Array): Array<{
+  text: string; x: number; y: number; fontSize: number;
+}> {
+  type Matrix = [number, number, number, number, number, number];
+  const identity = (): Matrix => [1, 0, 0, 1, 0, 0];
+  const multiply = (a: Matrix, b: Matrix): Matrix => [
+    a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1],
+    a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+    a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]
+  ];
+  const texts = extractPdfTextRuns(bytes);
+  const result: Array<{ text: string; x: number; y: number; fontSize: number }> = [];
+  for (const object of pdfObjects(bytes).values()) {
+    if (!object.includes("stream\n")) continue;
+    let matrix = identity(), textMatrix = identity(), fontSize = 0;
+    const stack: Array<{ matrix: Matrix; fontSize: number }> = [];
+    for (const line of stream(object).toString("latin1").split("\n")) {
+      const parts = line.trim().split(/\s+/), op = parts.pop();
+      const numbers = parts.map(Number);
+      if (op === "q") stack.push({ matrix: [...matrix], fontSize });
+      else if (op === "Q") {
+        const saved = stack.pop();
+        if (saved) { matrix = saved.matrix; fontSize = saved.fontSize; }
+      } else if (op === "cm") matrix = multiply(matrix, numbers as Matrix);
+      else if (op === "BT") textMatrix = identity();
+      else if (op === "Tf") fontSize = numbers[1]!;
+      else if (op === "Tm") textMatrix = numbers as Matrix;
+      else if (op === "Td") textMatrix = multiply(textMatrix, [1, 0, 0, 1, numbers[0]!, numbers[1]!]);
+      else if (op === "Tj") {
+        const effective = multiply(matrix, textMatrix);
+        const text = texts[result.length];
+        if (text === undefined) throw new Error("Missing decoded PDF text run");
+        result.push({ text, x: effective[4], y: effective[5],
+          fontSize: fontSize * Math.hypot(effective[2], effective[3]) });
       }
     }
   }

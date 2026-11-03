@@ -42,6 +42,10 @@ import type { IconName } from "./icons";
 import type { ToolbarAssetName } from "./toolbarAssets";
 import { SPIN3D_DEBUGGER_COMMAND_ID } from "./conformerDebug";
 import { NO_OPEN_WARNINGS_REASON, TOGGLE_OPEN_WARNINGS_COMMAND_ID } from "./openWarnings";
+import { createTableCommands, type ActiveTableCell } from "./tableCommands";
+export { tableRuleWidthCommandId, parseTableRuleWidthCommandId } from "./tableCommands";
+import { templateDialogAction, templateInsertActions } from "./templateCommands";
+export { templateInsertCommandId } from "./templateCommands";
 
 export interface CommandAvailability {
   canUndo?: boolean;
@@ -58,6 +62,7 @@ export interface CommandAvailability {
 }
 
 export interface ShellCommandOptions {
+  activeTableCell?: ActiveTableCell;
   compoundLayoutsEnabled?: boolean;
   availability?: CommandAvailability;
   registry?: DesktopToolsetRegistry;
@@ -123,6 +128,7 @@ export function createQuickActions(
     { id: "view.zoomIn", title: "Zoom In", icon: "zoomIn", shortcut: "Cmd++", source: "core" },
     { id: "view.toggleToolPalette", title: "Toggle Tool Palette", icon: "palette", source: "core" },
     { id: "export.open", title: "Export...", icon: "export", shortcut: "Shift+Cmd+E", source: "core" },
+    templateDialogAction,
     {
       id: "analyze.molecularProperties",
       title: "Molecular Inspector…",
@@ -195,7 +201,46 @@ export const copyAsMenuItems: ReadonlyArray<{ commandId: string; label: string }
   { commandId: "clipboard.copyAs.png", label: "PNG" }
 ];
 
+export const fragmentSproutCommands = [
+  ["cyclopropyl", "Cyclopropyl"], ["cyclobutyl", "Cyclobutyl"],
+  ["alkyne", "Alkyne"], ["cyclopentadienyl", "Cyclopentadienyl"], ["phenyl", "Phenyl"]
+] as const;
+
+export type FragmentSproutKind = typeof fragmentSproutCommands[number][0];
+
+export function fragmentSproutCommandId(kind: FragmentSproutKind): string {
+  return `atom.sproutFragmentAtHoveredAtom.${kind}`;
+}
+
+export function fragmentSproutKindForCommand(commandId: string): FragmentSproutKind | undefined {
+  return fragmentSproutCommands.find(([kind]) => fragmentSproutCommandId(kind) === commandId)?.[0];
+}
+
+// Case-sensitive keys must stay free of tool/command shortcuts in BOTH presets.
+// In particular, v selects in the default preset and j selects benzene in the alternate preset.
+export const fragmentAtomDrawingHotkeys: Readonly<Record<string, string>> = {
+  g: fragmentSproutCommandId("cyclopropyl"),
+  u: fragmentSproutCommandId("cyclobutyl"),
+  z: fragmentSproutCommandId("alkyne"),
+  G: fragmentSproutCommandId("cyclopentadienyl"),
+  J: fragmentSproutCommandId("phenyl")
+};
+
+export const fragmentBondDrawingHotkeys: Readonly<Record<string, string>> = {
+  g: "bond.fuseRingAtHoveredBond.cyclopropane",
+  z: "bond.fuseDieneAtHoveredBond"
+};
+
 export const editActions: CommandSpec[] = [
+  ...fragmentSproutCommands.map(([kind, label]): CommandSpec => ({
+    id: fragmentSproutCommandId(kind), title: `Sprout ${label} at Hovered Atom`,
+    icon: "bond", source: "core", category: "edit", description: `Attach a ${label} fragment to the hovered atom`
+  })),
+  { id: "bond.fuseRingAtHoveredBond.cyclopropane", title: "Fuse 3-Membered Ring at Hovered Bond",
+    icon: "ring3", source: "core", category: "edit", description: "Fuse a cyclopropane onto the hovered bond" },
+  { id: "bond.fuseDieneAtHoveredBond", title: "Fuse Cyclopentadiene at Hovered Bond",
+    icon: "ring", source: "core", category: "edit", description: "Fuse a cyclopentadiene onto the hovered bond" },
+
   {
     id: "atom.addSingleBondToHoveredAtom",
     title: "Add Single Bond to Hovered Atom",
@@ -281,11 +326,11 @@ export const editActions: CommandSpec[] = [
   },
   {
     id: "atom.sproutGemDimethylAtHoveredAtom",
-    title: "Add gem-Dimethyl to Hovered Atom",
+    title: "Add gem-Dimethyl or Isopropyl to Hovered Atom",
     icon: "bond",
     source: "core",
     category: "edit",
-    description: "Grow two methyl groups from the hovered atom"
+    description: "Grow two methyl groups, or attach isopropyl when carbon has fewer than two free valences"
   },
   {
     id: "atom.addCyclicBondToHoveredAtom",
@@ -393,12 +438,12 @@ export const editActions: CommandSpec[] = [
   },
   {
     id: "atom.addCarbonylToHoveredAtom",
-    title: "Add Carbonyl to Hovered Carbon",
+    title: "Add Carbonyl or Oxo to Hovered Atom",
     icon: "bond",
     source: "core",
     shortcut: "K",
     category: "edit",
-    description: "Grow a neutral C=O from the hovered native carbon atom"
+    description: "Add C=O at carbon, or add =O directly at sulfur or phosphorus"
   },
   {
     id: "atom.addPositiveChargeToHoveredAtom",
@@ -855,6 +900,34 @@ export const customMoleculeStructureBondSpacingPercentCommandPrefix = "molecule.
 export const customMoleculeStructureMultipleBondGapCommandPrefix = "molecule.structure.multipleBondGap:";
 export const customMoleculeStructureDoubleBondInsetCommandPrefix = "molecule.structure.doubleBondInset:";
 export type DoubleBondPosition = "left" | "center" | "right" | "automatic";
+export type BondStereoValue = "either" | "geometry" | "flipped";
+export function moleculeBondStereoCommandId(value: BondStereoValue): string {
+  return `molecule.bondStereo:${value}`;
+}
+export function moleculeBondStereoForCommand(id: string): { value: BondStereoValue } | undefined {
+  return (["either", "geometry", "flipped"] as const).map(value => ({ value }))
+    .find(({ value }) => moleculeBondStereoCommandId(value) === id);
+}
+export function createBondStereoActions(state: {
+  eitherDisabledReason?: string; geometryDisabledReason?: string; descriptor?: "E" | "Z";
+}): CommandSpec[] {
+  return (["either", "geometry"] as const).map(value => {
+    const disabledReason = value === "either" ? state.eitherDisabledReason : state.geometryDisabledReason;
+    return {
+      id: moleculeBondStereoCommandId(value),
+      title: value === "either" ? "Mark E/Z as unspecified" : `Use drawn geometry${state.descriptor ? ` (${state.descriptor})` : ""}`,
+      icon: "bond", source: "core", category: "molecule", enabled: !disabledReason, disabledReason
+    };
+  });
+}
+/** Exposed by the open-bond popover, leaving the inspector's existing actions intact. */
+export function createFlippedBondStereoAction(state: { descriptor?: "E" | "Z" }, disabledReason?: string): CommandSpec {
+  return {
+    id: moleculeBondStereoCommandId("flipped"),
+    title: `Use the other geometry${state.descriptor ? ` (${state.descriptor === "E" ? "Z" : "E"})` : ""}`,
+    icon: "bond", source: "core", category: "molecule", enabled: !disabledReason, disabledReason
+  };
+}
 export function moleculeDoubleBondPositionCommandId(value: DoubleBondPosition): string {
   return `molecule.structure.doubleBondPosition:${value}`;
 }
@@ -2281,6 +2354,7 @@ export function allShellCommands(
 ): CommandSpec[] {
   const registry = options.registry ?? desktopToolsetRegistry;
   return dedupeCommands([
+    ...createTableCommands(document, options.activeTableCell),
     ...createQuickActions(document, selectedMolecule, options.availability),
     ...createLayerActions(document, options.compoundLayoutsEnabled),
     // Generated launchers must beat a persisted toolbar occurrence under first-wins dedupe. The
@@ -2294,6 +2368,7 @@ export function allShellCommands(
     ...viewActions,
     createOpenWarningsAction(options.availability),
     ...pageSizeActions,
+    ...templateInsertActions,
     pageCustomSizeAction,
     ...pageOrientationActions,
     ...textToolbarActions,

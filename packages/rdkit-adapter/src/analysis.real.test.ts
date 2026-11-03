@@ -1,5 +1,5 @@
 /**
- * Engine regression against the vendored RDKit 2026.03.3 artifact (PLANS.md §10, verification layer 1).
+ * Engine regression against the vendored RDKit 2026.03.3 artifact (docs/plans/PLANS.md §10, verification layer 1).
  *
  * "Pinned outputs from the exact RDKit/OCL/IsoSpec/MOPAC version, so a dependency bump is a visible
  * failure, not a silent number change. → Phase 2, because the pins are what make release 1's numbers
@@ -154,7 +154,8 @@ describe("composition is source-preserving", { timeout: 60_000 }, () => {
     const labelled = await analyze("[13CH3]C(=O)O");
     const unlabelled = await analyze("CC(=O)O");
 
-    expect(composition(labelled).formula).toBe("[13C]CH4O2");
+    // This string is RDKit's own CalcMolFormula output with separate isotopes.
+    expect(composition(labelled).formula).toBe("C[13C]H4O2");
     expect(composition(labelled).hasExplicitIsotopes).toBe(true);
     expect(composition(unlabelled).formula).toBe("C2H4O2");
     expect(composition(unlabelled).hasExplicitIsotopes).toBe(false);
