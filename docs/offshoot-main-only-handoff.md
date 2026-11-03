@@ -15,7 +15,9 @@
 - First CI run `41693759962`: Windows passed all checks; Linux passed 14,737 tests but
   failed two existing label glyph-tightness assertions; macOS was cancelled. The Linux runner
   image changed from main's successful run earlier that day. The glyph test now explicitly
-  selects Liberation Sans on Linux, and CI installs that font; assertions are unchanged.
+  loads one explicit font: Arial on macOS/Windows, Liberation Sans on Linux (installed by
+  CI). No per-label system-font scan remains, and all assertions are unchanged. The original
+  local glyph run timed out on font scans; all 18 tests passed after this fix with one worker.
 - Fresh Linux/macOS/Windows CI is required before merging PR #201. Native hands-on checks
   and a packaged launch remain unverified on both platforms.
 
