@@ -1,5 +1,21 @@
 # Standalone offshoot handoff
 
+## Update to 1.1.0 main (2026-11-03)
+
+- Merged `jgassens/main` at `8c27d4819df011c2e313b877f7f5796e045cfc1e`,
+  including the published 1.1.0 version and update feeds. No release assets are republished.
+- Preserved both the offshoot and current table/clipboard/template features when resolving
+  conflicts in MainWindow, imports, exports and package documentation. Opening an offshoot,
+  table-alignment, arrangement or Copy As flyout closes its siblings; a DOM regression covers this.
+- Build stamp: `11.03.12.30-codex`. Native Rust files match current main.
+- Local validation is sequential: root TypeScript passed with a bounded 4 GiB Node heap.
+  The first attempt hit Node's default 2 GiB heap limit. All 406 tests in 11 focused files passed with
+  `--maxWorkers=1 --no-file-parallelism`; project timeout settings are unchanged.
+- Fresh Linux/macOS/Windows CI is required before merging PR #201. Native hands-on checks
+  and a packaged launch remain unverified on both platforms.
+
+## Earlier standalone work
+
 - Branch/worktree: `codex/offshoot-main-only` in `ChemDraft-offshoot-main`.
 - Base: `jgassens/main` commit `20112a1` (fetched 2026-10-25).
 - Replaces PR #201's stacked branch with a standalone offshoot change. Shared offshoot helpers

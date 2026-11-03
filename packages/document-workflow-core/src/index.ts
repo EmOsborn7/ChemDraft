@@ -1,3 +1,5 @@
+export * from "./chemicalIdentity";
+export * from "./formulaText";
 export * from "./atoms";
 export * from "./documentInventory";
 export * from "./gridLayout";
@@ -15,13 +17,20 @@ export {
 export * from "./labelGroups";
 export * from "./labelOnBondedAtom";
 export * from "./molecule";
+export * from "./pageConstraint";
 export * from "./moleculeSmiles";
 export * from "./reactionArrows";
 export * from "./reactionScheme";
+export * from "./reactionLabels";
 export * from "./shared";
 export * from "./smiles";
 export * from "./structureName";
+export * from "./structureTemplates";
 export * from "./textObjects";
 export * from "./documentStyle";
 
 export * from "./reactionArrowAttachments";
+
+export * from "./sourceBondSemantics";
+export * from "./drawingDefaults";
+export * from "./tables";

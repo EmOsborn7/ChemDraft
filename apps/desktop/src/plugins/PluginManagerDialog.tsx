@@ -29,6 +29,7 @@ import type {
   PreparedPluginUpdate
 } from "./pluginUpdates";
 import { EXPERIMENTAL_PLUGIN_NOTICE, isNetworkDownloadFailure, isOfficialPluginExperimental, OFFICIAL_PLUGIN_CATALOG } from "./pluginUpdates";
+import { installedPluginCatalogKey, type TimedPluginUpdateCheckResult } from "./pluginUpdateAutoCheck";
 import { installSpaceStatement } from "../dialogs/engineInstallText";
 import { RecognitionInstallProgress } from "./RecognitionInstallProgress";
 import { applyEnabledPlugins, type BundledPluginDescriptor } from "./registerBundledPlugins";
@@ -62,6 +63,7 @@ function requiresRecognitionEngine(pluginId: string | undefined): boolean {
 }
 
 export interface PluginManagerDialogProps {
+  onShown?: () => void;
   runtime: DesktopPluginRuntime;
   bundledPlugins: readonly BundledPluginDescriptor[];
   /** Plugins installed from a package (M36). Empty where installing is unsupported (browser build, tests). */
@@ -76,6 +78,8 @@ export interface PluginManagerDialogProps {
   /** Download and inspect one entry from the host-owned official catalog. */
   onPrepareOfficialPluginInstall?: (pluginId: string) => Promise<PreparedOfficialPluginInstall>;
   onUninstallPlugin?: (pluginId: string) => Promise<void>;
+  /** Successful cached checks appear without starting another request. */
+  cachedPluginUpdateResults?: readonly TimedPluginUpdateCheckResult[];
   /** Host-owned update operations. All are absent outside the Tauri desktop. */
   onCheckPluginUpdates?: () => Promise<readonly PluginUpdateCheckResult[]>;
   onPreparePluginUpdate?: (offer: PluginUpdateOffer) => Promise<PreparedPluginUpdate>;
@@ -108,7 +112,9 @@ type PluginManagerBusyOperation =
 
 interface CatalogBoundUpdateResults {
   catalogKey: string;
-  results: ReadonlyMap<string, PluginUpdateCheckResult>;
+  /** Each shared cache publication has a new array identity, including a manual check's cache. */
+  cacheAtCheck: readonly PluginUpdateCheckResult[] | undefined;
+  results: ReadonlyMap<string, TimedPluginUpdateCheckResult>;
 }
 
 interface CatalogBoundPreparedUpdate {
@@ -122,7 +128,7 @@ interface PluginManagerNotice {
   catalogKey?: string;
 }
 
-const NO_PLUGIN_UPDATE_RESULTS: ReadonlyMap<string, PluginUpdateCheckResult> = new Map();
+const NO_PLUGIN_UPDATE_RESULTS: ReadonlyMap<string, TimedPluginUpdateCheckResult> = new Map();
 
 /**
  * Core-owned manager (ADR-0027) for both the plugins compiled into this build and those installed from a
@@ -150,6 +156,7 @@ export function PluginManagerDialog({
   onPrepareOfficialPluginInstall,
   onUninstallPlugin,
   onCheckPluginUpdates,
+  cachedPluginUpdateResults,
   onPreparePluginUpdate,
   onUpdatePlugin,
   recognitionEngineStatus,
@@ -160,6 +167,7 @@ export function PluginManagerDialog({
   onUninstallRecognitionEngine,
   onShowRecognitionScreenCaptures,
   onClose,
+  onShown,
   onPluginsChanged
 }: PluginManagerDialogProps) {
   const titleId = useId();
@@ -181,14 +189,26 @@ export function PluginManagerDialog({
   const busy = busyOperation !== undefined;
   const backdropPressStartedRef = useRef(false);
   const dialogRef = useRef<HTMLElement>(null);
+  const shownRef = useRef(false);
+  useEffect(() => {
+    if (shownRef.current) return;
+    shownRef.current = true;
+    onShown?.();
+  }, [onShown]);
 
   const installedCatalogKey = installedPluginCatalogKey(installedPlugins);
   const pendingUpdate =
     pendingUpdateState?.catalogKey === installedCatalogKey ? pendingUpdateState.prepared : undefined;
-  const updateResults =
-    updateResultsState?.catalogKey === installedCatalogKey
-      ? updateResultsState.results
-      : NO_PLUGIN_UPDATE_RESULTS;
+  const manualResults = updateResultsState?.catalogKey === installedCatalogKey ? updateResultsState : undefined;
+  const updateResults = new Map(
+    manualResults && manualResults.cacheAtCheck === cachedPluginUpdateResults
+      ? manualResults.results
+      : [
+          // Automatic failures are filtered from the shared cache. Keep manual-only failure rows.
+          ...[...(manualResults?.results ?? NO_PLUGIN_UPDATE_RESULTS)].filter(([, result]) => result.status === "failed"),
+          ...(cachedPluginUpdateResults ?? []).map(result => [result.pluginId, result] as const)
+        ]
+  );
   const notice =
     noticeState &&
     (noticeState.catalogKey === undefined || noticeState.catalogKey === installedCatalogKey)
@@ -435,9 +455,11 @@ export function PluginManagerDialog({
   const checkForUpdates = (): Promise<void> =>
     run({ kind: "checkUpdates" }, async () => {
       const results = await onCheckPluginUpdates!();
+      const checkedAt = Date.now();
       setUpdateResultsState({
         catalogKey: installedCatalogKey,
-        results: new Map(results.map((result) => [result.pluginId, result]))
+        cacheAtCheck: cachedPluginUpdateResults,
+        results: new Map(results.map((result) => [result.pluginId, { ...result, checkedAt }]))
       });
       setNoticeState({
         catalogKey: installedCatalogKey,
@@ -804,7 +826,7 @@ export function PluginManagerDialog({
               {!installedPluginCatalogReady
                 ? "Installed plugins are still loading. Package and update actions will be available shortly."
                 : canInstall && canUpdate
-                ? "Install plugins you trust. Update checks are user-initiated and limited to ChemDraft's trusted catalog."
+                ? "Install plugins you trust. ChemDraft checks its trusted catalog for updates once a day (you can turn this off in Preferences) and installs nothing without your confirmation."
                 : "Installing and updating plugins is only available in the ChemDraft desktop app."}
             </p>
           </footer>
@@ -1192,7 +1214,7 @@ function PackageReview({
   );
 }
 
-function PluginUpdateStatus({ result }: { result: PluginUpdateCheckResult }) {
+function PluginUpdateStatus({ result }: { result: TimedPluginUpdateCheckResult }) {
   if (result.status === "available") {
     return (
       <p className="plugin-manager-update-status" data-update-status="available">
@@ -1201,9 +1223,12 @@ function PluginUpdateStatus({ result }: { result: PluginUpdateCheckResult }) {
     );
   }
   if (result.status === "upToDate") {
+    const checked = result.checkedAt === undefined ? undefined : new Date(result.checkedAt);
+    const time = checked?.toDateString() === new Date().toDateString()
+      ? checked.toLocaleTimeString() : checked?.toLocaleString();
     return (
       <p className="plugin-manager-update-status" data-update-status="up-to-date">
-        Up to date (latest trusted release: v{result.latestVersion}).
+        Up to date ({time ? `checked ${time}` : `latest trusted release: v${result.latestVersion}`}).
       </p>
     );
   }
@@ -1226,20 +1251,6 @@ function NetworkPackageHelp({ message }: { message: string }) {
   return isNetworkDownloadFailure(message)
     ? <span style={{ display: "block" }}>You can also download the package and use Add plugin from package…</span>
     : null;
-}
-
-function installedPluginCatalogKey(installedPlugins: readonly InstalledPluginCatalogEntry[]): string {
-  return JSON.stringify(
-    [...installedPlugins]
-      .map(({ record }) => ({
-        id: record.id,
-        version: record.version,
-        sourceChecksum: record.sourceChecksum,
-        stagedPath: record.stagedPath,
-        installedAt: record.installedAt
-      }))
-      .sort((left, right) => left.id.localeCompare(right.id))
-  );
 }
 
 function pluginUpdateCheckSummary(

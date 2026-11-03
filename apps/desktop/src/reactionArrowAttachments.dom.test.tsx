@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { applyPatches } from "@chemdraft/chem-core";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createNativeArtLineGraphicObject, createPhase4Document, groupSelectedDocumentObjects, selectDocumentObjects } from "./documentWorkflow";
-import { MainWindow } from "./MainWindow";
+import { MainWindow, ObjectLayerContextMenu } from "./MainWindow";
 import { DOM_COMMAND_EVENT } from "./window-manager";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 let root: Root, container: HTMLDivElement;
@@ -95,4 +95,24 @@ it('closes the offshoot flyout with Left and preserves its owner focus and targe
 it("targets the right-clicked arrow inside a selected group", async () => {
   const id = await mount(true); await menu(id); await clickCommand("arrow.attachOffshoot.below");
   expect(snapshot().pages[0].objects.find(object => object.arrowAttachment)?.arrowAttachment?.parentObjectId).toBe(id);
+});
+
+it("keeps offshoot, table and arrangement flyouts mutually exclusive after merging 1.1.0", async () => {
+  const onInvoke = vi.fn();
+  await act(async () => root.render(createElement(ObjectLayerContextMenu, {
+    objectId: "arrow", objectIndex: 0, objectCount: 1, targetKind: "object",
+    position: { x: 100, y: 100 }, onInvoke,
+    arrowActions: [{ id: "arrow.attachOffshoot.above", title: "Attach offshoot — above", icon: "select", enabled: true }],
+    tableActions: [{ id: "table.column.align.left", title: "Left", icon: "select", enabled: true }],
+    layoutActions: [{ id: "layout.arrange.row", title: "Row", icon: "select", enabled: true }]
+  })));
+  const owner = (label: string) => [...container.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="menu"]')]
+    .find(button => button.textContent?.includes(label))!;
+  for (const label of ["Attach offshoot", "Align Column", "Arrange", "Copy As", "Attach offshoot"]) {
+    await act(async () => owner(label).click());
+    expect(container.querySelectorAll('button[aria-expanded="true"]')).toHaveLength(1);
+    expect(owner(label).getAttribute("aria-expanded")).toBe("true");
+  }
+  await act(async () => container.querySelector<HTMLButtonElement>('[data-command-id="arrow.attachOffshoot.above"]')!.click());
+  expect(onInvoke).toHaveBeenCalledExactlyOnceWith("arrow.attachOffshoot.above");
 });

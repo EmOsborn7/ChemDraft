@@ -3,7 +3,7 @@
 ChemDraft is a lightweight, open-source chemical drawing application with a plugin architecture. The
 core stays small, stable, testable, legally clean, and focused on drawing. This file governs every AI
 agent and human contributor, on every branch. It is repo-wide: scope for one slice belongs in
-`PLANS.md`, never here.
+`docs/plans/PLANS.md`, never here.
 
 ## 1. Both platforms, every change
 
@@ -53,13 +53,13 @@ other platform is a follow-up" is not an acceptable state to merge.
 
 ## 2. Orientation
 
-Before editing implementation files, read `PLANS.md`, this file, `README.md`, `package.json`, and
+Before editing implementation files, read `docs/plans/PLANS.md`, this file, `README.md`, `package.json`, and
 `pnpm-workspace.yaml`. If the work touches a package, read its README too.
 
-- **`PLANS.md`** is the slice in flight, and binds unless the user gives newer instructions. Keep
+- **`docs/plans/PLANS.md`** is the slice in flight, and binds unless the user gives newer instructions. Keep
   edits to its files and behaviors. At closeout the slice moves to `docs/shipped/README.md`, so
-  `PLANS.md` never becomes a changelog.
-- **`PLAN.md`** is the product charter: whether a thing should be built at all. Read it only when
+  `docs/plans/PLANS.md` never becomes a changelog.
+- **`docs/plans/PLAN.md`** is the product charter: whether a thing should be built at all. Read it only when
   scoping a feature (§3, §4, §19), deciding core versus plugin (§5 non-goals, §21), adding a
   dependency or touching licensing (§15), judging release readiness (§1.1, §4, §19), or changing a
   user-facing surface (§6.15).
@@ -102,7 +102,7 @@ A plugin imports **only `@chemdraft/plugin-api`** (plus ordinary npm packages), 
 menus, panels, toolbar buttons, inspectors, templates, importers, exporters, analyzers, transformers,
 and recognizers.
 
-`PluginApiVersion` is `0.1.14`. For a 0.x version the minor is the compatibility boundary, so additive
+`PluginApiVersion` is `0.1.20`. For a 0.x version the minor is the compatibility boundary, so additive
 methods bump the patch and a plugin declares the caret version it needs. Record each bump in the
 `plugin-api` header comment and `AUTHORING.md`.
 
@@ -234,7 +234,7 @@ row says so.
 | `art-engine` | Art visual plans: strokes, markers, arrow geometry, boolean ops | Touch molecules, own documents, copy molecule rendering math |
 | `export-engine` | SVG, PDF, CDXML writers with warnings | Report a format done that `isExportFormatImplemented` denies; diverge from the canvas |
 | `shortcut-engine`, `toolset-registry` | Shortcut registry and conflicts; toolset schemas, overrides, menu models, command-ID validation | Bind actions only in click handlers; chemistry, permissions, windows |
-| `template-library`, `style-compat` | Original templates and abbreviations; `.cds` style import into native presets | Copy proprietary templates; parse `.cds` in UI; commit user `.cds` files; claim a partial import worked |
+| `template-library`, `style-compat` | Original templates and abbreviations; `.cds` style import into native presets | Copy proprietary templates (studying them for conventions is fine, §12); parse `.cds` in UI; commit user `.cds` files; claim a partial import worked |
 | `viewport-engine` | Coordinate, zoom, pan, ruler math | Document mutation, rendering |
 | `chemistry-adapter`, `ocl-adapter` | Engine-neutral contract (incl. 3D conformers); OpenChemLib depiction, stereo, conformers | Concrete engines in the contract; collapse an unrepresentable bond order (report `aromatic`/`unknown`) |
 | `rdkit-adapter` | Real RDKit analysis and ETKDGv3 conformers on the vendored custom MinimalLib WASM (`vendor/BUILD.md`) | Load at startup unless required (§13); vendor another RDKit build without its own decision |
@@ -261,7 +261,7 @@ tolerance.
 ## 8. Analysis and prediction claims
 
 The plan of record is `docs/shipped/analyzers-property-prediction-suite.md`. A bare "§n" in the
-analysis source, or a stale "PLANS.md §n" there, refers to that document.
+analysis source, or a stale "docs/plans/PLANS.md §n" there, refers to that document.
 
 - **One parse, many named interpretations.** Parse once through RDKit. Composition, charge, mass, and
   isotopes describe what the user drew. A method wanting a desalted or neutral form gets a *derived*
@@ -296,7 +296,7 @@ analysis source, or a stale "PLANS.md §n" there, refers to that document.
   `projectSpin`. Projection helpers stay in `apps/desktop/src/interaction/`, flattening in
   `documentWorkflow`. Changes here prove themselves with `spin3dModel`, `spinFlatten`,
   `spinFlattenStereo`, `flattenRoundTrip`, `spinOverlay`, and `rotation3d` tests. Force-field work
-  follows `PLAN-spin3d-forcefields.md`.
+  follows `docs/plans/spin3d-forcefields.md`.
 
 ## 10. Commands and toolbars
 
@@ -327,8 +327,11 @@ state. Preserve unknown objects, or warn. CDXML comes before broad CDX writing.
 ## 12. UI
 
 Familiar to chemists, original in every asset: never copy proprietary icons, templates, dialog art,
-help or menu text, sample files, command IDs, or trade dress. Menu and dense icon toolbar on top, a
-dominant page workspace, icon-first palettes owned by the document window, panels hidden until needed.
+help or menu text, sample files, command IDs, or trade dress. Studying any reference depiction,
+including another program's templates, for conventions and geometry and then drawing our own with our
+own code is allowed (owner, 2026-10-28); copying template files, coordinates, icons or art is not.
+Menu and dense icon toolbar on top, a dominant page workspace, icon-first palettes owned by the
+document window, panels hidden until needed.
 Never show fake chemistry: workspace objects are real `chem-core` objects or an honest disabled state.
 
 **Tools and dialogs float (owner rule, 2026-10-14).** Every tool palette, panel and dialog is its own native window
@@ -403,8 +406,10 @@ the label you saw. Only a stable build (on `main`, or `CHEMDRAFT_STABLE_BUILD=1`
 
 The stable app (`/Applications/ChemDraft.app`; `%LOCALAPPDATA%\ChemDraft` on Windows) is built from
 `main` as `org.chemdraft.desktop`. Branch builds are a different application, `ChemDraft (dev)` with
-identifier `org.chemdraft.desktop.dev.<worktree-slug>`, their own app data (fresh settings and
-plugins), and their own single-instance lock; on macOS `run-app` **moves** (never copies) the bundle
+the shared identifier `org.chemdraft.desktop.dev`, one shared app-data folder (settings and installed
+plugins), and one shared single-instance lock. Only one dev build runs at a time; quit it before
+launching another worktree's build. Stable app data and its lock stay separate.
+On macOS `run-app` **moves** (never copies) the bundle
 into `<worktree>/app/`. A branch never builds over, renames, or unregisters the stable app.
 `./run-app --dev` runs a bare binary with no bundle identifier, invisible to identifier-scoped tools.
 Identify a build by its stamp, never by its window.
@@ -417,7 +422,7 @@ Keep tasks narrow and never invent a dependency's capabilities. At closeout:
   `apps/desktop/src`, `src-tauri/src`, or `packages`). Its suffix names the authoring agent (`-opus`,
   `-codex`, `-fable`), never the branch.
 - Launch the new build (§15) and run the gauntlet (§14).
-- Move a finished slice from `PLANS.md` to `docs/shipped/README.md`.
+- Move a finished slice from `docs/plans/PLANS.md` to `docs/shipped/README.md`.
 - Report: **Summary**, **Files changed**, **Tests run**, **Results** (pass or fail, honestly),
   **Platforms** (macOS and Windows each verified, or unverified with what remains to check),
   **Known limitations**, and **One recommended next task**.

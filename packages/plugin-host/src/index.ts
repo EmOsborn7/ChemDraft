@@ -4,10 +4,15 @@
 // document type — not a second, structurally-identical copy inlined here.
 import type { ApplyPatchOptions, DocumentPatch } from "@chemdraft/chem-core";
 import { applyPatch } from "@chemdraft/chem-core";
-import { AssistantCapabilityPermissions, type PluginAssistantAPI } from "@chemdraft/plugin-api";
+import { Chemistry3dQueue } from "./chemistry3dQueue";
+import { chemistry3dTimeoutMs } from "./chemistry3dDeadline";
+import { chemistry3dResultError } from "./chemistry3dResult";
+export { chemistry3dTimeoutMs, CHEMISTRY3D_STARTUP_TIMEOUT_MS, pauseChemistry3dDeadlineForStartup } from "./chemistry3dDeadline";
+import { AssistantCapabilityPermissions, supportsPluginTableInsertion, type PluginAssistantAPI } from "@chemdraft/plugin-api";
 import type { ChemDraftDocument } from "@chemdraft/plugin-api";
 import type {
   AppliedPatchReceipt,
+  PluginTableSpec,
   PluginAnalysisAPI,
   PluginCanvasOverlayContribution,
   PluginOverlaysAPI,
@@ -17,6 +22,8 @@ import type {
   PluginAnalysisRecord,
   PluginAnalyzerContribution,
   PluginChemistryAPI,
+  PluginEmbed3DRequest, PluginEmbed3DResult, PluginMinimize3DRequest, PluginMinimize3DResult,
+  PluginFlatten3DRequest, PluginFlatten3DResult,
   PluginCommandContext,
   PluginCommandInput,
   PluginCommandContribution,
@@ -81,10 +88,12 @@ import {
   RecognitionConfidenceTierSchema,
   RecognitionProposalReviewSchema,
   PluginIsotopeEnvelopeRequestSchema,
+  PluginEmbed3DRequestSchema, PluginMinimize3DRequestSchema, PluginFlatten3DRequestSchema,
   PluginNameToStructureRequestSchema,
   PluginPanelReportSchema,
   PluginOverlayStatusRequestSchema,
   PluginOverlayTranscriptRequestSchema,
+  snapshotPanelReport,
   PluginOverlayContentRequestSchema,
   PluginOverlayOpenRequestSchema,
   PluginCommandInputSchema,
@@ -340,6 +349,11 @@ export type PluginHostAssistant = {
 } & { closeAllForPlugin(pluginId: string): void };
 
 export interface PluginHostOptions {
+  /** In-process worker chemistry: no native.execute or document permissions. The signal aborts
+   * when this command ends or the plugin unregisters; retained capability references are refused. */
+  embed3d?: (request: PluginEmbed3DRequest, signal: AbortSignal) => Promise<PluginEmbed3DResult>;
+  minimize3d?: (request: PluginMinimize3DRequest, signal: AbortSignal) => Promise<PluginMinimize3DResult>;
+  flatten3d?: (request: PluginFlatten3DRequest, signal: AbortSignal) => Promise<PluginFlatten3DResult>;
   overlays?: {
     setStatus(pluginId: string, overlayId: string, text: string): void | Promise<void>;
     setTranscript?(pluginId: string, overlayId: string, entries: PluginOverlayTranscriptEntry[]): void | Promise<void>;
@@ -390,6 +404,9 @@ export interface PluginHostOptions {
   applyDocumentPatch?: (
     request: PluginPatchApplicationRequest
   ) => AppliedPatchReceipt | Promise<AppliedPatchReceipt>;
+  /** Builds and places a native table without writing. The result uses the ordinary direct-patch
+   * permission, invocation, document identity, scope, receipt, and history checks. */
+  buildTablePatch?: (spec: PluginTableSpec, document: ChemDraftDocument, selection: readonly string[]) => ProposedDocumentPatch;
   /**
    * Computes an isotope envelope on a plugin's behalf. Absent hosts expose no chemistry API — which is
    * why the capability is optional on the context rather than assumed. This package stays engine-free;
@@ -429,9 +446,13 @@ export class PluginHost {
   private readonly requestImage?: PluginHostOptions["requestImage"];
   private readonly recognizeStructure?: PluginHostOptions["recognizeStructure"];
   private readonly applyDocumentPatch?: PluginHostOptions["applyDocumentPatch"];
+  private readonly buildTablePatch?: PluginHostOptions["buildTablePatch"];
   private readonly computeIsotopeEnvelope?: PluginHostOptions["computeIsotopeEnvelope"];
   private readonly convertNameToStructure?: PluginHostOptions["convertNameToStructure"];
   private readonly buildStructureFromSmiles?: PluginHostOptions["buildStructureFromSmiles"];
+  private readonly chemistry3d: Pick<PluginHostOptions, "embed3d" | "minimize3d" | "flatten3d">;
+  private readonly openChemistry3dRequests = new Map<symbol, Set<AbortController>>();
+  private readonly chemistry3dQueue = new Chemistry3dQueue();
   private readonly onProposedPatchesChanged?: PluginHostOptions["onProposedPatchesChanged"];
   private readonly now: () => Date | string;
   private readonly createId: () => string;
@@ -471,9 +492,11 @@ export class PluginHost {
     this.requestImage = options.requestImage;
     this.recognizeStructure = options.recognizeStructure;
     this.applyDocumentPatch = options.applyDocumentPatch;
+    this.buildTablePatch = options.buildTablePatch;
     this.computeIsotopeEnvelope = options.computeIsotopeEnvelope;
     this.convertNameToStructure = options.convertNameToStructure;
     this.buildStructureFromSmiles = options.buildStructureFromSmiles;
+    this.chemistry3d = { embed3d: options.embed3d, minimize3d: options.minimize3d, flatten3d: options.flatten3d };
     this.onProposedPatchesChanged = options.onProposedPatchesChanged;
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? (() => globalThis.crypto.randomUUID());
@@ -723,7 +746,12 @@ export class PluginHost {
           },
           setContent: async request => {
             this.requirePermission(pluginId, "ui.canvas");
-            const parsed = PluginOverlayContentRequestSchema.parse(request);
+            // Snapshot the request directly: action payloads have a separate 4,000-character
+            // contract. Leave room for 64 KiB of sections, the prompt and ownership metadata;
+            // the overlay schema supplies its own specific content-size refusal afterwards.
+            const snapshot = snapshotPanelReport(request, { serializedBytes: 2 * 1024 * 1024 });
+            if (!snapshot.ok) throw new PluginHostError(snapshot.issue.message);
+            const parsed = PluginOverlayContentRequestSchema.parse(snapshot.data);
             const overlay = requireOwnOverlay(parsed.overlayId);
             // Content control ids must also be distinct from the permanent composer/select.
             const report = PluginPanelReportSchema.parse({ title: overlay.title, sections: [overlay.prompt, ...parsed.sections] });
@@ -755,6 +783,7 @@ export class PluginHost {
               if (!declared) {
                 throw new PluginHostError(`Plugin "${pluginId}" does not declare panel "${panelId}".`);
               }
+              // Every call, including an open panel's updates, forwards only the detached snapshot.
               const parsedReport = PluginPanelReportSchema.parse(report);
               requireOwnReportCommands(parsedReport);
               await this.showPanelReport?.(pluginId, panelId, parsedReport);
@@ -817,6 +846,22 @@ export class PluginHost {
     // host — one seeing no capability, the other a rejected call. One code path, one shape of answer.
     const chemistry: PluginChemistryAPI | undefined = this.hasPermission(pluginId, "chemistry.compute")
       ? {
+          embed3d: request => this.runChemistry3d(pluginId, invocationToken, "embed3d", () => {
+            const parsed = PluginEmbed3DRequestSchema.parse(request);
+            if (!this.chemistry3d.embed3d) throw new PluginHostError("This host provides no 3D embedding engine.");
+            return { timeoutMs: chemistry3dTimeoutMs("embed3d", parsed.components.length),
+              run: signal => this.chemistry3d.embed3d!(parsed, signal) };
+          }),
+          minimize3d: request => this.runChemistry3d(pluginId, invocationToken, "minimize3d", () => {
+            const parsed = PluginMinimize3DRequestSchema.parse(request);
+            if (!this.chemistry3d.minimize3d) throw new PluginHostError("This host provides no 3D minimization engine.");
+            return { timeoutMs: chemistry3dTimeoutMs("minimize3d"), run: signal => this.chemistry3d.minimize3d!(parsed, signal) };
+          }),
+          flatten3d: request => this.runChemistry3d(pluginId, invocationToken, "flatten3d", () => {
+            const parsed = PluginFlatten3DRequestSchema.parse(request);
+            if (!this.chemistry3d.flatten3d) throw new PluginHostError("This host provides no 3D flattening engine.");
+            return { timeoutMs: chemistry3dTimeoutMs("flatten3d"), run: signal => this.chemistry3d.flatten3d!(parsed, signal) };
+          }),
           isotopeEnvelope: async (request) => {
             this.requirePermission(pluginId, "chemistry.compute");
             const parsed = PluginIsotopeEnvelopeRequestSchema.parse(request);
@@ -907,7 +952,10 @@ export class PluginHost {
         ...(this.hasPermission(pluginId, "document.write")
           ? {
               applyPatch: async (patch: ProposedDocumentPatch) =>
-                this.applyPatchForPlugin(pluginId, invocationToken, patch)
+                this.applyPatchForPlugin(pluginId, invocationToken, patch),
+              ...(supportsPluginTableInsertion(plugin.manifest.apiVersion)
+                ? { insertTable: async (spec: PluginTableSpec) => this.insertTableForPlugin(pluginId, invocationToken, spec) }
+                : {})
             }
           : {})
       },
@@ -998,12 +1046,30 @@ export class PluginHost {
     return { snapshot, hostHeld };
   }
 
+  /** Host-only entry point; plugins receive a closure bound to their own invocation. */
+  async insertTableForPlugin(pluginId: string, invocationToken: symbol | undefined, spec: PluginTableSpec): Promise<AppliedPatchReceipt> {
+    this.requirePermission(pluginId, "document.write");
+    const invocation = invocationToken ? this.activeCommandInvocations.get(invocationToken) : undefined;
+    if (!invocation || invocation.pluginId !== pluginId) {
+      throw new PluginHostError(
+        `Plugin "${pluginId}" may call documents.insertTable only while one of its own commands is executing.`
+      );
+    }
+    if (!this.buildTablePatch) throw new PluginHostError(`This host provides no table builder for plugin "${pluginId}".`);
+    const document = await this.getActiveDocument?.();
+    if (!document) throw new PluginHostError("No active document is available for table insertion.");
+    const patch = this.buildTablePatch(spec, document, [...invocation.writeScope]);
+    return this.applyPatchForPlugin(pluginId, invocationToken, patch, undefined, "Insert table");
+  }
+
   async applyPatchForPlugin(
     pluginId: string,
     invocationToken: symbol | undefined,
     patch: ProposedDocumentPatch,
     /** Trusted embedding-host override, never exposed on the plugin context. */
-    requestScope?: { objectIds: readonly string[]; apply: NonNullable<PluginHostOptions["applyDocumentPatch"]> }
+    requestScope?: { objectIds: readonly string[]; apply: NonNullable<PluginHostOptions["applyDocumentPatch"]> },
+    /** Trusted host label, never taken from plugin input. */
+    undoLabel?: string
   ): Promise<AppliedPatchReceipt> {
     this.requirePermission(pluginId, "document.write");
     const invocation = invocationToken ? this.activeCommandInvocations.get(invocationToken) :
@@ -1061,7 +1127,7 @@ export class PluginHost {
       plugin: { id: plugin.id, name: plugin.name, version: plugin.version },
       command: { id: invocation.commandId, title: invocation.commandTitle },
       patch: parsedPatch,
-      undoLabel: `${plugin.name}: ${invocation.commandTitle}`
+      undoLabel: undoLabel ?? `${plugin.name}: ${invocation.commandTitle}`
     });
     const parsedReceipt = AppliedPatchReceiptSchema.parse(receipt);
     // Only a successful write grows the scope; use actual ids returned by the host after rebasing.
@@ -1585,8 +1651,36 @@ export class PluginHost {
     return match?.source === "screenRegion" ? { ...match, bytes: new Uint8Array(match.bytes) } : undefined;
   }
 
+  private async runChemistry3d<T>(
+    pluginId: string, invocationToken: symbol | undefined, method: "embed3d" | "minimize3d" | "flatten3d",
+    prepare: () => { timeoutMs: number; run: (signal: AbortSignal) => Promise<T> }
+  ): Promise<T> {
+    this.requirePermission(pluginId, "chemistry.compute");
+    if (!invocationToken || this.activeCommandInvocations.get(invocationToken)?.pluginId !== pluginId) {
+      throw new PluginHostError(`Plugin "${pluginId}" may call chemistry.${method} only while one of its own commands is executing.`);
+    }
+    // Validate/snapshot now, before waiting: plugin mutation must not alter queued input.
+    const { timeoutMs, run } = prepare();
+    const controller = new AbortController();
+    const requests = this.openChemistry3dRequests.get(invocationToken) ?? new Set<AbortController>();
+    requests.add(controller);
+    this.openChemistry3dRequests.set(invocationToken, requests);
+    try {
+      const result = await this.chemistry3dQueue.run(pluginId, method, controller, timeoutMs, run);
+      const error = chemistry3dResultError(method, result);
+      if (error) throw new PluginHostError(error);
+      return result;
+    } finally {
+      requests.delete(controller);
+      if (requests.size === 0) this.openChemistry3dRequests.delete(invocationToken);
+    }
+  }
+
   private finishCommandInvocation(invocationToken: symbol): void {
     const pluginId = this.activeCommandInvocations.get(invocationToken)?.pluginId;
+    if (pluginId) this.chemistry3dQueue.cancelQueued(pluginId);
+    for (const controller of this.openChemistry3dRequests.get(invocationToken) ?? []) controller.abort();
+    this.openChemistry3dRequests.delete(invocationToken);
     this.activeCommandInvocations.delete(invocationToken);
     this.textPromptInvocations.delete(invocationToken);
     for (const controller of this.openImageRequests.get(invocationToken) ?? []) {
@@ -1613,8 +1707,11 @@ export class PluginHost {
   }
 
   private cancelOpenImageRequests(pluginId: string): void {
+    this.chemistry3dQueue.cancelQueued(pluginId);
     for (const [invocationToken, invocation] of this.activeCommandInvocations) {
       if (invocation.pluginId !== pluginId) continue;
+      for (const controller of this.openChemistry3dRequests.get(invocationToken) ?? []) controller.abort();
+      this.openChemistry3dRequests.delete(invocationToken);
       for (const controller of this.openImageRequests.get(invocationToken) ?? []) {
         controller.abort();
       }

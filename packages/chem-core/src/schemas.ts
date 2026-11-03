@@ -1,4 +1,8 @@
 import { z } from "zod";
+import { normalizeAtomIsotope } from "./isotopes";
+import { atomicNumberForElementSymbol } from "./elements";
+import { decodeImageBase64, imageBase64Error } from "./imageBytes";
+import { imagePixelLimitError, validatePngImage } from "./imageInfo";
 import {
   PageOrientations,
   PageSizePresetIds,
@@ -238,6 +242,17 @@ export const GraphicFreehandOptionsSchema = z
   })
   .strict();
 
+export const ImageObjectDataSchema = z.object({
+  mimeType: z.enum(["image/png", "image/svg+xml"]),
+  dataBase64: z.string(),
+  pixelWidth: z.number().int().positive(),
+  pixelHeight: z.number().int().positive(),
+  pixelsPerMeter: z.object({
+    x: z.number().int().positive(),
+    y: z.number().int().positive()
+  }).strict().optional()
+}).strict();
+
 export const GraphicObjectDataSchema = z
   .object({
     lineStart: PointSchema.optional(),
@@ -280,6 +295,8 @@ export const GraphicObjectDataSchema = z
     cornerRadiusPx: z.number().finite().nonnegative().optional(),
     imageHref: z.string().optional(),
     imageMimeType: z.string().optional(),
+    // Additive optional data, like the other graphic fields: existing v1 documents need no migration.
+    image: ImageObjectDataSchema.optional(),
     artToolId: z.string().optional()
   })
   .strict();
@@ -322,6 +339,8 @@ export const MoleculeAtomSchema = z
   .object({
     id: IdSchema,
     element: z.string().min(1),
+    /** Explicit isotope mass number; absent means natural abundance. D/T use their own symbols. */
+    isotope: z.number().int().positive().max(999).optional(),
     x: z.number().finite(),
     y: z.number().finite(),
     z: z.number().finite().optional(),
@@ -375,7 +394,18 @@ export const MoleculeAtomSchema = z
     labelBondSide: z.object({ side: z.enum(["left", "right"]), atomId: z.string() }).strict().optional(),
     labelOffset: PointSchema.optional()
   })
-  .strict();
+  .strict()
+  .superRefine((atom, context) => {
+    if (atom.isotope === undefined) return;
+    const message = atom.element === "D" || atom.element === "T"
+      ? "D and T must not carry an isotope field."
+      : atomicNumberForElementSymbol(atom.element) === undefined
+        ? `Isotope mass number requires an element symbol; "${atom.element}" is a label.`
+        : undefined;
+    if (message) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["isotope"], message });
+    }
+  });
 
 export const MoleculeBondDisplaySchema = z
   .object({
@@ -393,9 +423,19 @@ export const MoleculeBondSchema = z
     fromAtomId: IdSchema,
     toAtomId: IdSchema,
     order: degradingEnum(["single", "double", "triple", "aromatic", "unknown"]).default("single"),
+    /** Explicitly unspecified E/Z; absence retains geometry-defined interpretation. */
+    stereo: z.literal("either").optional(),
     display: MoleculeBondDisplaySchema.optional()
   })
-  .strict();
+  .strict()
+  .refine((bond) => bond.stereo === undefined || bond.order === "double", {
+    path: ["stereo"],
+    message: 'Bond stereo "either" is valid only for a double bond.'
+  })
+  .transform((bond) => {
+    if (bond.stereo === undefined) delete bond.stereo;
+    return bond;
+  });
 
 export const BondRefSchema = z
   .object({
@@ -450,7 +490,7 @@ export const MoleculeObjectSchema = BaseObjectSchema.extend({
   structureFormat: degradingEnum(["molfile-v3000", "molfile-v2000", "smiles", "unknown"]),
   structure: z.string(),
   chemistry: ChemicalMetadataSchema.optional(),
-  atoms: z.array(MoleculeAtomSchema).default([]),
+  atoms: z.array(MoleculeAtomSchema).transform((atoms) => atoms.map(normalizeAtomIsotope)).default([]),
   bonds: z.array(MoleculeBondSchema).default([]),
   transform: MoleculeTransformStateSchema.optional(),
   superatoms: z.array(SuperatomMetadataSchema).default([]),
@@ -513,6 +553,92 @@ export const TextObjectSchema = BaseObjectSchema.extend({
   spans: z.array(TextSpanSchema).default([])
 }).strict();
 
+export const TABLE_LIMITS = {
+  maxColumns: 64, maxRows: 500, maxCellCharacters: 2000, maxFootnotes: 50,
+  maxSpansPerCell: 200, maxFontFamilyLength: 200, maxFontSizePx: 400, maxTableCharacters: 200000
+} as const;
+
+export const TableRichTextSchema = z.object({
+  text: z.string().max(TABLE_LIMITS.maxCellCharacters),
+  spans: z.array(TextSpanSchema).default([]).superRefine((spans, ctx) => {
+    if (spans.length > TABLE_LIMITS.maxSpansPerCell) ctx.addIssue({ code: z.ZodIssueCode.custom,
+      message: `maxSpansPerCell is ${TABLE_LIMITS.maxSpansPerCell}; actual value is ${spans.length}` });
+  })
+}).strict();
+
+export const TableCellSchema = TableRichTextSchema.extend({
+  formula: z.enum(["auto", "off"]).optional()
+}).strict();
+
+export const TableColumnSchema = z.object({
+  id: IdSchema,
+  align: degradingEnum(["left", "center", "right", "decimal", "unknown"]),
+  width: z.discriminatedUnion("mode", [
+    z.object({ mode: z.literal("auto") }).strict(),
+    z.object({ mode: z.literal("fixed"), px: z.number().finite().positive().max(4000) }).strict()
+  ]),
+  formula: z.enum(["auto", "off"]).default("auto")
+}).strict();
+
+export const TableRowSchema = z.object({ id: IdSchema, cells: z.array(TableCellSchema) }).strict();
+
+export const TableStyleSchema = z.object({
+  preset: degradingEnum(["three-line", "grid", "unknown"]).default("three-line"),
+  topRulePt: z.number().finite().min(0).max(6).default(1),
+  headerRulePt: z.number().finite().min(0).max(6).default(0.5),
+  bottomRulePt: z.number().finite().min(0).max(6).default(1),
+  gridRulePt: z.number().finite().min(0).max(6).default(0.5),
+  headerBold: z.boolean().default(false),
+  autoColumnMinEm: z.number().finite().gt(0).max(10).optional(),
+  cellPaddingPx: z.object({
+    x: z.number().finite().min(0).max(48).default(6),
+    y: z.number().finite().min(0).max(48).default(2)
+  }).strict().default({})
+}).strict();
+
+const TableObjectShapeSchema = BaseObjectSchema.extend({
+  type: z.literal("table"),
+  tableVersion: z.literal(1),
+  columns: z.array(TableColumnSchema).min(1).max(TABLE_LIMITS.maxColumns),
+  rows: z.array(TableRowSchema).min(1).max(TABLE_LIMITS.maxRows),
+  headerRowCount: z.number().int().nonnegative(),
+  caption: TableRichTextSchema.optional(),
+  footnotes: z.array(TableRichTextSchema).max(TABLE_LIMITS.maxFootnotes).default([]),
+  tableStyle: TableStyleSchema.default({})
+}).strict();
+
+function refineTable(table: z.infer<typeof TableObjectShapeSchema>, ctx: z.RefinementCtx): void {
+  const total = table.rows.flatMap(row => row.cells).reduce((sum, cell) => sum + cell.text.length, 0)
+    + (table.caption?.text.length ?? 0) + table.footnotes.reduce((sum, note) => sum + note.text.length, 0);
+  if (total > TABLE_LIMITS.maxTableCharacters) ctx.addIssue({ code: z.ZodIssueCode.custom,
+    message: `maxTableCharacters is ${TABLE_LIMITS.maxTableCharacters}; actual value is ${total}` });
+  const family = table.style.fontFamily;
+  if (typeof family === "string" && family.length > TABLE_LIMITS.maxFontFamilyLength) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["style", "fontFamily"],
+      message: `maxFontFamilyLength is ${TABLE_LIMITS.maxFontFamilyLength}; actual value is ${family.length}`
+    });
+  }
+  const size = table.style.fontSizePx;
+  if (typeof size === "number" && (!Number.isFinite(size) || size < 1 || size > TABLE_LIMITS.maxFontSizePx)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["style", "fontSizePx"],
+      message: `fontSizePx must be 1..${TABLE_LIMITS.maxFontSizePx}; actual value is ${size}` });
+  }
+  const columnIds = new Set<string>();
+  table.columns.forEach((column, index) => {
+    if (columnIds.has(column.id)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["columns", index, "id"], message: `Duplicate column id "${column.id}".` });
+    columnIds.add(column.id);
+  });
+  const rowIds = new Set<string>();
+  table.rows.forEach((row, index) => {
+    if (rowIds.has(row.id)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["rows", index, "id"], message: `Duplicate row id "${row.id}".` });
+    rowIds.add(row.id);
+    if (row.cells.length !== table.columns.length) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["rows", index, "cells"], message: `Row "${row.id}" must have ${table.columns.length} cells, one per column.` });
+  });
+  if (table.headerRowCount > table.rows.length) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["headerRowCount"], message: "Header row count exceeds the number of rows." });
+}
+
+export const TableObjectSchema = TableObjectShapeSchema.superRefine(refineTable);
+
 export const BracketObjectSchema = BaseObjectSchema.extend({
   type: z.literal("bracket"),
   bracketKind: degradingEnum(["square", "round", "curly", "polymer", "unknown"]),
@@ -520,12 +646,33 @@ export const BracketObjectSchema = BaseObjectSchema.extend({
   containedObjectIds: z.array(IdSchema).default([])
 }).strict();
 
-export const GraphicObjectSchema = BaseObjectSchema.extend({
+const GraphicObjectShapeSchema = BaseObjectSchema.extend({
   type: z.literal("graphic"),
   graphicKind: degradingEnum(["line", "rect", "ellipse", "path", "image", "unknown"]),
   style: GraphicObjectStyleSchema.default({}),
   data: GraphicObjectDataSchema.default({})
 }).strict();
+
+function validateGraphicImage(object: z.infer<typeof GraphicObjectShapeSchema>, context: z.RefinementCtx) {
+  if (object.data.image) {
+    const message = imageBase64Error(object.data.image.dataBase64, object.id);
+    if (message) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["data", "image", "dataBase64"], message });
+      return;
+    }
+    const image = object.data.image;
+    // Existing SVG payloads are preserved on load; completeness is checked when pasting.
+    if (image.mimeType !== "image/png") return;
+    const bytes = decodeImageBase64(image.dataBase64, object.id);
+    const result = validatePngImage(bytes);
+    const error = result.error ?? imagePixelLimitError(image.pixelWidth, image.pixelHeight);
+    if (error) context.addIssue({ code: z.ZodIssueCode.custom,
+      path: ["data", "image", "dataBase64"],
+      message: error.replace("Couldn't paste the picture:", `Image object ${object.id}:`) });
+  }
+}
+
+export const GraphicObjectSchema = GraphicObjectShapeSchema.superRefine(validateGraphicImage);
 
 export const PlusObjectSchema = BaseObjectSchema.extend({
   type: z.literal("plus")
@@ -575,8 +722,9 @@ export const DocumentObjectSchema = z.discriminatedUnion("type", [
   MechanismArrowObjectSchema,
   ElectronMarkObjectSchema,
   TextObjectSchema,
+  TableObjectShapeSchema,
   BracketObjectSchema,
-  GraphicObjectSchema,
+  GraphicObjectShapeSchema,
   PlusObjectSchema,
   GroupObjectSchema,
   AnnotationObjectSchema,
@@ -584,7 +732,11 @@ export const DocumentObjectSchema = z.discriminatedUnion("type", [
   RGroupLabelObjectSchema,
   GenericAtomLabelObjectSchema,
   UnknownCompatibilityObjectSchema
-]);
+]).superRefine((object, context) => {
+  // Keep the discriminated union's fast dispatch while applying the same standalone validation.
+  if (object.type === "table") refineTable(object, context);
+  if (object.type === "graphic") validateGraphicImage(object, context);
+});
 
 export const PageSizePresetIdSchema = z.enum(PageSizePresetIds);
 export const PageSizeUnitSchema = z.enum(PageSizeUnits);
@@ -684,6 +836,12 @@ export type MechanismArrowObject = z.infer<typeof MechanismArrowObjectSchema>;
 export type ElectronMarkObject = z.infer<typeof ElectronMarkObjectSchema>;
 export type TextSpan = z.infer<typeof TextSpanSchema>;
 export type TextObject = z.infer<typeof TextObjectSchema>;
+export type TableObject = z.infer<typeof TableObjectSchema>;
+export type TableColumn = z.infer<typeof TableColumnSchema>;
+export type TableRow = z.infer<typeof TableRowSchema>;
+export type TableCell = z.infer<typeof TableCellSchema>;
+export type TableRichText = z.infer<typeof TableRichTextSchema>;
+export type TableStyle = z.infer<typeof TableStyleSchema>;
 export type BracketObject = z.infer<typeof BracketObjectSchema>;
 export type GraphicGradientStop = z.infer<typeof GraphicGradientStopSchema>;
 export type GraphicPaint = z.infer<typeof GraphicPaintSchema>;
@@ -696,6 +854,7 @@ export type GraphicFreehandPoint = z.infer<typeof GraphicFreehandPointSchema>;
 export type GraphicFreehandOptions = z.infer<typeof GraphicFreehandOptionsSchema>;
 export type GraphicObjectStyle = z.infer<typeof GraphicObjectStyleSchema>;
 export type GraphicObjectData = z.infer<typeof GraphicObjectDataSchema>;
+export type ImageObjectData = z.infer<typeof ImageObjectDataSchema>;
 export type GraphicObject = z.infer<typeof GraphicObjectSchema>;
 export type PlusObject = z.infer<typeof PlusObjectSchema>;
 export type GroupObject = z.infer<typeof GroupObjectSchema>;

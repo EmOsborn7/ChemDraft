@@ -37,6 +37,7 @@ export interface ToolActivationResult {
   status: string;
 }
 
+const orbitalUsageHint = usageHint("click a tip or canvas", "drag to orient (Shift snaps to 15°)", "Esc selects");
 const artShapeUsageHint = usageHint("click canvas", "select object to edit", "Esc exits");
 const artPathUsageHint = usageHint("click canvas", "drag handles after selecting", "Esc exits");
 
@@ -84,6 +85,22 @@ export const coreDrawingToolDefinitions = [
     icon: "bond",
     defaultShortcut: "M",
     usageHint: usageHint("click canvas or atom", "click atom to extend", "Esc exits")
+  },
+  {
+    commandId: "tool.doubleBond",
+    title: "Double Bond",
+    kind: "bond",
+    category: "structure",
+    icon: "doubleBond",
+    usageHint: usageHint("click canvas or atom", "click bond to set its order", "Esc exits")
+  },
+  {
+    commandId: "tool.tripleBond",
+    title: "Triple Bond",
+    kind: "bond",
+    category: "structure",
+    icon: "tripleBond",
+    usageHint: usageHint("click canvas or atom", "click bond to set its order", "Esc exits")
   },
   {
     commandId: "tool.wedgeBond",
@@ -141,6 +158,38 @@ export const coreDrawingToolDefinitions = [
     category: "structure",
     icon: "atom",
     usageHint: usageHint("click atom to edit its label", "type an element symbol", "Esc exits")
+  },
+  {
+    commandId: "tool.cyclopropane",
+    title: "Cyclopropane Template",
+    kind: "ring",
+    category: "structure",
+    icon: "ring3",
+    usageHint: usageHint("click canvas, atom, or bond", "attach at an atom or fuse at a bond", "Esc exits")
+  },
+  {
+    commandId: "tool.cyclobutane",
+    title: "Cyclobutane Template",
+    kind: "ring",
+    category: "structure",
+    icon: "ring4",
+    usageHint: usageHint("click canvas, atom, or bond", "attach at an atom or fuse at a bond", "Esc exits")
+  },
+  {
+    commandId: "tool.cycloheptane",
+    title: "Cycloheptane Template",
+    kind: "ring",
+    category: "structure",
+    icon: "ring7",
+    usageHint: usageHint("click canvas, atom, or bond", "attach at an atom or fuse at a bond", "Esc exits")
+  },
+  {
+    commandId: "tool.cyclooctane",
+    title: "Cyclooctane Template",
+    kind: "ring",
+    category: "structure",
+    icon: "ring8",
+    usageHint: usageHint("click canvas, atom, or bond", "attach at an atom or fuse at a bond", "Esc exits")
   },
   {
     commandId: "tool.cyclopentane",
@@ -675,10 +724,10 @@ function artDrawingToolDefinitions(): DrawingToolDefinition[] {
     ["tool.art.arc120Dashed", "Dashed One-third Arc", "export", artPathUsageHint],
     ["tool.art.arc90", "Quarter Arc", "export", artPathUsageHint],
     ["tool.art.arc90Dashed", "Dashed Quarter Arc", "export", artPathUsageHint],
-    ["tool.lobe", "Orbital Lobe", "atom", artShapeUsageHint],
-    ["tool.shadedLobe", "Shaded Orbital Lobe", "atom", artShapeUsageHint],
-    ["tool.pOrbital", "p Orbital", "atom", artShapeUsageHint],
-    ["tool.sOrbital", "s Orbital", "atom", artShapeUsageHint]
+    ["tool.lobe", "Orbital Lobe", "atom", orbitalUsageHint],
+    ["tool.shadedLobe", "Shaded Orbital Lobe", "atom", orbitalUsageHint],
+    ["tool.pOrbital", "p Orbital", "atom", orbitalUsageHint],
+    ["tool.sOrbital", "s Orbital", "atom", orbitalUsageHint]
   ] as const;
 
   return tools.map(([commandId, title, icon, usageHint]) => ({

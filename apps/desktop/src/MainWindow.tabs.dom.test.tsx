@@ -1,10 +1,14 @@
+import { saveStartWithFreshDocument } from "./startupSettings";
 // @vitest-environment jsdom
 import * as smilesListPaste from "./smilesListPaste";
+import * as smilesPasteIdentity from "./smilesPasteIdentity";
+import { IdentityVerificationTimeoutError } from "./depiction2d/identityWorkerClient";
+import { inspectStructureOffThread } from "./depiction2d/identityClient";
 import { act, createElement, StrictMode } from "react";
 import { setNativePromptProvider, type NativePromptOptions } from "./nativePrompt";
 import { readFileSync } from "node:fs";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainWindow, documentTabPathKey } from "./MainWindow";
 import { exportPhase4Svg, applyNativeChainTool, createNativeSingleBondMolecule, arrangeSelectedDocumentObjects, createNativeSavePayload, createPhase4Document, openNativeDocument, selectDocumentObjects } from "./documentWorkflow";
 import { openChemDraftPayload } from "@chemdraft/cdx-compat";
@@ -18,8 +22,9 @@ import { buildDocumentSessionEnvelope, buildDocumentTabsSession, parseDocumentSe
 import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
 import { applyPatches, type DocumentPatch, type MoleculeObject } from "@chemdraft/chem-core";
 import {
-  ANALYSIS_WINDOW_ACTION_EVENT, type AnalysisWindowSnapshotPayload,
-  broadcastAnalysisWindowSnapshot, respondToProposalDecision
+  ANALYSIS_WINDOW_ACTION_EVENT, ANALYSIS_WINDOW_OWNER_ID, PATCH_REVIEW_WINDOW_ID,
+  type AnalysisWindowSnapshotPayload, broadcastAnalysisWindowSnapshot,
+  pluginPanelWindowLabel, respondToProposalDecision
 } from "./plugins/panelBridge";
 import { createDesktopShortcutRegistry } from "./keyboardShortcuts";
 import { createDocumentTabActions } from "./commands";
@@ -28,6 +33,14 @@ import * as atomLabelDraft from "./atomLabelDraft";
 import * as nativePaletteReconciliation from "./toolbars/reconcileNativePalettes";
 import type { DialogMessage } from "./dialogs/dialogProtocol";
 import { nativeDialogTransport, type DialogDelivery } from "./dialogs/dialogTransport";
+import { createPerfProbe, PerfProbe, type PerfRecord } from "./perf/probe";
+import { invoke as nativeInvoke } from "@tauri-apps/api/core";
+
+const perfState = vi.hoisted(() => ({ current: undefined as import("./perf/probe").PerfProbe | undefined }));
+vi.mock("./perf/runtime", async original => ({
+  ...await original<typeof import("./perf/runtime")>(),
+  get perfProbe() { return perfState.current; }
+}));
 
 const native = vi.hoisted(() => ({
   desktop: true,
@@ -153,6 +166,9 @@ vi.mock("./plugins/panelBridge", async (original) => {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("documents in one window", () => {
+  beforeAll(async () => {
+    expect((await inspectStructureOffThread("smiles", "C")).valid).toBe(true);
+  }, 20_000);
   let container: HTMLDivElement;
   let root: Root | undefined;
 
@@ -218,6 +234,7 @@ describe("documents in one window", () => {
   afterEach(() => {
     restorePromptProvider();
     act(() => root?.unmount());
+    perfState.current?.stop(); perfState.current = undefined;
     root = undefined;
     container?.remove();
     window.history.replaceState(null, "", "/");
@@ -242,6 +259,66 @@ describe("documents in one window", () => {
     container.innerHTML = "";
     await mount();
   }
+
+  function recordOpens() {
+    const records: PerfRecord[] = [];
+    const frames = new Map<number, () => void>(); let id = 0;
+    perfState.current = createPerfProbe(true, () => ({
+      target: window, now: () => performance.now(), eventTime: stamp => stamp,
+      frame: callback => { frames.set(++id, callback); return id; }, afterPaint: callback => callback(), cancelFrame: key => { frames.delete(key); },
+      defer: callback => window.queueMicrotask(callback), timeout: callback => window.setTimeout(callback, 120_000), clearTimeout: id => window.clearTimeout(id),
+      write: record => records.push(record), window: "main", platform: "macos", buildStamp: "test", processStart: 0, clockErrorMs: 0
+    }));
+    return () => {
+      const callbacks = [...frames.values()]; frames.clear(); callbacks.forEach(callback => callback());
+      return records.filter(record => record.kind === "document-open");
+    };
+  }
+
+  it("with the probe off installs no perf listeners, registry wrapper or native calls through MainWindow", async () => {
+    const instrument = vi.spyOn(PerfProbe.prototype, "instrumentRegistry");
+    const measuredCommand = vi.spyOn(PerfProbe.prototype, "command");
+    const listen = vi.spyOn(window, "addEventListener");
+    await remount(); await open("Probe off"); await command("document.new");
+    expect(instrument).not.toHaveBeenCalled(); expect(measuredCommand).not.toHaveBeenCalled();
+    expect(listen.mock.calls.filter(([name]) => name.startsWith("chemdraft:perf"))).toEqual([]);
+    expect(vi.mocked(nativeInvoke).mock.calls.filter(([name]) => name.startsWith("perf_log_"))).toEqual([]);
+  });
+
+  it("reports commits only for installed opens and labels an already open file", async () => {
+    const rows = recordOpens();
+    await open("Perf first");
+    expect(rows()).toEqual([expect.objectContaining({ doneSignal: "document-commit" })]);
+    await open("Perf first");
+    expect(rows()).toEqual([
+      expect.objectContaining({ doneSignal: "document-commit" }),
+      expect.objectContaining({ doneSignal: "command-finished", extra: expect.objectContaining({ openOutcome: "already-open" }) })
+    ]);
+  });
+
+  it("labels a startup open queued during hydration, then records its later history install", async () => {
+    let hydrated!: (session: unknown) => void;
+    native.load.mockImplementationOnce(() => new Promise(resolve => { hydrated = resolve; }));
+    const rows = recordOpens(); await remount();
+    await act(async () => native.events.get("chemdraft://open-document")!({
+      path: "/tmp/perf-startup.chemdraft", displayName: "perf-startup.chemdraft", contents: fileContents("Startup")
+    }));
+    expect(rows()).toEqual([expect.objectContaining({ doneSignal: "command-finished", extra: expect.objectContaining({ openOutcome: "queued" }) })]);
+    await act(async () => hydrated(undefined));
+    expect(rows().map(row => row.doneSignal)).toEqual(["command-finished", "document-commit"]);
+  });
+
+  it("labels an open queued while the quit question is active", async () => {
+    saveAskToSaveBeforeQuit(true); await paste("Unsaved drawing");
+    await act(async () => native.promptQuit!(++native.quitId));
+    const rows = recordOpens();
+    await act(async () => native.events.get("chemdraft://open-document")!({
+      path: "/tmp/perf-quit.chemdraft", displayName: "perf-quit.chemdraft", contents: fileContents("After quit")
+    }));
+    expect(rows()).toEqual([expect.objectContaining({ doneSignal: "command-finished", extra: expect.objectContaining({ openOutcome: "queued" }) })]);
+    await modalButton("Cancel");
+    expect(rows().map(row => row.doneSignal)).toEqual(["command-finished", "document-commit"]);
+  });
 
   it.each(["/Users/chemist/drawing.chemdraft", "D:\\drawings\\drawing.chemdraft", "D:\\drawings\\drawing.cdxml"])(
     "saves a restored dirty named tab directly to %s without a picker", async (path) => {
@@ -309,6 +386,18 @@ describe("documents in one window", () => {
     .filter((object) => object.type === "text").map((object) => object.text).join("\n");
   const tabs = () => Array.from(container.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
   const active = () => tabs().findIndex((tab) => tab.getAttribute("aria-selected") === "true");
+  it("refuses a timed-out SMILES check without inserting a molecule or fallback text", async () => {
+    const before = structuredClone(bridge().snapshot().document);
+    vi.spyOn(smilesListPaste, "depictSmilesForPaste").mockResolvedValueOnce({
+      depiction: { atoms: [{ element: "C", x: 0, y: 0, charge: 0 }], bonds: [] }, stereoCount: 0
+    });
+    vi.spyOn(smilesPasteIdentity, "verifySmilesPaste").mockRejectedValueOnce(
+      new smilesPasteIdentity.SmilesPasteIdentityError("CC", new IdentityVerificationTimeoutError(4_000)));
+    await paste("CC");
+    expect(bridge().snapshot().document).toEqual(before);
+    expect(container.querySelector('[role="status"]')?.textContent)
+      .toContain("within 4 s; nothing was inserted");
+  });
   async function command(commandId: string) {
     await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })); });
   }
@@ -516,10 +605,12 @@ describe("documents in one window", () => {
     await act(async () => { await runtime().invokeCommand(commandId); });
     return runtime().host.listProposedPatches("pending")[0]!;
   }
+  const reviewSourceLabel = pluginPanelWindowLabel({ pluginId: ANALYSIS_WINDOW_OWNER_ID, panelId: PATCH_REVIEW_WINDOW_ID });
   async function decide(kind: "acceptPluginProposal" | "rejectPluginProposal", proposalId: string) {
-    await act(async () => window.dispatchEvent(new CustomEvent(ANALYSIS_WINDOW_ACTION_EVENT, {
-      detail: { kind, proposalId, requestId: "review-result" }
-    })));
+    // Rust stamps the review window's label before forwarding the action to main.
+    await act(async () => native.events.get(ANALYSIS_WINDOW_ACTION_EVENT)!({
+      kind, proposalId, requestId: "review-result", sourceLabel: reviewSourceLabel
+    }));
   }
   const reviewItems = () => {
     const snapshots = vi.mocked(broadcastAnalysisWindowSnapshot).mock.calls
@@ -528,6 +619,35 @@ describe("documents in one window", () => {
     if (content.kind !== "patchReview") throw new Error("No proposal review snapshot");
     return content.proposals;
   };
+
+  it.each(["acceptPluginProposal", "rejectPluginProposal"] as const)("requires the native review window sender for %s", async kind => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await paste("Source object");
+    const before = bridge().snapshot().document;
+    const proposal = await propose({ op: "updateObject", objectId: before.pages[0]!.objects[0]!.id,
+      changes: { text: "Reviewed source" } });
+    const action = { kind, proposalId: proposal.id, requestId: "review-result" };
+    const receive = native.events.get(ANALYSIS_WINDOW_ACTION_EVENT)!;
+    const otherSourceLabel = pluginPanelWindowLabel({ pluginId: "org.test.tab-proposal", panelId: PATCH_REVIEW_WINDOW_ID });
+    for (const payload of [action, { ...action, sourceLabel: otherSourceLabel }]) {
+      await act(async () => receive(payload));
+      expect(runtime().host.listProposedPatches("pending")).toEqual([proposal]);
+      expect(bridge().snapshot().document).toEqual(before);
+      expect(respondToProposalDecision).not.toHaveBeenCalled();
+    }
+    await act(async () => window.dispatchEvent(new CustomEvent(ANALYSIS_WINDOW_ACTION_EVENT, {
+      detail: { ...action, sourceLabel: reviewSourceLabel }
+    })));
+    expect(runtime().host.listProposedPatches("pending")).toEqual([proposal]);
+    expect(bridge().snapshot().document).toEqual(before);
+    expect(respondToProposalDecision).not.toHaveBeenCalled();
+    await decide(kind, proposal.id);
+    expect(runtime().host.listProposedPatches("pending")).toEqual([]);
+    expect(drawnText()).toBe(kind === "acceptPluginProposal" ? "Reviewed source" : "Source object");
+    expect(respondToProposalDecision).toHaveBeenCalledExactlyOnceWith("review-result", {
+      ok: true, message: expect.any(String)
+    }, reviewSourceLabel);
+  });
 
   async function mountHoverChain() {
     act(() => root!.unmount());
@@ -734,7 +854,7 @@ describe("documents in one window", () => {
     expect(container.querySelector('[role="status"]')?.textContent).toContain("its document was closed (Closed source.chemdraft)");
     expect(respondToProposalDecision).toHaveBeenLastCalledWith("review-result", {
       ok: false, message: expect.stringContaining("its document was closed")
-    });
+    }, reviewSourceLabel);
     expect(runtime().host.listProposedPatches("pending")).toEqual([proposal]);
     expect(bridge().snapshot().document).toEqual(other);
     await command("edit.undo");
@@ -764,7 +884,7 @@ describe("documents in one window", () => {
     await decide("acceptPluginProposal", proposal.id);
     const message = "Could not accept the proposal: its document was closed (Renamed source.chemdraft). You can reject it.";
     expect(container.querySelector('[role="status"]')?.textContent).toContain(message);
-    expect(respondToProposalDecision).toHaveBeenLastCalledWith("review-result", { ok: false, message });
+    expect(respondToProposalDecision).toHaveBeenLastCalledWith("review-result", { ok: false, message }, reviewSourceLabel);
     expect(runtime().host.listProposedPatches("pending")).toEqual([proposal]);
   });
 
@@ -796,7 +916,7 @@ describe("documents in one window", () => {
     await decide("acceptPluginProposal", proposal.id);
     const message = "Could not accept the proposal: its document was closed (Renamed delayed source.chemdraft). You can reject it.";
     expect(container.querySelector('[role="status"]')?.textContent).toContain(message);
-    expect(respondToProposalDecision).toHaveBeenLastCalledWith("review-result", { ok: false, message });
+    expect(respondToProposalDecision).toHaveBeenLastCalledWith("review-result", { ok: false, message }, reviewSourceLabel);
     expect(runtime().host.listProposedPatches("pending")).toEqual([proposal]);
     expect(bridge().snapshot().document).toEqual(other);
     await decide("rejectPluginProposal", proposal.id);
@@ -1595,36 +1715,69 @@ describe("documents in one window", () => {
     expect(native.promptShowing).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["clipboard", "depiction"])("prevents an already-running %s paste from changing the saved quit snapshot", async (kind) => {
-    await paste("Existing drawing");
-    let finishPaste: () => void = () => {};
-    if (kind === "clipboard") {
-      native.clipboardPending = new Promise((resolve) => {
-        finishPaste = () => resolve({ types: ["text/plain"], textItems: [{ type: "text/plain", text: "Late clipboard text" }] });
-      });
-      await command("clipboard.paste");
-    } else {
-      const parsed = await smilesListPaste.depictSmilesForPaste("CC");
-      expect(parsed).toBeDefined();
-      vi.spyOn(smilesListPaste, "depictSmilesForPaste").mockImplementationOnce(() => new Promise((resolve) => {
-        finishPaste = () => resolve(parsed);
-      }));
-      await paste("CC");
-    }
-    saveAskToSaveBeforeQuit(true);
-    native.savePicker.mockResolvedValueOnce("/tmp/async-quit.chemdraft");
-    await flush();
-    let finishFlush: () => void = () => {};
-    native.saveSession.mockImplementationOnce(() => new Promise<void>((resolve) => { finishFlush = resolve; }));
-    await quitButton("Save");
-    const saved = bridge().snapshot().document;
-    await act(async () => { finishPaste(); });
-    expect(bridge().snapshot().document).toEqual(saved);
-    expect(bridge().snapshot().file.dirty).toBe(false);
-    expect(native.quit).not.toHaveBeenCalled();
-    await act(async () => { finishFlush(); });
-    expect(native.quit).toHaveBeenCalledTimes(1);
-  });
+  it.each(["clipboard", "depiction", "identity", "list identity"])(
+    "prevents an already-running %s paste from changing the saved quit snapshot", async (kind) => {
+      await paste("Existing drawing");
+      let finishPaste: () => void = () => {};
+      if (kind === "clipboard") {
+        native.clipboardPending = new Promise((resolve) => {
+          finishPaste = () => resolve({ types: ["text/plain"],
+            textItems: [{ type: "text/plain", text: "Late clipboard text" }] });
+        });
+        await command("clipboard.paste");
+      } else {
+        const parsed = await smilesListPaste.depictSmilesForPaste("CC");
+        expect(parsed).toBeDefined();
+        if (kind.includes("identity")) {
+          const inspect = smilesPasteIdentity.createPasteIdentityInspector();
+          const wait = new Promise<void>(resolve => { finishPaste = resolve; });
+          if (kind === "list identity") {
+            const original = smilesPasteIdentity.verifySmilesGridEntries;
+            const entries = ["CC", "CC"].map(smiles => ({ smiles, depiction: parsed!.depiction }));
+            vi.spyOn(smilesListPaste, "depictSmilesListForPaste")
+              .mockReturnValueOnce(Promise.resolve({ entries, skipped: 0, skippedItems: [], failures: [] }));
+            vi.spyOn(smilesPasteIdentity, "verifySmilesGridEntries").mockImplementationOnce(async entries => {
+              await wait;
+              return original(entries, inspect);
+            });
+          } else {
+            const original = smilesPasteIdentity.verifySmilesPaste;
+            vi.spyOn(smilesListPaste, "depictSmilesForPaste").mockResolvedValueOnce(parsed);
+            vi.spyOn(smilesPasteIdentity, "verifySmilesPaste")
+              .mockImplementationOnce(async (depiction, smiles) => {
+                await wait;
+                await original(depiction, smiles, inspect);
+              });
+          }
+        } else {
+          vi.spyOn(smilesListPaste, "depictSmilesForPaste")
+            .mockImplementationOnce(() => new Promise((resolve) => {
+              finishPaste = () => resolve(parsed);
+            }));
+        }
+        await paste(kind === "list identity" ? "CC\nCC" : "CC");
+      }
+      saveAskToSaveBeforeQuit(true);
+      native.savePicker.mockResolvedValueOnce("/tmp/async-quit.chemdraft");
+      await flush();
+      let finishFlush: () => void = () => {};
+      native.saveSession.mockImplementationOnce(() =>
+        new Promise<void>(resolve => { finishFlush = resolve; }));
+      await quitButton("Save");
+      const saved = bridge().snapshot().document;
+      await act(async () => { finishPaste(); });
+      if (kind.includes("identity")) {
+        await vi.waitFor(() => {
+          expect(container.querySelector('[role="status"]')?.textContent)
+            .toBe("Paste cancelled while quitting");
+        }, { timeout: 15_000 });
+      }
+      expect(bridge().snapshot().document).toEqual(saved);
+      expect(bridge().snapshot().file.dirty).toBe(false);
+      expect(native.quit).not.toHaveBeenCalled();
+      await act(async () => { finishFlush(); });
+      expect(native.quit).toHaveBeenCalledTimes(1);
+  }, 20_000);
 
   it.each(["picker cancelled", "write failed"])("remains editable after quit Save is %s", async (failure) => {
     await paste("Existing drawing");
@@ -1799,6 +1952,174 @@ describe("documents in one window", () => {
     expect(pendingPrompt).toBeUndefined();
     expect(reject).not.toHaveBeenCalled();
     expect(runtime.host.listProposedPatches("pending")).toEqual([proposal]);
+  });
+
+
+  describe("fresh-document launch preference", () => {
+    it.each([false, true])("uses the launch preference %s without changing live history", async enabled => {
+      const defaultViewport = bridge().snapshot().viewport;
+      const previous = threeTabSession();
+      previous.tabs!.forEach(tab => { tab.view!.viewport = { ...tab.view!.viewport, scale: 2, translateX: 321 }; });
+      native.session = previous;
+      saveStartWithFreshDocument(enabled);
+      await remount();
+      expect(tabs()).toHaveLength(enabled ? 1 : 3);
+      expect(bridge().snapshot().document.title).toBe(enabled ? "Untitled" : "Second");
+      if (enabled) {
+        expect(bridge().snapshot().file).toEqual({ dirty: false });
+        expect(bridge().snapshot().selection.objectIds).toEqual([]);
+        expect(bridge().snapshot().viewport).toEqual(defaultViewport);
+        expect(bridge().snapshot().document.pages.flatMap(p => p.objects)).toEqual([]);
+        await command("edit.undo");
+        expect(container.querySelector('[role="status"]')?.textContent).toContain("Nothing to undo");
+      }
+      await paste("Current work");
+      const currentTabIndex = active();
+      await command("document.new");
+      await activate(currentTabIndex);
+      const current = bridge().snapshot().document;
+      const currentViewport = bridge().snapshot().viewport;
+      const currentSelection = bridge().snapshot().selection;
+      saveStartWithFreshDocument(!enabled);
+      expect(bridge().snapshot().document).toEqual(current);
+      expect(bridge().snapshot().viewport).toEqual(currentViewport);
+      expect(bridge().snapshot().selection).toEqual(currentSelection);
+      await command("edit.undo");
+      expect(drawnText()).not.toContain("Current work");
+      await command("edit.redo");
+      expect(drawnText()).toContain("Current work");
+    });
+
+    it("keeps the old session through autosave and quit of the untouched blank, then saves new work", async () => {
+      const previous = threeTabSession(); native.session = previous;
+      saveStartWithFreshDocument(true); await remount();
+      native.saveSession.mockClear();
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
+      await flush();
+      expect(native.saveSession).not.toHaveBeenCalled();
+      expect(native.session).toEqual(previous);
+      await paste("New run work");
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
+      expect(native.saveSession).toHaveBeenCalled();
+      native.savePicker.mockResolvedValueOnce("D:\\new-run.chemdraft");
+      await command("document.save");
+      expect(native.writeFile).toHaveBeenCalled();
+      const saved = await flush();
+      expect(saved.tabs).toHaveLength(1);
+      saveStartWithFreshDocument(false); await remount();
+      expect(drawnText()).toContain("New run work");
+      expect(bridge().snapshot().file.path).toBe("D:\\new-run.chemdraft");
+    });
+
+    it.each([[false, "MacIntel"], [true, "MacIntel"], [false, "Win32"], [true, "Win32"]] as const)("queues startup file opens and preserves later OS opens (fresh %s, %s)", async (enabled, platform) => {
+      vi.stubGlobal("navigator", { platform });
+      saveStartWithFreshDocument(enabled);
+      let resolve!: (value: unknown) => void;
+      native.load.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+      await remount();
+      await act(async () => native.events.get("chemdraft://open-document")!({
+        path: "/tmp/startup.chemdraft", displayName: "startup.chemdraft", contents: fileContents("Startup file")
+      }));
+      await act(async () => resolve(threeTabSession()));
+      expect(tabs()).toHaveLength(enabled ? 1 : 4);
+      expect(bridge().snapshot().document.title).toBe("Startup file");
+      await act(async () => native.events.get("chemdraft://open-document")!({
+        path: "/tmp/later.chemdraft", displayName: "later.chemdraft", contents: fileContents("Later OS file")
+      }));
+      expect(tabs()).toHaveLength(enabled ? 2 : 5);
+      expect(bridge().snapshot().document.title).toBe("Later OS file");
+    });
+
+    it.each([false, true])("does not replace live drawings on invalid OS file requests (fresh %s)", async enabled => {
+      saveStartWithFreshDocument(enabled); native.session = threeTabSession(); await remount();
+      const before = bridge().snapshot(); const count = tabs().length;
+      await act(async () => native.events.get("chemdraft://open-document")!({
+        path: "/tmp/invalid.chemdraft", displayName: "invalid.chemdraft", contents: "not a document"
+      }));
+      expect(tabs()).toHaveLength(count);
+      expect(bridge().snapshot().document).toEqual(before.document);
+      expect(bridge().snapshot().file).toEqual(before.file);
+      expect(container.querySelector('[role="status"]')?.textContent).toContain("Open failed:");
+    });
+
+    it("captures opt-in before a slow read, keeps early work, and ignores a live toggle", async () => {
+      saveStartWithFreshDocument(true);
+      let resolve!: (value: unknown) => void;
+      native.load.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+      await remount(); await paste("Early fresh work");
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
+      native.saveSession.mockClear();
+      saveStartWithFreshDocument(false);
+      await act(async () => resolve(threeTabSession()));
+      expect(tabs()).toHaveLength(1);
+      expect(drawnText()).toContain("Early fresh work");
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 900)); });
+      expect(native.saveSession).toHaveBeenCalled();
+      expect(parseDocumentSessionEnvelope(native.session)!.tabs).toHaveLength(1);
+    });
+
+    it.each([false, true])("keeps corrupt outer-session writes blocked (fresh %s)", async enabled => {
+      saveStartWithFreshDocument(enabled);
+      const raw = { version: 99, contents: "recoverable bytes" }; native.session = raw;
+      await remount(); native.saveSession.mockClear();
+      await paste("New work"); await flush();
+      expect(native.saveSession).not.toHaveBeenCalled(); expect(native.session).toEqual(raw);
+    });
+
+    it("keeps previously retained tabs even when their contents are now readable", async () => {
+      saveStartWithFreshDocument(true);
+      const previous = threeTabSession();
+      const kept = { ...previous.tabs![0]!, extraRecoveryData: { keep: true } };
+      previous.unrestoredTabs = [kept]; native.session = previous;
+      await remount();
+      expect(tabs()).toHaveLength(1);
+      expect(pendingPrompt).toBeUndefined();
+      await paste("Fresh work beside newly readable recovery");
+      expect((await flush()).unrestoredTabs).toEqual([kept]);
+    });
+
+    it("retains schema-valid envelopes with unreadable document contents in a fresh run", async () => {
+      saveStartWithFreshDocument(true);
+      const previous = threeTabSession();
+      const corrupt = { ...previous.tabs![0]!, contents: "not a document", extraRecoveryData: { keep: true } };
+      previous.tabs![0] = corrupt; native.session = previous;
+      await remount();
+      expect(tabs()).toHaveLength(1);
+      expect(pendingPrompt).toBeUndefined();
+      await paste("Fresh work beside recovery");
+      expect((await flush()).unrestoredTabs).toEqual([corrupt]);
+    });
+
+    it("retains unrestored tabs while skipping readable tabs and never discards automatically", async () => {
+      saveStartWithFreshDocument(true);
+      const previous = sessionWithUnrestoredTabs(); native.session = previous;
+      await remount();
+      expect(tabs()).toHaveLength(1);
+      expect(bridge().snapshot().document.title).toBe("Untitled");
+      expect(pendingPrompt).toBeUndefined();
+      native.saveSession.mockClear(); await flush();
+      expect(native.saveSession).not.toHaveBeenCalled();
+      await paste("New run with recovery");
+      expect((await flush()).unrestoredTabs).toEqual(previous.unrestoredTabs);
+    });
+
+
+    it.each([true, false])("shows the kept-drawings prompt only when not starting fresh (fresh %s)", async enabled => {
+      saveStartWithFreshDocument(enabled);
+      const previous = threeTabSession();
+      const kept = { ...previous.tabs![0]!, extraRecoveryData: { keep: true } };
+      const corrupt = { ...previous.tabs![1]!, contents: "not a document", extraRecoveryData: { keep: true } };
+      previous.tabs![1] = corrupt; previous.unrestoredTabs = [kept]; native.session = previous;
+      await remount();
+      if (enabled) {
+        expect(pendingPrompt).toBeUndefined();
+        expect(tabs()).toHaveLength(1);
+        await paste("Fresh work beside recovery");
+        expect((await flush()).unrestoredTabs).toEqual(expect.arrayContaining([kept, corrupt]));
+      } else {
+        expect(pendingPrompt?.prompt.title).toMatch(/didn't open/);
+      }
+    });
   });
 
   function threeTabSession() {

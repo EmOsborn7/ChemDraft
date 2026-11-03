@@ -9,6 +9,8 @@ import {
   elementSymbolForAtomicNumber,
   isDativeBond,
   isEngineDocument,
+  nativeTextStyleFromObjectStyle,
+  normalizeAtomIsotope,
   parseDocument,
   type Anchor,
   type ArrowObject,
@@ -25,9 +27,12 @@ import {
   type MoleculeBond,
   type MoleculeObject,
   type Point,
-  type TextObject
+  type TextObject,
+  type TableObject
 } from "@chemdraft/chem-core";
+import { measureTextRun, planTableLayout } from "@chemdraft/layout-engine";
 import { bondedElementLabelMeaning } from "@chemdraft/template-library";
+import { planMoleculeAtomLabels } from "@chemdraft/layout-engine";
 import { sha256Hex, utf8Bytes, utf8String } from "./sha256";
 
 export interface CompatibilityConversionWarning {
@@ -183,9 +188,12 @@ export function exportDocumentToCdxml(
   // hashes and parses whatever JSON bytes the envelope carries.
   const nativeJson = JSON.stringify(parsedDocument);
   const nativePayloadHash = sha256Utf8Hex(nativeJson);
-  const visiblePageChildren = parsedDocument.pages.map((page, pageIndex) => buildVisiblePageChildren(page, warnings, pageIndex));
+  const fonts = [...new Set(parsedDocument.pages.flatMap(page => page.objects
+    .filter((object): object is TableObject => object.type === "table")
+    .map(object => nativeTextStyleFromObjectStyle(object.style).fontFamily)))];
+  const visiblePageChildren = parsedDocument.pages.map((page, pageIndex) => buildVisiblePageChildren(page, warnings, pageIndex, fonts));
   const visiblePages = parsedDocument.pages.map((page, pageIndex) => buildPageXml(page, visiblePageChildren[pageIndex]));
-  const visibleEnvelope = buildCdxmlEnvelope(creationProgram, visiblePages);
+  const visibleEnvelope = buildCdxmlEnvelope(creationProgram, visiblePages, fonts);
   const visibleCdxmlHash = visibleHashForCdxml(visibleEnvelope);
   const metadata = buildMetadataObjectTags({
     codecVersion: CdxmlEnvelopeCodecVersion,
@@ -197,7 +205,7 @@ export function exportDocumentToCdxml(
   const envelopePages = parsedDocument.pages.map((page, pageIndex) =>
     buildPageXml(page, `${visiblePageChildren[pageIndex]}${pageIndex === 0 ? metadata : ""}`)
   );
-  const contents = buildCdxmlEnvelope(creationProgram, envelopePages);
+  const contents = buildCdxmlEnvelope(creationProgram, envelopePages, fonts);
   // No runtime self-check that the metadata leaves the visible hash alone. The one this replaced
   // re-parsed and re-hashed the whole finished envelope, payload included — a full XML parse of
   // megabytes on every save — and a textual stand-in could never fire, since `contents` is the
@@ -443,12 +451,14 @@ function unsupportedSchemaWarningFromJson(contents: string): CompatibilityConver
   return undefined;
 }
 
-function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[]): string {
+function buildCdxmlEnvelope(creationProgram: string, pages: readonly string[], fonts: readonly string[]): string {
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE CDXML SYSTEM "http://www.cambridgesoft.com/xml/cdxml.dtd">',
     `<CDXML CreationProgram="${escapeXmlAttribute(creationProgram)}">`,
     buildStandardColorTableXml(),
+    ...(fonts.length ? ["  <fonttable>", ...fonts.map((font, index) =>
+      `    <font id="${index + 1}" charset="iso-8859-1" name="${escapeXmlAttribute(font)}"/>`), "  </fonttable>"] : []),
     ...pages,
     "</CDXML>",
     ""
@@ -476,12 +486,12 @@ function buildPageXml(page: DocumentPage, children: string): string {
   return `  <page ${attributes.join(" ")}>${children}</page>`;
 }
 
-function buildVisiblePageChildren(page: DocumentPage, warnings: CompatibilityConversionWarning[], pageIndex: number): string {
+function buildVisiblePageChildren(page: DocumentPage, warnings: CompatibilityConversionWarning[], pageIndex: number, fonts: readonly string[]): string {
   const allocator = createIdAllocator(pageIndex);
   const context = createVisibleExportContext(page);
   const objectsById = new Map(page.objects.map((object) => [object.id, object]));
   const visibleChildren = page.objects
-    .map((object) => exportVisibleObject(object, context, allocator, warnings, objectsById))
+    .map((object) => exportVisibleObject(object, context, allocator, warnings, objectsById, fonts))
     .filter((child) => child.length > 0);
   return visibleChildren.length > 0 ? `\n${visibleChildren.map((child) => indent(child, 4)).join("\n")}\n  ` : "";
 }
@@ -491,8 +501,12 @@ function exportVisibleObject(
   context: VisibleExportContext,
   allocator: IdAllocator,
   warnings: CompatibilityConversionWarning[],
-  objectsById: ReadonlyMap<string, DocumentObject>
+  objectsById: ReadonlyMap<string, DocumentObject>,
+  fonts: readonly string[]
 ): string {
+  if (object.type === "table") {
+    return exportTableObject(object, context.ids, allocator, warnings, fonts);
+  }
   if (object.type === "molecule") {
     return exportMoleculeObject(object, context, allocator, warnings);
   }
@@ -599,6 +613,11 @@ function exportMoleculeObject(
   const fragmentId = idFor(context.ids, molecule.id, allocator);
   const atomIds = new Map<string, string>();
   const bondedAtomIds = new Set(molecule.bonds.flatMap((bond) => [bond.fromAtomId, bond.toAtomId]));
+  const hasIsotopes = molecule.atoms.some((atom) =>
+    atom.isotope !== undefined || atom.element === "D" || atom.element === "T");
+  const labels = hasIsotopes
+    ? new Map(planMoleculeAtomLabels(molecule).map((plan) => [plan.atom.id, plan.layout.runs]))
+    : undefined;
   const atomLines = molecule.atoms.map((atom) => {
     const nodeId = idFor(atomIds, atom.id, allocator);
     // An element symbol chemists write on bonds — "Ar" (aryl), "Ac", "Pr", "Ts" — typed as a label is
@@ -609,13 +628,19 @@ function exportMoleculeObject(
     const bondedMeaning = bondedAtomIds.has(atom.id) && atom.labelLiteral === true
       ? bondedElementLabelMeaning(atom.element)
       : undefined;
-    const elementNumber = bondedMeaning === undefined ? atomicNumberForElement(atom.element) : undefined;
+    const heavyHydrogen = atom.element === "D" || atom.element === "T";
+    const isotope = atom.element === "D" ? 2 : atom.element === "T" ? 3 : atom.isotope;
+    const elementNumber = heavyHydrogen ? 1
+      : bondedMeaning === undefined ? atomicNumberForElement(atom.element) : undefined;
     const attributes = [
       `id="${nodeId}"`,
       `p="${formatPoint(atom)}"`
     ];
     if (elementNumber !== undefined && atom.element !== "C") {
       attributes.push(`Element="${elementNumber}"`);
+    }
+    if (isotope !== undefined) {
+      attributes.push(`Isotope="${isotope}"`);
     }
     if (elementNumber === undefined) {
       attributes.push(`Element="${escapeXmlAttribute(atom.element)}"`);
@@ -656,14 +681,23 @@ function exportMoleculeObject(
     if (atom.hydrogenCount !== undefined) {
       attributes.push(`NumHydrogens="${atom.hydrogenCount}"`);
     }
+    if (isotope !== undefined) {
+      const label = (labels?.get(atom.id) ?? []).map((run) => {
+        const face = run.script === "superscript" ? ' face="32"'
+          : run.script === "subscript" ? ' face="64"' : "";
+        return `<s${face}>${escapeXmlText(run.text)}</s>`;
+      }).join("");
+      return `<n ${attributes.join(" ")}><t>${label}</t></n>`;
+    }
     return `<n ${attributes.join(" ")}/>`;
   });
   const bondLines = molecule.bonds.map((bond) => exportBond(bond, molecule, atomIds, context, allocator, warnings));
 
-  if (molecule.chemistry?.isotopeLabels.length || molecule.chemistry?.radicalCount || molecule.chemistry?.stereochemistry.length) {
+  if (molecule.chemistry?.radicalCount || molecule.chemistry?.stereochemistry.length) {
     warnings.push({
       code: "cdxml.molecule_metadata_payload_only",
-      message: "Molecule isotope, radical, or stereochemistry aggregates remain in the native payload until per-atom schema support exists.",
+      message: "Molecule radical and stereochemistry aggregates remain in the native payload; " +
+        "isotopes are preserved on CDXML atoms and supported bond stereo is written visibly.",
       sourceObjectId: molecule.id
     });
   }
@@ -696,6 +730,12 @@ function exportBond(
     `E="${atomIds.get(bond.toAtomId) ?? escapeXmlAttribute(bond.toAtomId)}"`,
     `Order="${order}"`
   ];
+  if (bond.order === "double" && bond.stereo === "either") {
+    warnings.push(warning(
+      "cdxml.open_double_bond_native_only",
+      `E/Z-unspecified double bond ${bond.id} is kept for ChemDraft only; other apps will see a plain double bond.`
+    ));
+  }
   const bondStyle = cdxmlBondDisplayForBondStyle(bond.display);
   if (bondStyle) {
     attributes.push(`Display="${bondStyle}"`);
@@ -746,6 +786,65 @@ function cdxmlCrossingZForRef(
   return counts.front >= counts.back ? "2" : "1";
 }
 
+function exportTableObject(
+  table: TableObject,
+  ids: Map<string, string>,
+  allocator: IdAllocator,
+  warnings: CompatibilityConversionWarning[],
+  fonts: readonly string[]
+): string {
+  const layout = planTableLayout(table);
+  const style = nativeTextStyleFromObjectStyle(table.style);
+  const font = fonts.indexOf(style.fontFamily) + 1;
+  const texts: string[] = [];
+  const writeLines = (lines: typeof layout.cells[number]["lines"], fontSizePx: number) => {
+    for (const line of lines) {
+      const runs = line.pieces.flatMap(piece => piece.runs);
+      if (!runs.some(run => run.text.length > 0)) continue;
+      const first = line.pieces[0];
+      const after = line.pieces.length === 2 ? line.pieces[1].runs : [];
+      const afterWidth = after.reduce((sum, run) => sum + measureTextRun(run.text, {
+        fontSizePx: run.script === "normal" && typeof run.style.fontSizePx === "number" ? run.style.fontSizePx : fontSizePx,
+        fontWeight: typeof run.style.fontWeight === "number" ? run.style.fontWeight : style.fontWeight,
+        script: run.script
+      }) + [...run.text].length * (typeof run.style.letterSpacingPx === "number" ? run.style.letterSpacingPx : style.letterSpacingPx), 0);
+      const justification = first.anchor === "end" ? "Right" : first.anchor === "middle" ? "Center" : "Left";
+      const runXml = runs.map(run => {
+        const weight = typeof run.style.fontWeight === "number" ? run.style.fontWeight : style.fontWeight;
+        const italic = typeof run.style.fontStyle === "string" ? run.style.fontStyle : style.fontStyle;
+        const face = (weight >= 600 ? 1 : 0) + (italic === "italic" ? 2 : 0) +
+          (run.script === "subscript" ? 32 : run.script === "superscript" ? 64 : 0);
+        const size = run.script === "normal" && typeof run.style.fontSizePx === "number" ? run.style.fontSizePx : fontSizePx;
+        return `<s font="${font}" size="${formatNumber(cssPxToCdxml(size))}" face="${face}">${escapeXmlText(run.text)}</s>`;
+      }).join("");
+      texts.push(`<t id="${allocator.next()}" p="${formatPoint({ x: first.x + afterWidth, y: line.baselineY })}" Justification="${justification}">${runXml}</t>`);
+    }
+  };
+  if (layout.captionBox) writeLines(layout.captionBox.lines, style.fontSizePx * 0.9);
+  layout.cells.forEach(cell => writeLines(cell.lines, style.fontSizePx));
+  layout.footnoteBoxes.forEach(box => writeLines(box.lines, style.fontSizePx * 0.9));
+  const lines = layout.rules.map(rule => exportGraphicAsCdxmlGraphic({
+    id: table.id, type: "graphic", graphicKind: "line", x: rule.x1, y: rule.y1,
+    width: rule.x2 - rule.x1, height: rule.y2 - rule.y1, rotation: 0,
+    style: { strokeWidth: rule.widthPx, strokeColor: style.color }, data: {}
+  }, allocator.next(), warnings));
+  const caption = [...(table.caption?.text ?? "").replace(/\s+/gu, " ").trim()];
+  const tableName = caption.length > 0
+    ? `Table "${caption.length > 40 ? `${caption.slice(0, 39).join("")}…` : caption.join("")}"`
+    : "The table";
+  warnings.push({
+    code: "cdxml.table_approximated",
+    message: `${tableName} was written as ${texts.length} text objects and ${lines.length} lines, so other programs will not edit it as a table; ChemDraft reopens it exactly from the embedded ChemDraft payload.`,
+    sourceObjectId: table.id
+  });
+  if (table.rotation !== 0) warnings.push({
+    code: "cdxml.table_rotation_approximated",
+    message: `${tableName} was exported without its rotation.`,
+    sourceObjectId: table.id
+  });
+  return `<group id="${idFor(ids, table.id, allocator)}">${texts.join("")}${lines.join("")}</group>`;
+}
+
 function exportTextObject(text: TextObject, ids: Map<string, string>, allocator: IdAllocator): string {
   const textId = idFor(ids, text.id, allocator);
   return `<t id="${textId}" p="${formatPoint({ x: text.x, y: text.y })}">${escapeXmlText(text.text)}</t>`;
@@ -784,6 +883,10 @@ function exportGraphicObject(
   allocator: IdAllocator,
   warnings: CompatibilityConversionWarning[]
 ): string {
+  if (graphic.graphicKind === "image") {
+    warnings.push({ code: "cdxml.picture_not_saved", message: `CDXML export: picture ${graphic.id} is not saved in CDXML`, sourceObjectId: graphic.id });
+    return "";
+  }
   const graphicId = idFor(ids, graphic.id, allocator);
   warnForGraphicCdxmlLimitations(graphic, warnings);
   // An object that came in as an <arrow> goes back out as one, even now that it is tagged as a
@@ -1453,19 +1556,26 @@ function importVisibleCdxmlFromTree(tree: OrderedXmlTree): { document?: ChemDraf
   const importTransform = importTransformForTree(tree);
   const colorTable = importCdxmlColorTable(tree);
   const base = createEmptyDocument({ title: "Imported CDXML.chemdraft", now: nativeImportTimestamp });
-  const importedPages = pageElements.map((pageElement, pageIndex) => {
-    const pageTemplate = base.pages[0];
-    const importedPage = applyImportTransformToPageObjects(
-      importPageObjects(pageElement, pageIndex, warnings, colorTable),
-      importTransform
-    );
+  let importedPages: DocumentPage[];
+  try {
+    importedPages = pageElements.map((pageElement, pageIndex) => {
+      const pageTemplate = base.pages[0];
+      const importedPage = applyImportTransformToPageObjects(
+        importPageObjects(pageElement, pageIndex, warnings, colorTable),
+        importTransform
+      );
+      return {
+        ...pageTemplate,
+        id: `page_${String(pageIndex + 1).padStart(3, "0")}`,
+        objects: importedPage.objects,
+        crossings: importedPage.crossings
+      };
+    });
+  } catch (error) {
     return {
-      ...pageTemplate,
-      id: `page_${String(pageIndex + 1).padStart(3, "0")}`,
-      objects: importedPage.objects,
-      crossings: importedPage.crossings
+      warnings: [warning("cdxml.values_out_of_range", `CDXML import failed: ${errorMessage(error)}`)]
     };
-  });
+  }
   const objectCount = importedPages.reduce((count, page) => count + page.objects.length, 0);
   if (objectCount === 0) {
     return {
@@ -1902,9 +2012,11 @@ function importFragment(
     const rawElement = atomElement.attributes.Element?.trim();
     const textLabel = rawElement !== undefined && rawElement.length > 0 && !Number.isInteger(Number(rawElement)) &&
       bondedElementLabelMeaning(element) !== undefined;
-    return {
+    return normalizeAtomIsotope({
       id: atomId,
       element: literalLabel ?? element,
+      ...(atomElement.attributes.Isotope === undefined ? {}
+        : { isotope: Number(atomElement.attributes.Isotope) }),
       x: point.x,
       y: point.y,
       formalCharge: parseInteger(atomElement.attributes.Charge) ?? 0,
@@ -1912,7 +2024,7 @@ function importFragment(
       // no implicit hydrogens are invented for a label like "SO3".
       ...(literalLabel || textLabel ? { labelLiteral: true } : {}),
       ...(labelPoint ? { labelOffset: { x: labelPoint.x - point.x, y: labelPoint.y - point.y } } : {})
-    };
+    });
   });
   // A bond drawn to an abbreviation now lands on the atom its connection point marked — the sulfur
   // of an expanded SO3, not the vanished node.

@@ -1,3 +1,7 @@
+export { normalizeAtomIsotope } from "./isotopes";
+export { MAX_IMAGE_OBJECT_BYTES } from "./imageBytes";
+export { MAX_IMAGE_SIDE, MAX_IMAGE_DECODED_BYTES, imagePixelLimitError, validatePngImage, validateSvgImage, isSvgImageSource, createImageGraphicObject, readPngInfo, readSvgInfo, type CreateImageGraphicObjectOptions, type ImagePixelInfo } from "./image";
+
 export {
   AnchorSchema,
   ArrowAttachmentSchema,
@@ -26,6 +30,7 @@ export {
   GraphicObjectDataSchema,
   GraphicMarkerSchema,
   GraphicObjectSchema,
+  ImageObjectDataSchema,
   GraphicObjectStyleSchema,
   GraphicPathNodeSchema,
   GraphicPaintSchema,
@@ -48,6 +53,13 @@ export {
   ReactionObjectSchema,
   SuperatomMetadataSchema,
   SuperatomObjectSchema,
+  TABLE_LIMITS,
+  TableCellSchema,
+  TableColumnSchema,
+  TableObjectSchema,
+  TableRichTextSchema,
+  TableRowSchema,
+  TableStyleSchema,
   TextObjectSchema,
   TextSpanSchema,
   UnknownCompatibilityObjectSchema,
@@ -76,6 +88,7 @@ export {
   type GraphicObjectData,
   type GraphicMarker,
   type GraphicObject,
+  type ImageObjectData,
   type GraphicObjectStyle,
   type GraphicPathNode,
   type GraphicPaint,
@@ -98,6 +111,12 @@ export {
   type ReactionObject,
   type SuperatomMetadata,
   type SuperatomObject,
+  type TableCell,
+  type TableColumn,
+  type TableObject,
+  type TableRichText,
+  type TableRow,
+  type TableStyle,
   type TextObject,
   type TextSpan,
   type UnknownCompatibilityObject,
@@ -139,6 +158,7 @@ export {
   createEmptyDocument,
   deserializeDocument,
   migrateDocument,
+  migrateLegacyTableObjects,
   parseDocument,
   serializeDocument,
   toIsoTimestamp,

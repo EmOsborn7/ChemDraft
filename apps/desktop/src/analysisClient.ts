@@ -1,5 +1,5 @@
 /**
- * Main-thread client for the analysis worker (PLANS.md §5).
+ * Main-thread client for the analysis worker (docs/plans/PLANS.md §5).
  *
  * Two responsibilities, and it is worth keeping them separate in your head:
  *
@@ -29,7 +29,7 @@ import {
   sourceInterpretation
 } from "@chemdraft/rdkit-adapter/constants";
 
-import type { AnalysisWorkRequest, AnalysisWorkResponse } from "./analysisWorker";
+import type { AnalysisWorkRequest, AnalysisWorkResponse } from "./analysisWorkerRuntime";
 
 /**
  * Refuse anything larger than this many heavy atoms. Enforced in the adapter, which is the only layer

@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { loadStartWithFreshDocument, saveStartWithFreshDocument } from "./startupSettings";
 import { loadExportPreviewEnabled, saveExportPreviewEnabled } from "./exportPreviewSettings";
+import { loadAutomaticPluginUpdates, saveAutomaticPluginUpdates, broadcastPluginUpdateSettings } from "./pluginUpdateSettings";
 import { loadAskToSaveBeforeQuit, saveAskToSaveBeforeQuit } from "./quitSettings";
 import {
   loadSpin3dSettings,
@@ -95,8 +97,10 @@ function PreferenceRadioGroup<T extends string>({ legend, hint, name, options, v
 }
 
 export function PreferencesWindow() {
+  const [startFresh, setStartFresh] = useState(loadStartWithFreshDocument);
   const [compoundLayouts, setCompoundLayouts] = useState(() => loadCompoundLayoutSettings());
   const [exportPreview, setExportPreview] = useState(loadExportPreviewEnabled);
+  const [automaticPluginUpdates, setAutomaticPluginUpdates] = useState(loadAutomaticPluginUpdates);
   const [askToSave, setAskToSave] = useState(loadAskToSaveBeforeQuit);
   const [settings, setSettings] = useState<Spin3dSettings>(() => loadSpin3dSettings());
   const [keybindings, setKeybindings] = useState<KeybindingSettings>(() => loadKeybindingSettings());
@@ -153,6 +157,17 @@ export function PreferencesWindow() {
         </label>
       </section>
       <section className="preferences-section">
+        <h2>Startup</h2>
+        <label className="preferences-radio">
+          <input type="checkbox" checked={startFresh} onChange={(event) => {
+            setStartFresh(event.target.checked);
+            saveStartWithFreshDocument(event.target.checked);
+          }} />
+          <span className="preferences-radio-body"><span>Start with a fresh document</span>
+            <small>Open a blank drawing instead of reopening the previous session on the next launch.</small></span>
+        </label>
+      </section>
+      <section className="preferences-section">
         <h2>Quitting</h2>
         <label className="preferences-radio">
           <input type="checkbox" checked={askToSave} onChange={(event) => {
@@ -161,6 +176,20 @@ export function PreferencesWindow() {
             void broadcastQuitSettings(event.target.checked);
           }} />
           Ask to save unsaved changes before quitting
+        </label>
+      </section>
+
+      <section className="preferences-section">
+        <h2>Plugin updates</h2>
+        <label className="preferences-radio">
+          <input type="checkbox" aria-label="Check for plugin updates automatically" checked={automaticPluginUpdates} onChange={(event) => {
+            const enabled = event.currentTarget.checked;
+            setAutomaticPluginUpdates(enabled);
+            saveAutomaticPluginUpdates(enabled);
+            void broadcastPluginUpdateSettings(enabled).catch(error => console.warn("Could not broadcast plugin update preferences:", error));
+          }} />
+          <span className="preferences-radio-body"><span>Check for plugin updates automatically</span>
+            <small>Check installed official plugins daily. Updates are installed only when you choose Update.</small></span>
         </label>
       </section>
 

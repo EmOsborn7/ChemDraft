@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { applyPatch, createCustomPageLayout, DocumentObjectSchema, toEngineDocument, undo, redo } from "@chemdraft/chem-core";
+import { applyPatch, createCustomPageLayout, DocumentObjectSchema, nativeDrawingStyleFromObjectStyle, toEngineDocument, undo, redo } from "@chemdraft/chem-core";
 import { AssistantCapabilityPermissions, type PluginCommandContext } from "@chemdraft/plugin-api";
 import { PluginHost } from "@chemdraft/plugin-host";
 import { AssistantToolsController } from "./AssistantToolsController";
@@ -70,6 +70,31 @@ function setup() {
 afterEach(() => vi.useRealTimers());
 
 describe("assistant write structural sharing", () => {
+  it("groups insert_table and a later scoped edit into one request transaction", async () => {
+    const s = setup();
+    try {
+      const { requestId } = await s.controller.beginRequest(s.plugin, { prompt: "Table of measured values" });
+      const before = s.context.getDocument()!;
+      const inserted = await s.controller.callTool(s.plugin, { name: "insert_table", input: {
+        columns: [{ header: "Formula" }, { header: "Mass (g)", align: "decimal" }],
+        rows: [["H2O", "18.015"]], besideObjectId: s.molecule.id
+      } });
+      expect(inserted.isError, JSON.stringify(inserted)).not.toBe(true);
+      const id = (inserted.structuredContent!.objectIds as string[])[0]!;
+      expect(s.context.getDocument()!.selection.objectIds).toContain(id);
+      const edited = await s.controller.callTool(s.plugin, { name: "style_objects", input: {
+        objectIds: [id], style: { color: "#112233" }
+      } });
+      expect(edited.isError, JSON.stringify(edited)).not.toBe(true);
+      await s.controller.endRequest(s.plugin, { requestId });
+      expect(s.history).toHaveLength(1);
+      expect(s.history[0]!.before).toBe(before);
+      expect(s.history[0]!.label).toBe("ChemDraft Assistant: Table of measured values");
+      expect(s.history[0]!.after.pages[0]!.objects.find(object => object.id === id)).toMatchObject({
+        type: "table", style: { color: "#112233" }
+      });
+    } finally { await s.finish(); }
+  });
   it.each([1, 5000])("inserts a caption without copying or comparing unchanged graphs (%i molecules, 20 atoms each)", async count => {
     const s = setup();
     const document = s.context.getDocument()!;
@@ -496,7 +521,10 @@ describe("assistant requests and MCP bridge", () => {
       const pending = s.controller.callTool(s.plugin, { name: "move_objects", input });
       await vi.waitFor(() => expect(s.gate.pending()).toBe(1));
       const before = s.context.getDocument()!;
-      const withMark = applyChargeToolAtPoint(before, 1, { x: atom.x - 30, y: atom.y });
+      // The queued patch is already placed; this later mark cannot trigger replanning.
+      // Just outside one bond length, but inside the 1.15-bond association radius.
+      const markOffset = nativeDrawingStyleFromObjectStyle(moved.style).bondLengthPx * 1.1;
+      const withMark = applyChargeToolAtPoint(before, 1, { x: atom.x - markOffset, y: atom.y });
       s.port.push(s.context.tabId, before, withMark, "Draw charge");
       s.userEdits.forEach(listener => listener(s.context.tabId));
       s.gesture.active = false;

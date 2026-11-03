@@ -21,15 +21,27 @@ struct DialogKindSpec {
     title: &'static str,
     size: (f64, f64),
     min_size: (f64, f64),
+    // Content-fit: `ready` carries the form's measured height; reveal sets the inner height to it
+    // (never below `min_size.1`, clamped to the work area) and keeps it as the minimum height.
+    fit_content: bool,
 }
 fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
     match kind {
+        "structureTemplates" => Ok(DialogKindSpec {
+            maximizable: false,
+            resizable: true,
+            title: "Templates",
+            size: (620.0, 700.0),
+            min_size: (420.0, 360.0),
+            fit_content: false,
+        }),
         "pageSize" => Ok(DialogKindSpec {
             maximizable: false,
             resizable: false,
             title: "Custom Page Size",
             size: (420.0, 300.0),
             min_size: (360.0, 260.0),
+            fit_content: false,
         }),
         "arrangementSpacing" => Ok(DialogKindSpec {
             maximizable: false,
@@ -37,6 +49,17 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Adjust arrangement spacing",
             size: (540.0, 600.0),
             min_size: (360.0, 260.0),
+            fit_content: false,
+        }),
+        "insertTable" => Ok(DialogKindSpec {
+            maximizable: false,
+            resizable: true,
+            title: "Insert Table",
+            // Height before ready, and the fallback when ready carries no usable measurement;
+            // ready's measured content height replaces it. 240 is the floor for this form.
+            size: (480.0, 240.0),
+            min_size: (480.0, 240.0),
+            fit_content: true,
         }),
         "export" => Ok(DialogKindSpec {
             maximizable: false,
@@ -44,6 +67,7 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Export",
             size: (520.0, 620.0),
             min_size: (420.0, 360.0),
+            fit_content: false,
         }),
         "engineInstall" => Ok(DialogKindSpec {
             maximizable: false,
@@ -51,6 +75,7 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Engine installation",
             size: (520.0, 480.0),
             min_size: (420.0, 380.0),
+            fit_content: false,
         }),
         "toolInstall" => Ok(DialogKindSpec {
             maximizable: false,
@@ -58,6 +83,7 @@ fn kind_spec(kind: &str) -> Result<DialogKindSpec, String> {
             title: "Tool installation",
             size: (520.0, 460.0),
             min_size: (420.0, 380.0),
+            fit_content: false,
         }),
         _ => Err("Unknown dialog kind".into()),
     }
@@ -102,12 +128,112 @@ enum Action {
     },
     Cancel,
 }
+/// `ready` data from a content-fit form: CSS height × device pixel ratio = physical pixels.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContentFit {
+    content_height: f64,
+    pixel_ratio: f64,
+}
+/// A dialog form is far shorter than this; anything taller is not a measurement.
+const CONTENT_FIT_MAX_HEIGHT: f64 = 4096.0;
+/// Device pixel ratios and native scale factors outside this range are not a real display.
+const CONTENT_FIT_SCALE_RANGE: std::ops::RangeInclusive<f64> = 0.5..=8.0;
+impl ContentFit {
+    fn from_ready(data: &Value) -> Option<Self> {
+        serde_json::from_value::<Self>(data.clone())
+            .ok()
+            .filter(|f| {
+                f.content_height.is_finite()
+                    && f.content_height > 0.0
+                    && f.content_height <= CONTENT_FIT_MAX_HEIGHT
+                    && f.pixel_ratio.is_finite()
+                    && CONTENT_FIT_SCALE_RANGE.contains(&f.pixel_ratio)
+            })
+    }
+}
+/// A content-fit measurement with the window's native scale factor when `ready` (the
+/// measurement) arrived. The display scale can change before reveal (a monitor change or a
+/// scale setting), so the physical measurement converts through the scale it was taken at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeasuredContent {
+    fit: ContentFit,
+    scale_at_ready: f64,
+}
+impl MeasuredContent {
+    fn new(fit: Option<ContentFit>, scale_at_ready: Option<f64>) -> Option<Self> {
+        let scale_at_ready =
+            scale_at_ready.filter(|s| s.is_finite() && CONTENT_FIT_SCALE_RANGE.contains(s))?;
+        Some(Self {
+            fit: fit?,
+            scale_at_ready,
+        })
+    }
+    /// Logical inner height: physical measurement / scale at measurement. The ratio carries
+    /// WebView zoom and text scaling; never below the kind's minimum. Placement converts it to
+    /// physical pixels at the destination's scale (the scale at reveal).
+    fn logical_height(self, min_height: f64) -> f64 {
+        (self.fit.content_height * self.fit.pixel_ratio / self.scale_at_ready)
+            .ceil()
+            .max(min_height)
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InsertTableSnapshot {
+    title: String,
+    rows: u32,
+    columns: u32,
+    header_rows: u32,
+    preset: String,
+}
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum InsertTableAction {
+    Apply {
+        rows: u32,
+        columns: u32,
+        #[serde(rename = "headerRows")]
+        header_rows: u32,
+        preset: String,
+    },
+    // Struct form: serde ignores deny_unknown_fields on unit variants of internally tagged enums.
+    Cancel {},
+}
+fn valid_table_options(rows: u32, columns: u32, header_rows: u32, preset: &str) -> bool {
+    (1..=500).contains(&rows)
+        && (1..=64).contains(&columns)
+        && header_rows <= rows
+        && matches!(preset, "three-line" | "grid")
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpacingSnapshot {
     title: String,
     min_percent: u32,
     max_percent: u32,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StructureTemplatesSnapshot {
+    title: String,
+    template_ids: Vec<String>,
+}
+fn template_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 80
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum StructureTemplatesAction {
+    Insert {
+        #[serde(rename = "templateId")]
+        template_id: String,
+    },
+    Cancel,
 }
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
@@ -632,6 +758,56 @@ impl Message {
             return Err("Invalid dialog envelope or payload limit exceeded".into());
         }
         let valid = match self.message_type.as_str() {
+            "snapshot" if self.dialog_kind == "insertTable" => {
+                serde_json::from_value::<InsertTableSnapshot>(self.data.clone()).is_ok_and(|s| {
+                    valid_title(&s.title)
+                        && valid_table_options(s.rows, s.columns, s.header_rows, &s.preset)
+                })
+            }
+            "action" if self.dialog_kind == "insertTable" => serde_json::from_value::<
+                InsertTableAction,
+            >(self.data.clone())
+            .is_ok_and(|a| match a {
+                InsertTableAction::Cancel {} => true,
+                InsertTableAction::Apply {
+                    rows,
+                    columns,
+                    header_rows,
+                    preset,
+                } => valid_table_options(rows, columns, header_rows, &preset),
+            }),
+            "snapshot" if self.dialog_kind == "structureTemplates" => {
+                serde_json::from_value::<StructureTemplatesSnapshot>(self.data.clone()).is_ok_and(
+                    |s| {
+                        valid_title(&s.title)
+                            && !s.title.contains('\0')
+                            && !s.template_ids.is_empty()
+                            && s.template_ids.len() <= 64
+                            && s.template_ids.iter().all(|id| template_id(id))
+                            && s.template_ids
+                                .iter()
+                                .collect::<std::collections::HashSet<_>>()
+                                .len()
+                                == s.template_ids.len()
+                    },
+                )
+            }
+            "action" if self.dialog_kind == "structureTemplates" => serde_json::from_value::<
+                StructureTemplatesAction,
+            >(self.data.clone())
+            .is_ok_and(|action| match action {
+                StructureTemplatesAction::Cancel => true,
+                StructureTemplatesAction::Insert { template_id: id } => template_id(&id),
+            }),
+            "result" if self.dialog_kind == "structureTemplates" => {
+                serde_json::from_value::<Receipt>(self.data.clone()).is_ok_and(|r| {
+                    matches!(
+                        r.status.as_str(),
+                        "accepted" | "inserted" | "cancelled" | "error"
+                    ) && optional_string_fields(&self.data, &["error"])
+                        && r.error.is_none_or(|s| s.encode_utf16().count() <= 2048)
+                })
+            }
             "snapshot" if self.dialog_kind == "engineInstall" => {
                 serde_json::from_value::<EngineInstallSnapshot>(self.data.clone())
                     .is_ok_and(|s| s.valid())
@@ -759,7 +935,11 @@ impl Message {
                             })
                     })
             }
-            "request" | "ready" => self.data.as_object().is_some_and(|d| d.is_empty()),
+            "request" => self.data.as_object().is_some_and(|d| d.is_empty()),
+            "ready" => {
+                self.data.as_object().is_some_and(|d| d.is_empty())
+                    || ContentFit::from_ready(&self.data).is_some()
+            }
             "result" => serde_json::from_value::<Receipt>(self.data.clone()).is_ok_and(|r| {
                 matches!(
                     r.status.as_str(),
@@ -804,6 +984,7 @@ struct Session {
     receipts: HashMap<String, Message>,
     transient_until: Instant,
     pending_move: Option<(Instant, SavedPosition)>,
+    content_fit: Option<MeasuredContent>,
 }
 #[derive(Default)]
 struct Registry {
@@ -923,6 +1104,14 @@ fn send_host(session: &Session, message: &Message) -> Result<(), String> {
 }
 /// Reserve before forwarding: request-ID dedup alone cannot prevent two distinct Apply requests.
 fn reserve_action(session: &mut Session, message: &Message) -> Result<bool, String> {
+    if message.dialog_kind == "structureTemplates"
+        && message.data["action"] == "insert"
+        && !session.snapshot.data["templateIds"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&message.data["templateId"]))
+    {
+        return Err("Unknown structure template in this dialog".into());
+    }
     if message.dialog_kind == "arrangementSpacing" && message.data["action"] == "preview" {
         return if session.terminal_request.is_none() {
             Ok(true)
@@ -1036,6 +1225,7 @@ fn register(
             receipts: HashMap::new(),
             transient_until: Instant::now() + Duration::from_millis(500),
             pending_move: None,
+            content_fit: None,
         },
     );
     Ok((registration, true))
@@ -1073,6 +1263,7 @@ pub(crate) async fn dialog_open(
         session.ready
             && (session.snapshot.dialog_kind == "engineInstall"
                 || session.snapshot.dialog_kind == "toolInstall"
+                || session.snapshot.dialog_kind == "structureTemplates"
                 || session.terminal_request.is_none()
                 || session
                     .terminal_request
@@ -1115,17 +1306,21 @@ pub(crate) async fn dialog_open(
     let builder = builder.parent(&window).map_err(|e| e.to_string())?;
     #[cfg(not(windows))]
     let builder = builder;
-    if let Err(error) = builder.build() {
-        REGISTRY
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .sessions
-            .remove(&registration.host_id);
-        return Err(format!(
-            "Could not create native {} window: {error}",
-            spec.title
-        ));
-    }
+    let dialog_window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            REGISTRY
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sessions
+                .remove(&registration.host_id);
+            return Err(format!(
+                "Could not create native {} window: {error}",
+                spec.title
+            ));
+        }
+    };
+    super::disable_default_context_menus(&dialog_window);
     // Owner close/quit does not wait on the construction lock. Discard a late build whose
     // registered session was already settled, rather than leaving an orphan hidden webview.
     if !REGISTRY
@@ -1186,6 +1381,12 @@ pub(crate) async fn dialog_send(
         return Err("Dialog can send only ready or a typed action".into());
     }
     let _creation = super::lock_window_creation()?;
+    // The form measured at this window's current scale; read it before taking the registry lock.
+    let scale_at_ready = if message.message_type == "ready" {
+        window.scale_factor().ok()
+    } else {
+        None
+    };
     let reveal = {
         let mut registry = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
         let session = registry
@@ -1207,6 +1408,8 @@ pub(crate) async fn dialog_send(
         }
         if reveal {
             session.ready = true;
+            session.content_fit =
+                MeasuredContent::new(ContentFit::from_ready(&message.data), scale_at_ready);
         }
         // Only this Rust-validated path can write the owner's private channel.
         send_owner(session, window.label(), &message)?;
@@ -1281,7 +1484,7 @@ pub(crate) fn dialog_publish(
         }
         if matches!(
             message.data["status"].as_str(),
-            Some("error" | "picked" | "cancelled")
+            Some("error" | "picked" | "cancelled" | "inserted")
         ) && session.terminal_request.as_ref() == Some(&message.request_id)
         {
             session.terminal_request = None;
@@ -1448,7 +1651,7 @@ pub(crate) fn configure_on_main<R: Runtime>(
 
 #[cfg(target_os = "macos")]
 fn dialog_window_level() -> objc2_app_kit::NSWindowLevel {
-    super::toolset_utility_window_level()
+    super::toolset_utility_window_level("dialog")
 }
 
 /// Reveal/reopen and becoming key raise within the utility level. Restoration only configures
@@ -1630,20 +1833,27 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
     let owner_size = owner.inner_size().map_err(|e| e.to_string())?;
     let frame = window.outer_size().map_err(|e| e.to_string())?;
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let size = (
-        f64::from(frame.width) / scale,
-        f64::from(frame.height) / scale,
-    );
     let positions = read_positions(app);
-    let kind = REGISTRY
+    let (kind, content_fit) = REGISTRY
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .sessions
         .values()
         .find(|s| s.registration.window_label == window.label())
-        .map(|s| s.snapshot.dialog_kind.clone())
+        .map(|s| (s.snapshot.dialog_kind.clone(), s.content_fit))
         .ok_or("Unknown dialog window")?;
     let spec = kind_spec(&kind)?;
+    // Logical, through the scale at measurement; finish_placement converts at the destination.
+    let fitted_height = content_fit
+        .filter(|_| spec.fit_content)
+        .map(|fit| fit.logical_height(spec.min_size.1));
+    let client_size = (spec.size.0, fitted_height.unwrap_or(spec.size.1));
+    let client = window.inner_size().map_err(|e| e.to_string())?;
+    // Centre the frame the dialog will have: today's decorations around the fitted client.
+    let size = (
+        f64::from(frame.width) / scale,
+        f64::from(frame.height) / scale + client_size.1 - f64::from(client.height) / scale,
+    );
     let saved = positions.get(&kind).filter(|p| {
         [p.x, p.y, p.offset_x, p.offset_y]
             .iter()
@@ -1664,12 +1874,30 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
     let destination = saved
         .and_then(|s| monitors.iter().find(|m| m.id == s.monitor))
         .unwrap_or(&work);
+    let template_placement = (kind == "structureTemplates").then_some(TemplatePlacement {
+        saved,
+        owner_rect: (
+            f64::from(position.x) / destination.scale,
+            f64::from(position.y) / destination.scale,
+            f64::from(owner_size.width) / destination.scale,
+            f64::from(owner_size.height) / destination.scale,
+        ),
+    });
+    let fits_work_area = template_placement.is_some() || fitted_height.is_some();
+    if fits_work_area {
+        // The picker, and a fitted dialog, must also fit work areas smaller than its normal
+        // minimum. Restore a bounded minimum after measuring the destination's decorations.
+        window
+            .set_min_size(Some(tauri::LogicalSize::new(1.0, 1.0)))
+            .map_err(|e| e.to_string())?;
+    }
     // WM_DPICHANGED runs when moving between Windows monitors. Move first, set the desired
     // client size at the destination DPI, then clamp using the measured final outer frame.
     finish_placement(
-        (x, y, destination_scale),
-        spec.size,
+        ((x, y, destination_scale), client_size),
         destination,
+        fitted_height.is_some(),
+        template_placement,
         |x, y| {
             window
                 .set_position(tauri::PhysicalPosition::new(x as i32, y as i32))
@@ -1681,34 +1909,107 @@ fn place_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), Stri
                 .map_err(|e| e.to_string())
         },
         || {
-            window
-                .outer_size()
-                .map(|s| (s.width, s.height))
-                .map_err(|e| e.to_string())
+            let outer = window.outer_size().map_err(|e| e.to_string())?;
+            let client = window.inner_size().map_err(|e| e.to_string())?;
+            Ok(DialogFrame {
+                outer: (outer.width, outer.height),
+                client: (client.width, client.height),
+            })
         },
     )?;
+    if fits_work_area {
+        let client = window.inner_size().map_err(|e| e.to_string())?;
+        let client_height = f64::from(client.height) / destination.scale;
+        window
+            // Keep constraints logical so Windows rescales them on later DPI changes.
+            // A fitted dialog never shrinks below its content (or the work area, if smaller).
+            .set_min_size(Some(tauri::LogicalSize::new(
+                (f64::from(client.width) / destination.scale).min(spec.min_size.0),
+                if fitted_height.is_some() {
+                    client_height
+                } else {
+                    client_height.min(spec.min_size.1)
+                },
+            )))
+            .map_err(|e| e.to_string())?;
+    }
     mark_transient(window.label());
     Ok(())
 }
+struct TemplatePlacement<'a> {
+    saved: Option<&'a SavedPosition>,
+    owner_rect: (f64, f64, f64, f64),
+}
+struct DialogFrame {
+    outer: (u32, u32),
+    client: (u32, u32),
+}
+// All arguments/results are physical pixels. Decoration sizes are measured after the move,
+// since Windows may replace them during WM_DPICHANGED.
+fn fitted_template_client(client: (u32, u32), frame: (u32, u32), work: &WorkArea) -> (u32, u32) {
+    let available_width = (work.width * work.scale) as u32;
+    let available_height = (work.height * work.scale) as u32;
+    (
+        client
+            .0
+            .min(available_width.saturating_sub(frame.0.saturating_sub(client.0)))
+            .max(1),
+        client
+            .1
+            .min(available_height.saturating_sub(frame.1.saturating_sub(client.1)))
+            .max(1),
+    )
+}
 fn finish_placement(
-    (x, y, scale): (f64, f64, f64),
-    (client_width, client_height): (f64, f64),
+    ((x, y, scale), (client_width, client_height)): ((f64, f64, f64), (f64, f64)),
     work: &WorkArea,
+    fit_to_work_area: bool,
+    template: Option<TemplatePlacement<'_>>,
     mut move_to: impl FnMut(f64, f64) -> Result<(), String>,
     mut resize: impl FnMut(u32, u32) -> Result<(), String>,
-    mut measure: impl FnMut() -> Result<(u32, u32), String>,
+    mut measure: impl FnMut() -> Result<DialogFrame, String>,
 ) -> Result<(), String> {
     move_to(x, y)?;
+    // A fitted size comes from the webview: never ask for more than the destination work area,
+    // even before its decorations are measured.
+    let (client_width, client_height) = if fit_to_work_area {
+        (client_width.min(work.width), client_height.min(work.height))
+    } else {
+        (client_width, client_height)
+    };
+    // Round up: a fitted content height truncated at 125%/150% would lose its last pixel row.
     resize(
-        (client_width * scale) as u32,
-        (client_height * scale) as u32,
+        (client_width * scale).ceil() as u32,
+        (client_height * scale).ceil() as u32,
     )?;
-    let (width, height) = measure()?;
+    let mut frame = measure()?;
+    if fit_to_work_area || template.is_some() {
+        let fitted = fitted_template_client(frame.client, frame.outer, work);
+        if fitted != frame.client {
+            resize(fitted.0, fitted.1)?;
+            frame = measure()?;
+        }
+    }
+    if let Some(template) = template {
+        // Re-centre using the final outer frame, rather than the initial monitor's frame.
+        // A saved position still uses the shared per-kind destination/offset policy.
+        let (x, y, _) = position_for(
+            template.saved,
+            std::slice::from_ref(work),
+            work,
+            template.owner_rect,
+            (
+                f64::from(frame.outer.0) / scale,
+                f64::from(frame.outer.1) / scale,
+            ),
+        );
+        return move_to(x, y);
+    }
     let (x, y) = work.clamp(
         x / scale,
         y / scale,
-        f64::from(width) / scale,
-        f64::from(height) / scale,
+        f64::from(frame.outer.0) / scale,
+        f64::from(frame.outer.1) / scale,
     );
     move_to(x * scale, y * scale)
 }
@@ -1944,6 +2245,51 @@ pub(crate) fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &Win
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn structure_templates_registration_and_actions_are_bounded_on_all_platforms() {
+        let mut message = snapshot();
+        message.dialog_kind = "structureTemplates".into();
+        message.data =
+            json!({"title":"Drawing A","templateIds":["beta-cyclodextrin","pillar-5-arene"]});
+        assert!(message.validate().is_ok());
+        let spec = kind_spec("structureTemplates").unwrap();
+        assert!(spec.resizable && !spec.maximizable);
+        let mut registry = Registry::default();
+        let (registration, build) = register(&mut registry, message.clone(), false).unwrap();
+        assert!(build);
+        assert!(registration
+            .window_label
+            .starts_with("dialog-main-structureTemplates-"));
+        assert!(is_dialog_label(&registration.window_label));
+        assert!(include_str!("../capabilities/dialog-host.json")
+            .contains("dialog-main-structureTemplates-*"));
+        assert!(!register(&mut registry, message.clone(), false).unwrap().1);
+        let session = registry.sessions.get_mut(&registration.host_id).unwrap();
+        message.message_type = "action".into();
+        for data in [
+            json!({"action":"insert"}),
+            json!({"action":"insert","templateId":"../main"}),
+            json!({"action":"insert","templateId":"beta-cyclodextrin","commandId":"document.new"}),
+        ] {
+            message.data = data;
+            assert!(message.validate().is_err());
+        }
+        message.data = json!({"action":"insert","templateId":"unknown"});
+        assert!(reserve_action(session, &message).is_err());
+        message.data = json!({"action":"insert","templateId":"beta-cyclodextrin"});
+        assert!(message.validate().is_ok());
+        assert!(reserve_action(session, &message).unwrap());
+        assert!(!reserve_action(session, &message).unwrap());
+        message.request_id = "second-insert".into();
+        assert!(reserve_action(session, &message).is_err());
+        session.terminal_request = None;
+        assert!(reserve_action(session, &message).unwrap());
+        message.message_type = "snapshot".into();
+        message.data = json!({"title":"A","templateIds":["beta-cyclodextrin","beta-cyclodextrin"]});
+        assert!(message.validate().is_err());
+        message.data = json!({"title":"A","templateIds":[],"extra":true});
+        assert!(message.validate().is_err());
+    }
     fn engine_install_snapshot() -> Message {
         let mut message = snapshot();
         message.dialog_kind = "engineInstall".into();
@@ -2384,7 +2730,7 @@ mod tests {
             .split("let builder = WebviewWindowBuilder::new(")
             .nth(1)
             .unwrap()
-            .split("if let Err(error) = builder.build()")
+            .split("let dialog_window = match builder.build()")
             .next()
             .unwrap();
         assert!(builder.contains(".minimizable(false)"));
@@ -2403,7 +2749,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn dialog_level_reaches_floating_toolbars() {
-        assert!(dialog_window_level() >= super::super::toolset_utility_window_level());
+        assert!(
+            dialog_window_level()
+                >= super::super::toolset_utility_window_level("toolset-core-main")
+        );
         assert!(dialog_window_level() > objc2_app_kit::NSNormalWindowLevel);
     }
 
@@ -2423,6 +2772,135 @@ mod tests {
         assert!(reserve_action(session, &action).unwrap());
     }
     #[test]
+    fn template_placement_fits_oversized_frames_at_destination_dpi_and_negative_origins() {
+        use std::cell::RefCell;
+        // Physical monitor origin, scale, work area in logical units. The first case is
+        // smaller than both the picker's default size and its normal minimum height.
+        for (origin, scale, area, expected_client, expected_position) in [
+            ((0.0, 24.0), 1.0, (500.0, 300.0), (484, 260), (0.0, 24.0)),
+            (
+                (2880.0, 0.0),
+                1.5,
+                (1000.0, 900.0),
+                (930, 1050),
+                (3037.0, 10.0),
+            ),
+            (
+                (-1600.0, -900.0),
+                2.0,
+                (800.0, 700.0),
+                (1240, 1360),
+                (-1388.0, -900.0),
+            ),
+        ] {
+            let work = WorkArea {
+                id: "destination".into(),
+                x: origin.0 / scale,
+                y: origin.1 / scale,
+                width: area.0,
+                height: area.1,
+                scale,
+            };
+            let owner_rect = (work.x + 20.0, work.y + 20.0, 800.0, 700.0);
+            let client = RefCell::new((0, 0));
+            let position = RefCell::new((0.0, 0.0));
+            finish_placement(
+                (
+                    (origin.0, origin.1, scale),
+                    kind_spec("structureTemplates").unwrap().size,
+                ),
+                &work,
+                false,
+                Some(TemplatePlacement {
+                    saved: None,
+                    owner_rect,
+                }),
+                |x, y| {
+                    *position.borrow_mut() = (x, y);
+                    Ok(())
+                },
+                |w, h| {
+                    *client.borrow_mut() = (w, h);
+                    Ok(())
+                },
+                || {
+                    let (w, h) = *client.borrow();
+                    Ok(DialogFrame {
+                        outer: (w + 16, h + 40),
+                        client: (w, h),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(*client.borrow(), expected_client);
+            assert!((position.borrow().0 - expected_position.0).abs() < 0.001);
+            assert!((position.borrow().1 - expected_position.1).abs() < 0.001);
+            let (x, y) = *position.borrow();
+            let (w, h) = *client.borrow();
+            assert!(x >= origin.0 && y >= origin.1);
+            assert!(x + f64::from(w + 16) <= origin.0 + area.0 * scale);
+            assert!(y + f64::from(h + 40) <= origin.1 + area.1 * scale);
+        }
+    }
+    #[test]
+    fn template_placement_restores_saved_offsets_or_centres_when_monitor_is_gone() {
+        use std::cell::RefCell;
+        let work = WorkArea {
+            id: "secondary".into(),
+            x: -800.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            scale: 2.0,
+        };
+        for (monitor, expected_position) in [
+            ("secondary", (-1256.0, 0.0)),
+            ("disconnected", (-1488.0, 0.0)),
+        ] {
+            let saved = SavedPosition {
+                monitor: monitor.into(),
+                x: 9999.0,
+                y: 9999.0,
+                offset_x: 1.0,
+                offset_y: 0.5,
+            };
+            let client = RefCell::new((0, 0));
+            let moves = RefCell::new(Vec::new());
+            let sizes = RefCell::new(Vec::new());
+            finish_placement(
+                (
+                    (-1600.0, 0.0, work.scale),
+                    kind_spec("structureTemplates").unwrap().size,
+                ),
+                &work,
+                false,
+                Some(TemplatePlacement {
+                    saved: Some(&saved),
+                    owner_rect: (-780.0, 20.0, 700.0, 500.0),
+                }),
+                |x, y| {
+                    moves.borrow_mut().push((x, y));
+                    Ok(())
+                },
+                |w, h| {
+                    *client.borrow_mut() = (w, h);
+                    sizes.borrow_mut().push((w, h));
+                    Ok(())
+                },
+                || {
+                    let (w, h) = *client.borrow();
+                    Ok(DialogFrame {
+                        outer: (w + 16, h + 40),
+                        client: (w, h),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(*sizes.borrow(), [(1240, 1400), (1240, 1160)]);
+            assert_eq!(*moves.borrow(), [(-1600.0, 0.0), expected_position]);
+        }
+    }
+    #[test]
     fn placement_moves_before_destination_resize_and_clamps_the_measured_outer_frame() {
         use std::cell::RefCell;
         let calls = RefCell::new(Vec::new());
@@ -2436,9 +2914,10 @@ mod tests {
             scale: 2.0,
         };
         finish_placement(
-            (3000.0, 1000.0, 2.0),
-            (420.0, 300.0),
+            ((3000.0, 1000.0, 2.0), (420.0, 300.0)),
             &work,
+            false,
+            None,
             |x, y| {
                 calls.borrow_mut().push(format!("move:{x},{y}"));
                 if calls.borrow().len() == 1 {
@@ -2455,7 +2934,11 @@ mod tests {
             },
             || {
                 calls.borrow_mut().push("measure".into());
-                Ok(*frame.borrow())
+                let (w, h) = *frame.borrow();
+                Ok(DialogFrame {
+                    outer: (w, h),
+                    client: (w - 32, h - 80),
+                })
             },
         )
         .unwrap();
@@ -2566,7 +3049,11 @@ mod tests {
     }
     #[test]
     fn dialog_activation_during_native_box_waits_for_last_release_and_quit_clears_it() {
-        for dialog in ["dialog-main-pageSize-1", "dialog-main-export-1"] {
+        for dialog in [
+            "dialog-main-pageSize-1",
+            "dialog-main-export-1",
+            "dialog-main-insertTable-1",
+        ] {
             let mut suspension = super::super::utility_suspension::UtilitySuspension::default();
             suspension.begin([(dialog.into(), true, false, true)], None);
             // Focus/activation retries query pending_restore; an open native box has no reveal.
@@ -2588,7 +3075,11 @@ mod tests {
     }
     #[test]
     fn dialog_uses_shared_suspension_order_and_is_never_restored_after_close_or_quit() {
-        for dialog in ["dialog-main-pageSize-1", "dialog-main-export-1"] {
+        for dialog in [
+            "dialog-main-pageSize-1",
+            "dialog-main-export-1",
+            "dialog-main-insertTable-1",
+        ] {
             let toolbar = "toolset-core-main";
             assert!(super::super::is_suspended_utility_label(dialog));
             assert_eq!(
@@ -2673,6 +3164,358 @@ mod tests {
         assert!(message.validate().is_err());
         assert!(is_dialog_label("dialog-main-arrangementSpacing-12"));
         assert!(!is_dialog_label("dialog-main-arrangementSpacing-../main"));
+    }
+    #[test]
+    fn only_insert_table_fits_its_window_to_the_measured_content() {
+        for kind in [
+            "structureTemplates",
+            "pageSize",
+            "arrangementSpacing",
+            "insertTable",
+            "export",
+            "engineInstall",
+            "toolInstall",
+        ] {
+            assert_eq!(kind_spec(kind).unwrap().fit_content, kind == "insertTable");
+        }
+    }
+    #[test]
+    fn ready_content_fit_is_typed_bounded_and_converted_through_the_pixel_ratio() {
+        let mut ready = snapshot();
+        ready.dialog_kind = "insertTable".into();
+        ready.message_type = "ready".into();
+        for data in [
+            json!({}),
+            json!({"contentHeight": 263, "pixelRatio": 2}),
+            json!({"contentHeight": 262.5, "pixelRatio": 1.25}),
+            json!({"contentHeight": 4096, "pixelRatio": 8}),
+            json!({"contentHeight": 263, "pixelRatio": 0.5}),
+        ] {
+            ready.data = data;
+            assert!(ready.validate().is_ok(), "{}", ready.data);
+        }
+        for data in [
+            json!({"contentHeight": 263}),
+            json!({"contentHeight": 0, "pixelRatio": 1}),
+            json!({"contentHeight": -5, "pixelRatio": 1}),
+            json!({"contentHeight": 4097, "pixelRatio": 1}),
+            json!({"contentHeight": 16384, "pixelRatio": 16}),
+            json!({"contentHeight": 1e308, "pixelRatio": 1}),
+            json!({"contentHeight": 263, "pixelRatio": 0}),
+            json!({"contentHeight": 263, "pixelRatio": 0.49}),
+            json!({"contentHeight": 263, "pixelRatio": 8.01}),
+            json!({"contentHeight": 263, "pixelRatio": 17}),
+            json!({"contentHeight": "263", "pixelRatio": 1}),
+            json!({"contentHeight": 263, "pixelRatio": 1, "width": 480}),
+        ] {
+            ready.data = data;
+            assert!(ready.validate().is_err(), "{}", ready.data);
+            assert_eq!(ContentFit::from_ready(&ready.data), None);
+        }
+        // A request still carries nothing.
+        ready.message_type = "request".into();
+        ready.data = json!({"contentHeight": 263, "pixelRatio": 1});
+        assert!(ready.validate().is_err());
+        let fit = |content_height, pixel_ratio, scale| {
+            MeasuredContent::new(
+                Some(ContentFit {
+                    content_height,
+                    pixel_ratio,
+                }),
+                Some(scale),
+            )
+            .unwrap()
+        };
+        // Same scale: CSS px are logical px. Retina and 150% monitors measure the same content.
+        assert_eq!(fit(263.0, 1.0, 1.0).logical_height(240.0), 263.0);
+        assert_eq!(fit(263.0, 2.0, 2.0).logical_height(240.0), 263.0);
+        assert_eq!(fit(263.0, 1.5, 1.5).logical_height(240.0), 263.0);
+        // WebView zoom or larger text (ratio above the monitor scale) grows the window.
+        assert_eq!(fit(263.0, 1.25, 1.0).logical_height(240.0), 329.0);
+        assert_eq!(fit(263.0, 1.875, 1.5).logical_height(240.0), 329.0);
+        // Never below the kind's minimum (the 240px floor for the form).
+        assert_eq!(fit(200.0, 1.0, 1.0).logical_height(240.0), 240.0);
+        // No usable scale at measurement, or no measurement: the spec size applies.
+        let measured = Some(ContentFit {
+            content_height: 263.0,
+            pixel_ratio: 2.0,
+        });
+        for scale in [
+            None,
+            Some(0.0),
+            Some(0.25),
+            Some(9.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            assert_eq!(MeasuredContent::new(measured, scale), None, "{scale:?}");
+        }
+        assert_eq!(MeasuredContent::new(None, Some(2.0)), None);
+    }
+    #[test]
+    fn content_fit_converts_through_the_scale_at_measurement_not_at_reveal() {
+        use std::cell::RefCell;
+        // Measured on a 2x display (263 CSS px = 526 physical), revealed after the display
+        // changed to 1x, 1.5x or stayed 2x: the logical height is the same 263 every time ...
+        let measured = MeasuredContent::new(
+            ContentFit::from_ready(&json!({"contentHeight": 263, "pixelRatio": 2})),
+            Some(2.0),
+        )
+        .unwrap();
+        assert_eq!(measured.logical_height(240.0), 263.0);
+        // ... where converting with the reveal scale would have doubled it at 1x.
+        assert_eq!(
+            measured.fit.content_height * measured.fit.pixel_ratio,
+            526.0
+        );
+        // Measured at 1x, revealed at 2x: still 263 logical, not 131.5 (collapsed to the floor).
+        let measured_1x = MeasuredContent::new(
+            ContentFit::from_ready(&json!({"contentHeight": 263, "pixelRatio": 1})),
+            Some(1.0),
+        )
+        .unwrap();
+        assert_eq!(measured_1x.logical_height(240.0), 263.0);
+        // The physical client is the logical height at the destination (reveal) scale.
+        for (reveal_scale, physical) in [(1.0, 263u32), (1.5, 395), (2.0, 526)] {
+            let work = WorkArea {
+                id: "display".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 1600.0,
+                height: 1000.0,
+                scale: reveal_scale,
+            };
+            let client = RefCell::new((0u32, 0u32));
+            finish_placement(
+                (
+                    (100.0 * reveal_scale, 100.0 * reveal_scale, reveal_scale),
+                    (480.0, measured.logical_height(240.0)),
+                ),
+                &work,
+                true,
+                None,
+                |_, _| Ok(()),
+                |w, h| {
+                    *client.borrow_mut() = (w, h);
+                    Ok(())
+                },
+                || {
+                    let (w, h) = *client.borrow();
+                    Ok(DialogFrame {
+                        outer: (w, h + (28.0 * reveal_scale) as u32),
+                        client: (w, h),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(client.borrow().1, physical, "{reveal_scale}");
+        }
+    }
+    #[test]
+    fn absurd_content_fit_never_reaches_a_native_resize() {
+        use std::cell::RefCell;
+        // A buggy or hostile webview: rejected on the wire, and no measurement survives.
+        let mut ready = snapshot();
+        ready.dialog_kind = "insertTable".into();
+        ready.message_type = "ready".into();
+        ready.data = json!({"contentHeight": 16384, "pixelRatio": 16});
+        assert!(ready.validate().is_err());
+        assert_eq!(
+            MeasuredContent::new(ContentFit::from_ready(&ready.data), Some(2.0)),
+            None
+        );
+        // Even the largest accepted measurement, at the smallest accepted scale, and any height
+        // that got this far, is bounded by the destination work area on the very first resize.
+        let largest = MeasuredContent::new(
+            ContentFit::from_ready(&json!({"contentHeight": 4096, "pixelRatio": 8})),
+            Some(0.5),
+        )
+        .unwrap();
+        for (scale, height) in [
+            (2.0, largest.logical_height(240.0)),
+            (1.0, 262144.0),
+            (1.5, f64::MAX),
+        ] {
+            let work = WorkArea {
+                id: "display".into(),
+                x: 0.0,
+                y: 25.0,
+                width: 1440.0,
+                height: 875.0,
+                scale,
+            };
+            let resizes = RefCell::new(Vec::<(u32, u32)>::new());
+            finish_placement(
+                ((0.0, 25.0 * scale, scale), (480.0, height)),
+                &work,
+                true,
+                None,
+                |_, _| Ok(()),
+                |w, h| {
+                    resizes.borrow_mut().push((w, h));
+                    Ok(())
+                },
+                || {
+                    let (w, h) = *resizes.borrow().last().unwrap();
+                    Ok(DialogFrame {
+                        outer: (w, h + (28.0 * scale) as u32),
+                        client: (w, h),
+                    })
+                },
+            )
+            .unwrap();
+            let resizes = resizes.borrow();
+            assert!(!resizes.is_empty());
+            for &(w, h) in resizes.iter() {
+                assert!(f64::from(w) <= (1440.0 * scale).ceil(), "{scale}: {w}");
+                assert!(
+                    f64::from(h) <= (875.0 * scale).ceil(),
+                    "{scale} {height}: {h}"
+                );
+            }
+            // And the final frame fits the work area.
+            let (_, h) = *resizes.last().unwrap();
+            assert!(f64::from(h) + f64::from((28.0 * scale) as u32) <= 875.0 * scale);
+        }
+    }
+    #[test]
+    fn fitted_dialog_client_is_never_shorter_than_its_content_unless_the_work_area_is() {
+        use std::cell::RefCell;
+        for (scale, content, area_height) in [
+            (1.0, 263.0, 1000.0),
+            (1.25, 263.0, 1000.0),
+            (1.5, 263.0, 1000.0),
+            (2.0, 263.0, 1000.0),
+            (1.25, 329.0, 1000.0),
+            (1.5, 600.0, 400.0),
+        ] {
+            let work = WorkArea {
+                id: "display".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 1600.0,
+                height: area_height,
+                scale,
+            };
+            let client = RefCell::new((0u32, 0u32));
+            let position = RefCell::new((0.0, 0.0));
+            finish_placement(
+                ((100.0 * scale, 900.0 * scale, scale), (480.0, content)),
+                &work,
+                true,
+                None,
+                |x, y| {
+                    *position.borrow_mut() = (x, y);
+                    Ok(())
+                },
+                |w, h| {
+                    *client.borrow_mut() = (w, h);
+                    Ok(())
+                },
+                || {
+                    let (w, h) = *client.borrow();
+                    let decorations = (2.0 * scale) as u32;
+                    let title_bar = (28.0 * scale) as u32;
+                    Ok(DialogFrame {
+                        outer: (w + decorations, h + title_bar),
+                        client: (w, h),
+                    })
+                },
+            )
+            .unwrap();
+            let (w, h) = *client.borrow();
+            let title_bar = f64::from((28.0 * scale) as u32);
+            assert!(f64::from(w) >= 480.0 * scale);
+            if content * scale + title_bar <= area_height * scale {
+                // The window holds all of the content: the buttons are never cut off.
+                assert!(f64::from(h) >= content * scale, "{scale} {content}: {h}");
+                // And no more than a rounding pixel: no empty band below the buttons.
+                assert!(
+                    f64::from(h) < content * scale + 1.0,
+                    "{scale} {content}: {h}"
+                );
+            } else {
+                // Clamped to the screen, with the whole frame inside the work area.
+                assert_eq!(f64::from(h) + title_bar, (area_height * scale).floor());
+            }
+            let (_, y) = *position.borrow();
+            assert!(y >= 0.0);
+            assert!(y + f64::from(h) + title_bar <= area_height * scale + 0.001);
+        }
+    }
+    #[test]
+    fn insert_table_registers_and_validates_typed_payloads() {
+        let spec = kind_spec("insertTable").unwrap();
+        assert!(!spec.maximizable);
+        assert!(spec.resizable);
+        assert_eq!(spec.size, (480.0, 240.0));
+        assert_eq!(spec.min_size, (480.0, 240.0));
+        assert_eq!(
+            native_window_title("insertTable", spec.title, "Drawing"),
+            "Insert Table — Drawing"
+        );
+        let capability = include_str!("../capabilities/dialog-host.json");
+        assert!(capability.contains("dialog-main-insertTable-*"));
+        let mut message = snapshot();
+        message.dialog_kind = "insertTable".into();
+        message.data = json!({"title":"Drawing", "rows":4, "columns":3,
+            "headerRows":1, "preset":"three-line"});
+        assert!(message.validate().is_ok());
+        let mut registry = Registry::default();
+        let (registration, _) = register(&mut registry, message.clone(), false).unwrap();
+        assert!(registration
+            .window_label
+            .starts_with("dialog-main-insertTable-"));
+        assert!(is_dialog_label(&registration.window_label));
+        for label in [
+            "dialog-main-insertTable-",
+            "dialog-main-insertTable-../main",
+            "dialog-main-insertTable-12-extra",
+        ] {
+            assert!(!is_dialog_label(label));
+        }
+        for message_type in ["snapshot", "action"] {
+            message.message_type = message_type.into();
+            let mut data = json!({"rows":4, "columns":3, "headerRows":1, "preset":"grid"});
+            if message_type == "snapshot" {
+                data["title"] = json!("Drawing");
+            } else {
+                data["action"] = json!("apply");
+            }
+            message.data = data.clone();
+            assert!(message.validate().is_ok());
+            for (field, value) in [
+                ("rows", json!(0)),
+                ("rows", json!(501)),
+                ("rows", json!(1.5)),
+                ("rows", json!("4")),
+                ("columns", json!(0)),
+                ("columns", json!(65)),
+                ("columns", json!(1.5)),
+                ("headerRows", json!(-1)),
+                ("headerRows", json!(5)),
+                ("headerRows", json!(0.5)),
+                ("preset", json!("unknown")),
+                ("path", json!("/private")),
+            ] {
+                message.data = data.clone();
+                message.data[field] = value;
+                assert!(message.validate().is_err());
+            }
+            for header_rows in [0, 500] {
+                message.data = data.clone();
+                message.data["rows"] = json!(500);
+                message.data["columns"] = json!(64);
+                message.data["headerRows"] = json!(header_rows);
+                assert!(message.validate().is_ok());
+            }
+        }
+        message.data = json!({"action":"cancel"});
+        assert!(message.validate().is_ok());
+        message.data["rows"] = json!(4);
+        assert!(message.validate().is_err());
+        message.data = json!({"action":"preview", "percent":80});
+        assert!(message.validate().is_err());
     }
     #[test]
     fn validates_kind_label_owner_and_payload() {
@@ -2966,15 +3809,21 @@ mod tests {
             scale: 1.5,
         };
         finish_placement(
-            (0.0, 0.0, 1.5),
-            kind_spec("export").unwrap().size,
+            ((0.0, 0.0, 1.5), kind_spec("export").unwrap().size),
             &work,
+            false,
+            None,
             |_, _| Ok(()),
             |w, h| {
                 sizes.borrow_mut().push((w, h));
                 Ok(())
             },
-            || Ok((780, 960)),
+            || {
+                Ok(DialogFrame {
+                    outer: (780, 960),
+                    client: (780, 930),
+                })
+            },
         )
         .unwrap();
         assert_eq!(*sizes.borrow(), [(780, 930)]);

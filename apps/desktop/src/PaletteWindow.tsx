@@ -10,9 +10,14 @@ import {
   type ToolbarPopoverAnchor
 } from "./ToolPalette";
 import { writeClipboardTextItems } from "./clipboard";
-import { allShellCommands, type CommandSpec } from "./commands";
+import { allShellCommands, drawnStructureSettingsToolsetId, type CommandSpec } from "./commands";
+import { createTableInspectorModel, type TableInspectorControl, type TableInspectorModel, type TableInspectorSnapshot } from "./tableInspectorModel";
 import { createPhase4Document } from "./documentWorkflow";
-import { createDesktopShortcutRegistry } from "./keyboardShortcuts";
+import { createDesktopShortcutRegistry, detectDesktopShortcutPlatform } from "./keyboardShortcuts";
+import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { NATIVE_MENU_COMMAND_IDS, paletteMenuShortcut } from "./paletteMenuShortcuts";
+import { disabledControlAtPointer, installPaletteInputFocus, isPaletteInputFocusPending, paletteInputFocusControl, PALETTE_INPUT_FOCUS_COMMIT_EVENT } from "./plugins/pluginPanelInputFocus";
+import { editHistoryDirection, forceDocumentHistoryCommandId, isCleanPaletteNumberInput, isTextEditingElement } from "./editHistoryRouting";
 import { applyKeybindingSchemeToCommands } from "./keybindingScheme";
 import { isCompoundLayoutCommand } from "./compoundLayoutSettings";
 import { useCompoundLayoutTools } from "./useCompoundLayoutTools";
@@ -40,12 +45,16 @@ import {
   closeToolsetWindow,
   closeToolsetPopoverWindow,
   currentWindowLogicalPosition,
+  currentWindowLogicalWorkArea,
+  fitCurrentPaletteWindow,
   dismissToolsetPopovers,
+  toolsetPopoverTimestamp,
   hidePaletteFloatingTooltip,
   openToolsetPopoverWindow,
   prewarmToolsetPopoverWindow,
   prewarmToolsetTooltipWindow,
   listenForPalettePointer,
+  listenForCurrentWindowWorkAreaChanges,
   listenForPalettePointerLeave,
   listenForKeybindingSettings,
   listenForToolsetActiveTool,
@@ -70,8 +79,6 @@ import {
   sendPaletteCommandCommit,
   sendPaletteCommandPreview,
   showPaletteFloatingTooltip,
-  setCurrentWindowLogicalSize,
-  setToolsetWindowFocusable,
   startPaletteWindowDrag,
   toolsetCommandSpecsSignature,
   type ToolsetArtPaintTarget,
@@ -120,13 +127,17 @@ export function PaletteWindow({
   toolsetId = "core.main",
   // Interim seam so tests (and, until Phase 4's definition-push, callers) can supply a
   // registry that already includes plugin toolsets. Defaults to the core registry.
-  initialRegistry
+  initialRegistry,
+  platform = detectDesktopShortcutPlatform()
 }: {
   toolsetId?: string;
   initialRegistry?: DesktopToolsetRegistry;
+  platform?: ShortcutPlatform;
 }) {
   const dragRef = useRef<PaletteWindowDrag | null>(null);
   const shellRef = useRef<HTMLElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const settlingBeforeForwardRef = useRef(false);
   const lastLoggedSizeRef = useRef<string>("");
   const sizeAnimationFrameRef = useRef<number | undefined>(undefined);
   const compoundLayoutsEnabled = useCompoundLayoutTools();
@@ -168,7 +179,9 @@ export function PaletteWindow({
   const [currentTextScript, setCurrentTextScript] = useState<TextSpan["script"]>("normal");
   const [currentArtStyle, setCurrentArtStyle] = useState<ToolsetArtStylePayload | undefined>();
   const [currentArtStyleTarget, setCurrentArtStyleTarget] = useState<ToolsetArtPaintTarget>("fill");
+  const [colorContextKey, setColorContextKey] = useState<string | undefined>();
   const [currentMoleculeInspector, setCurrentMoleculeInspector] = useState<ToolsetMoleculeInspectorPayload | undefined>();
+  const [currentTable, setCurrentTable] = useState<TableInspectorSnapshot | undefined>();
   const [currentSelection, setCurrentSelection] = useState<ToolbarSelectionModel | undefined>();
   const [currentMolecularInspector, setCurrentMolecularInspector] = useState<AnalysisReport | undefined>();
   const [molecularInspectorBusy, setMolecularInspectorBusy] = useState(false);
@@ -217,9 +230,11 @@ export function PaletteWindow({
     );
   }, [allCommands, compoundLayoutsEnabled]);
   const shortcutRegistry = useMemo(
-    () => createDesktopShortcutRegistry(allCommands, { includeDisabled: true }),
-    [allCommands]
+    () => createDesktopShortcutRegistry(allCommands, { includeDisabled: true, platform }),
+    [allCommands, platform]
   );
+  const shortcutRegistryRef = useRef(shortcutRegistry);
+  shortcutRegistryRef.current = shortcutRegistry;
   // Every append-mode section widget the gallery can offer (Style Controls, Text Style) — present ones
   // gray out, removed ones (e.g. Style Controls after a drag-out) show as restorable tiles.
   const galleryWidgets = APPENDABLE_TOOLBAR_WIDGETS;
@@ -411,17 +426,13 @@ export function PaletteWindow({
     };
   }, [toolset.id]);
 
-  // Palettes ship non-focusable; the gallery's search field needs keystrokes, so flip focusability on
-  // while customizing this palette and back off on exit (restoring the never-steal-key default).
+  // All non-button settings borrow the keyboard: otherwise Delete reaches the drawing
+  // after a checkbox/slider/select click. Command buttons keep the document's keyboard.
   useEffect(() => {
-    if (!customizeThisPalette) {
-      return;
-    }
-    void setToolsetWindowFocusable(toolset.id, true).catch(() => undefined);
-    return () => {
-      void setToolsetWindowFocusable(toolset.id, false).catch(() => undefined);
-    };
-  }, [customizeThisPalette, toolset.id]);
+    const shell = shellRef.current;
+    if (shell) return installPaletteInputFocus(shell, platform,
+      (event) => !!paletteMenuShortcut(event, shortcutRegistryRef.current));
+  }, [platform]);
 
   useEffect(() => {
     const preferredSize = toolset.preferredWindowSize ?? gridWindowSize;
@@ -430,48 +441,80 @@ export function PaletteWindow({
     }
 
     const shell = shellRef.current;
-    const applySize = () => {
-      // Fit the window to the palette's own content in BOTH dimensions. The shell is
-      // width/height:max-content (see CSS), so its measured box is the natural content size:
-      // the window shrinks when the manifest size is too big (blank gaps) and grows when
-      // content is larger (crowded rows). colorPickerOpen reserves room for the open swatch.
-      const rect = shell?.getBoundingClientRect();
-      const contentWidth = rect ? Math.ceil(rect.width) : 0;
-      const contentHeight = rect ? Math.ceil(rect.height) : 0;
-      const width = contentWidth > 0 ? contentWidth : preferredSize.width;
-      const height = Math.max(colorPickerOpen ? 292 : 0, contentHeight > 0 ? contentHeight : preferredSize.height);
-      // Dev-only size probe: open the palette window's devtools console to read exact
-      // content-vs-window numbers for any palette that still looks wrong.
-      if (import.meta.env.DEV) {
-        const key = `${contentWidth}x${contentHeight}->${width}x${height}`;
-        if (lastLoggedSizeRef.current !== key) {
-          lastLoggedSizeRef.current = key;
-          console.log(`[palette-size] ${toolset.id}: content ${contentWidth}x${contentHeight} -> window ${width}x${height}`);
+    let disposed = false;
+    let sizing = false;
+    let pending = false;
+    let lastSize = "";
+    const applySize = async () => {
+      if (disposed) return;
+      if (sizing) {
+        pending = true;
+        return;
+      }
+      sizing = true;
+      try {
+        const area = await currentWindowLogicalWorkArea();
+        if (disposed) return;
+        // Cap the shared body, not individual inspector sections. Keep the title outside the scroll
+        // area and measure only after applying the monitor-based cap (never a vh feedback loop).
+        const availableHeight = Math.floor(area.bottom - area.top);
+        if (bodyRef.current) bodyRef.current.style.maxHeight = `${Math.max(0, availableHeight - 22)}px`;
+        // Fit the window to the palette's own content in BOTH dimensions. The shell is
+        // width/height:max-content (see CSS), so its measured box is the natural content size:
+        // the window shrinks when the manifest size is too big (blank gaps) and grows when
+        // content is larger (crowded rows). colorPickerOpen reserves room for the open swatch.
+        const rect = shell?.getBoundingClientRect();
+        const contentWidth = rect ? Math.ceil(rect.width) : 0;
+        const contentHeight = rect ? Math.ceil(rect.height) : 0;
+        const width = contentWidth > 0 ? contentWidth : preferredSize.width;
+        const height = Math.min(availableHeight,
+          Math.max(colorPickerOpen ? 292 : 0, contentHeight > 0 ? contentHeight : preferredSize.height));
+        // Dev-only size probe: open the palette window's devtools console to read exact
+        // content-vs-window numbers for any palette that still looks wrong.
+        if (import.meta.env.DEV) {
+          const key = `${contentWidth}x${contentHeight}->${width}x${height}`;
+          if (lastLoggedSizeRef.current !== key) {
+            lastLoggedSizeRef.current = key;
+            console.log(`[palette-size] ${toolset.id}: content ${contentWidth}x${contentHeight} -> window ${width}x${height}`);
+          }
+        }
+        const sizeKey = `${width}x${height}`;
+        if (sizeKey !== lastSize) {
+          lastSize = sizeKey;
+          await fitCurrentPaletteWindow({ width, height }, area);
+        }
+      } finally {
+        sizing = false;
+        if (pending && !disposed) {
+          pending = false;
+          void applySize().catch(() => undefined);
         }
       }
-      void setCurrentWindowLogicalSize({ width, height }).catch(() => undefined);
     };
 
-    applySize();
-
-    if (!shell || typeof ResizeObserver === "undefined") {
-      return;
-    }
-
-    const observer = new ResizeObserver(() => {
+    const scheduleSize = () => {
       if (sizeAnimationFrameRef.current !== undefined) {
         return;
       }
 
       sizeAnimationFrameRef.current = window.requestAnimationFrame(() => {
         sizeAnimationFrameRef.current = undefined;
-        applySize();
+        void applySize().catch(() => undefined);
       });
+    };
+    void applySize().catch(() => undefined);
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(scheduleSize);
+    if (shell) observer?.observe(shell);
+    let unlisten: (() => void) | undefined;
+    void listenForCurrentWindowWorkAreaChanges(scheduleSize).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
     });
-    observer.observe(shell);
 
     return () => {
-      observer.disconnect();
+      disposed = true;
+      observer?.disconnect();
+      unlisten?.();
       if (sizeAnimationFrameRef.current !== undefined) {
         window.cancelAnimationFrame(sizeAnimationFrameRef.current);
         sizeAnimationFrameRef.current = undefined;
@@ -503,6 +546,8 @@ export function PaletteWindow({
       setCurrentArtStyle(payload.currentArtStyle);
       setCurrentArtStyleTarget(payload.currentArtStyle?.activePaintTarget ?? payload.currentArtStyleTarget ?? "fill");
       setCurrentMoleculeInspector(payload.currentMoleculeInspector);
+      setCurrentTable(payload.currentTable);
+      setColorContextKey(payload.colorContextKey);
       // Version skew degrades to the pre-variant behavior: an unknown kind reads as no selection
       // model at all rather than freezing the palette on a rejected payload.
       setCurrentSelection(
@@ -668,20 +713,62 @@ export function PaletteWindow({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      const commandId = shortcutRegistry.resolve(event);
-      if (!commandId) {
+      const menuCommand = paletteMenuShortcut(event, shortcutRegistry);
+      if (menuCommand) {
+        const drafts = shellRef.current?.querySelectorAll<HTMLElement>('[data-palette-number-draft="true"]');
+        // Settle into the original document before Save/Export or a tab change. Commits
+        // and commands share ordered IPC; suppress AppKit's menu when settling a draft.
+        if (platform === "macos" && NATIVE_MENU_COMMAND_IDS.has(menuCommand) && !drafts?.length) return;
+        event.preventDefault();
+        settlingBeforeForwardRef.current = true;
+        try {
+          drafts?.forEach((control) => control.dispatchEvent(new Event(PALETTE_INPUT_FOCUS_COMMIT_EVENT)));
+        } finally {
+          settlingBeforeForwardRef.current = false;
+        }
+        const leased = isPaletteInputFocusPending(shellRef.current) || !!paletteInputFocusControl(shellRef.current);
+        void (leased ? sendPaletteCommand(menuCommand, { preserveInputFocus: true })
+          : sendPaletteCommand(menuCommand)).catch(() => undefined);
         return;
       }
+      // WebKit/WebView2 can temporarily target body during a control click. The leased
+      // destination still owns editing keys; a disabled control uses the shell as its sink.
+      const target = event.target instanceof Element && event.target !== document.body
+        && event.target !== shellRef.current ? event.target : paletteInputFocusControl(shellRef.current) ?? null;
+      // Clean inspector numbers and non-text controls delegate history to the document.
+      // Select type-ahead and every uncommitted typed draft retain native behavior.
+      const controlHistory = (isCleanPaletteNumberInput(target) || !!target?.closest("select")) &&
+        !event.isComposing && (event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase());
+      if (event.defaultPrevented || isPaletteInputFocusPending(shellRef.current) ||
+        target?.matches(":disabled") || (target?.closest("select") && !controlHistory) ||
+        (isTextEditingElement(target) && !controlHistory)) return;
+      // Activation, value and editing keys belong to every form control. In
+      // particular, Delete/Backspace here must never delete document objects.
+      if (target?.closest("input, textarea, select, button") &&
+        [" ", "Enter", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) return;
+      // The shared registry conservatively ignores all form controls. Palette non-text
+      // controls keep document shortcuts, so resolve from their surrounding surface.
+      const commandId = shortcutRegistry.resolve({
+        key: event.key,
+        altKey: event.altKey,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        shiftKey: event.shiftKey,
+        repeat: event.repeat,
+        target: target?.closest("input, select")?.parentElement ?? event.target
+      });
+      if (controlHistory && commandId !== "edit.undo" && commandId !== "edit.redo") return;
+      if (!commandId) return;
 
       event.preventDefault();
-      void sendPaletteCommand(commandId).catch(() => undefined);
+      void sendPaletteCommand(editHistoryDirection(commandId) ? forceDocumentHistoryCommandId(commandId) : commandId).catch(() => undefined);
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [shortcutRegistry]);
+  }, [shortcutRegistry, platform]);
 
   const invokeCommand = (commandId: string) => {
     void sendPaletteCommand(commandId).catch(() => undefined);
@@ -690,7 +777,9 @@ export function PaletteWindow({
     void sendPaletteCommandPreview(commandId).catch(() => undefined);
   };
   const commitPreviewCommand = (commandId: string) => {
-    void sendPaletteCommandCommit(commandId).catch(() => undefined);
+    void (settlingBeforeForwardRef.current
+      ? sendPaletteCommandCommit(commandId, { settleBeforeForward: true })
+      : sendPaletteCommandCommit(commandId)).catch(() => undefined);
   };
   const cancelPreviewCommand = () => {
     void sendPaletteCommandCancel("palette.preview.cancel").catch(() => undefined);
@@ -727,6 +816,7 @@ export function PaletteWindow({
   );
 
   const openPopover = (anchor: ToolbarPopoverAnchor, kind: string, content: ToolsetPopoverContent) => {
+    content = { ...content, openedAt: toolsetPopoverTimestamp() };
     void (async () => {
       // No silent origin fallback: a failed position read once sent the first popover
       // open to the anchor offset from (0,0) — inches from its button — while every
@@ -827,7 +917,7 @@ export function PaletteWindow({
       if (target instanceof Element && target.closest(".toolbar-color-trigger, .command-flyout-button, .distribute-mode-button")) {
         return;
       }
-      void dismissToolsetPopovers().catch(() => undefined);
+      void dismissToolsetPopovers(toolsetPopoverTimestamp()).catch(() => undefined);
     };
     window.addEventListener("pointerdown", handlePointerDown, true);
     return () => window.removeEventListener("pointerdown", handlePointerDown, true);
@@ -844,7 +934,12 @@ export function PaletteWindow({
       return;
     }
 
-    if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]")) {
+    // The scroll container itself receives presses on its scrollbar. Leave those to the webview;
+    // descendants such as the existing content drag grip can still start a palette drag.
+    if (event.target === bodyRef.current) return;
+
+    if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
+      (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
       return;
     }
 
@@ -858,7 +953,10 @@ export function PaletteWindow({
       return;
     }
 
-    if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]")) {
+    if (event.target === bodyRef.current) return;
+
+    if ((event.target as HTMLElement).closest("button, select, input, textarea, [data-palette-control]") ||
+      (shellRef.current && disabledControlAtPointer(shellRef.current, event.nativeEvent))) {
       return;
     }
 
@@ -952,6 +1050,7 @@ export function PaletteWindow({
         onInvoke={invokeCommand}
         customize={customizeThisPalette ? { groupIds: renderGroups.map((group) => group.id) } : undefined}
         widgetState={{
+          colorContextKey,
           currentObjectColor: currentTextStyle.color,
           currentArtStyle,
           currentArtStyleTarget,
@@ -978,13 +1077,24 @@ export function PaletteWindow({
     );
   };
 
+  // The Table section lives in the Drawn Structure Settings inspector window and exists only while a
+  // table is selected. Availability comes from the same command specs the toolbars use.
+  const tableInspector = toolsetId === drawnStructureSettingsToolsetId
+    ? createTableInspectorModel(currentTable, (commandId) => commandOverrides.get(commandId))
+    : undefined;
+  // Older broadcasts can omit the selection classification. A table snapshot with no molecule
+  // targets still suffices to avoid a stack of disabled molecule settings above the Table section.
+  const tableOnly = tableInspector && (currentSelection
+    ? currentSelection.objectTypes.length === 1 && currentSelection.objectTypes[0] === "table"
+    : !currentMoleculeInspector?.targets.moleculeObjectIds.length);
+
   return (
     <main
       ref={shellRef}
       className="palette-window-shell"
       aria-label={`ChemDraft floating ${toolset.title}`}
       data-toolset-id={toolset.id}
-      data-palette-drag-surface="true"
+      data-palette-drag-surface={customizeThisPalette ? undefined : "true"}
       onPointerDown={startDragFromPaletteSurface}
       onPointerUp={stopPaletteWindowDrag}
       onPointerCancel={stopPaletteWindowDrag}
@@ -1014,30 +1124,107 @@ export function PaletteWindow({
         </button>
         <span className="palette-title-label">{toolset.title.replace(/ Toolbar$/, "")}</span>
       </div>
-      {customizeThisPalette ? (
-        <ToolbarCustomizeController
-          toolsetId={toolset.id}
-          groups={paletteGroups}
-          onEdit={(edit) => sendToolsetLayoutEdit({ toolsetId: toolset.id, edit })}
-        >
-          {(effectiveGroups) => (
-            <>
-              {renderPalette(effectiveGroups)}
-              <CustomizeBar
-                onDone={() => void sendToolsetLayoutEdit({ toolsetId: toolset.id, edit: { kind: "exitCustomize" } }).catch(() => undefined)}
-                onRestoreDefaults={() => void sendToolsetLayoutEdit({ toolsetId: toolset.id, edit: { kind: "resetToolset" } }).catch(() => undefined)}
-              />
-              <GalleryTray
-                commands={galleryCommands}
-                widgets={galleryWidgets}
-                presentItemIds={new Set(effectiveGroups.flatMap((group) => group.items.map((item) => item.id)))}
-              />
-            </>
-          )}
-        </ToolbarCustomizeController>
-      ) : (
-        renderPalette(paletteGroups)
-      )}
+      <div className="palette-window-content" ref={bodyRef}>
+        {customizeThisPalette ? (
+          <ToolbarCustomizeController
+            toolsetId={toolset.id}
+            groups={paletteGroups}
+            onEdit={(edit) => sendToolsetLayoutEdit({ toolsetId: toolset.id, edit })}
+          >
+            {(effectiveGroups) => (
+              <>
+                {renderPalette(effectiveGroups)}
+                <CustomizeBar
+                  onDone={() => void sendToolsetLayoutEdit({ toolsetId: toolset.id, edit: { kind: "exitCustomize" } }).catch(() => undefined)}
+                  onRestoreDefaults={() => void sendToolsetLayoutEdit({ toolsetId: toolset.id, edit: { kind: "resetToolset" } }).catch(() => undefined)}
+                />
+                <GalleryTray
+                  commands={galleryCommands}
+                  widgets={galleryWidgets}
+                  presentItemIds={new Set(effectiveGroups.flatMap((group) => group.items.map((item) => item.id)))}
+                />
+              </>
+            )}
+          </ToolbarCustomizeController>
+        ) : (
+          tableOnly ? null : renderPalette(paletteGroups)
+        )}
+        {tableInspector ? <TableInspectorSections model={tableInspector} onInvoke={invokeCommand} /> : null}
+      </div>
     </main>
+  );
+}
+
+function TableInspectorSections({ model, onInvoke }: { model: TableInspectorModel; onInvoke: (commandId: string) => void }) {
+  const renderControl = (control: TableInspectorControl) => {
+    const blockPointer = (event: PointerEvent) => event.stopPropagation();
+    switch (control.kind) {
+      case "readout":
+        return (
+          <div className="molecule-inspector-field" key={control.id} data-table-control={control.id}>
+            <span>{control.label}</span>
+            <span>{control.value}</span>
+            {control.disabledReason ? <span className="molecule-inspector-empty-message">{control.disabledReason}</span> : null}
+          </div>
+        );
+      case "toggle":
+      case "button":
+        return (
+          <div className={control.kind === "toggle" ? "molecule-inspector-effect-row" : "molecule-inspector-template-actions"} key={control.id}>
+            <button
+              type="button"
+              className={[
+                "toolbar-text-button",
+                control.kind === "button" ? "molecule-inspector-template-button" : "",
+                control.kind === "toggle" && control.pressed ? "active" : ""
+              ].filter(Boolean).join(" ")}
+              aria-pressed={control.kind === "toggle" ? control.pressed : undefined}
+              disabled={control.disabledReason !== undefined}
+              title={control.disabledReason}
+              data-command-id={control.commandId}
+              data-table-control={control.id}
+              data-palette-control="true"
+              onPointerDown={blockPointer}
+              onClick={() => onInvoke(control.commandId)}
+            >
+              {control.label}
+            </button>
+          </div>
+        );
+      case "segmented":
+        return (
+          <div className="molecule-inspector-field" role="group" aria-label={control.label} key={control.id} data-table-control={control.id}>
+            <span>{control.label}</span>
+            <div className="molecule-inspector-effect-row">
+              {control.choices.map((choice) => (
+                <button
+                  type="button"
+                  key={choice.id}
+                  className={["toolbar-text-button", choice.selected ? "active" : ""].filter(Boolean).join(" ")}
+                  aria-pressed={choice.selected}
+                  disabled={choice.disabledReason !== undefined}
+                  title={choice.disabledReason}
+                  data-command-id={choice.commandId}
+                  data-palette-control="true"
+                  onPointerDown={blockPointer}
+                  onClick={() => onInvoke(choice.commandId)}
+                >
+                  {choice.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+    }
+  };
+  return (
+    <div className="molecule-inspector-controls table-inspector-controls" role="group" aria-label="Table" data-table-inspector={model.tableId}>
+      {model.sections.map((section) => (
+        <div className="molecule-inspector-section" key={section.id} data-table-inspector-section={section.id}>
+          <span className="molecule-inspector-target-label">{section.title}</span>
+          {section.controls.map(renderControl)}
+        </div>
+      ))}
+    </div>
   );
 }
