@@ -78,7 +78,11 @@ describe("renderer label collision regressions", () => {
     const glyphs = plans.map(plan => {
       const runs = plan.layout.runs.map(run => `<text x="${run.x}" y="${run.y}" dy="0.35em" text-anchor="${run.textAnchor}" font-size="${atomLabelRunFontSize(run.script, plan.drawingStyle) ?? plan.fontSizePx}">${run.text}</text>`).join("");
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800"><g transform="translate(${plan.anchor.x} ${plan.anchor.y})" font-family="${plan.fontFamily}" font-weight="${plan.fontWeight}" font-style="${plan.fontStyle}">${runs}</g></svg>`;
-      const glyph = new Resvg(svg).getBBox()!;
+      // Arial/Helvetica are absent on Linux. Pick their metric-compatible fallback explicitly:
+      // resvg otherwise takes a system-font choice that can change with the runner image.
+      const glyph = new Resvg(svg, process.platform === "linux" ? {
+        font: { sansSerifFamily: "Liberation Sans", defaultFontFamily: "Liberation Sans" }
+      } : undefined).getBBox()!;
       const box = boxes.find(box => molecule.atoms[box.atom].id === plan.atom.id)!;
       expect(glyph.x).toBeGreaterThanOrEqual(box.x - 0.5);
       expect(glyph.y).toBeGreaterThanOrEqual(box.y - 0.5);

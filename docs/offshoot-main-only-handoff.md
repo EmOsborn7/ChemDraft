@@ -11,6 +11,11 @@
 - Local validation is sequential: root TypeScript passed with a bounded 4 GiB Node heap.
   The first attempt hit Node's default 2 GiB heap limit. All 406 tests in 11 focused files passed with
   `--maxWorkers=1 --no-file-parallelism`; project timeout settings are unchanged.
+- Production web build, Rust formatting and `git diff --check` passed locally.
+- First CI run `41693759962`: Windows passed all checks; Linux passed 14,737 tests but
+  failed two existing label glyph-tightness assertions; macOS was cancelled. The Linux runner
+  image changed from main's successful run earlier that day. The glyph test now explicitly
+  selects Liberation Sans on Linux, and CI installs that font; assertions are unchanged.
 - Fresh Linux/macOS/Windows CI is required before merging PR #201. Native hands-on checks
   and a packaged launch remain unverified on both platforms.
 
