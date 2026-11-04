@@ -172,7 +172,7 @@ describe("arrow offshoots and conditions", () => {
     const saved = serializeDocument(next), reopened = normalizeCommittedDocument(deserializeDocument(saved));
     expect(reopened.pages[0].objects).toEqual(next.pages[0].objects);
     const svg = exportDocumentToSvg(reopened).contents;
-    expect(svg).toContain('font-size="11.52"'); expect(svg).toContain("80 °C");
+    expect(svg).toContain('font-size="11.52px"'); expect(svg).toContain("80 °C");
     next = setReactionArrowConditions(next, arrow.id, { side: "above", spans: [] });
     expect(next.pages[0].objects).toHaveLength(1);
     expect(next.selection.objectIds).toEqual([arrow.id]);

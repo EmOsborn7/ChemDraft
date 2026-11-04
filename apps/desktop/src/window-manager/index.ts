@@ -1,6 +1,7 @@
 import { EXPORT_PREVIEW_STORAGE_KEY, loadExportPreviewEnabled } from "../exportPreviewSettings";
 import type { AnalysisReport } from "@chemdraft/analysis-core";
 import type { NativeTextStyle, TextSpan } from "@chemdraft/chem-core";
+import type { tableInspectorSnapshot } from "../tableCommands";
 import type { ToolsetDefinition } from "@chemdraft/toolset-registry";
 import type { ArtInspectorModel, ArtInspectorPaintTarget } from "../artInspectorModel";
 import type { CommandSpec } from "../commands";
@@ -74,6 +75,8 @@ export type PaletteCommandPayload = ToolsetCommandPayload;
 export type ToolsetActiveToolPayload = ToolsetCommandPayload;
 
 export interface ToolsetTextStylePayload {
+  currentTable?: ReturnType<typeof tableInspectorSnapshot>;
+  colorContextKey?: string;
   currentTextStyle: NativeTextStyle;
   currentTextScript: TextSpan["script"];
   currentArtStyle?: ToolsetArtStylePayload;
@@ -160,11 +163,15 @@ export function createToolsetTextStylePayload(
   currentSelection?: ToolbarSelectionModel,
   currentMolecularInspector?: AnalysisReport,
   molecularInspectorBusy = false,
-  molecularInspectorStale = false
+  molecularInspectorStale = false,
+  currentTable?: ReturnType<typeof tableInspectorSnapshot>,
+  colorContextKey?: string
 ): ToolsetTextStylePayload {
   return {
+    currentTable,
     currentTextStyle,
     currentTextScript,
+    ...(colorContextKey !== undefined ? { colorContextKey } : {}),
     ...(currentArtStyle ? { currentArtStyle, currentArtStyleTarget } : {}),
     ...(currentMoleculeInspector ? { currentMoleculeInspector } : {}),
     ...(currentSelection ? { currentSelection } : {}),
@@ -210,6 +217,38 @@ export async function closeToolsetWindow(toolsetId: string): Promise<ToolsetWind
   return invokeToolsetWindow("close_toolset_window", toolsetId);
 }
 
+export type ToolsetPopoverFocusMode = "preserve" | "focus";
+
+const TOOLSET_POPOVER_RELEASE_EVENT = "chemdraft://toolset-popover-release";
+let stopPopoverRelease: (() => void) | undefined;
+function observePopoverOpeningRelease(toolsetId: string): void {
+  stopPopoverRelease?.();
+  const stop = () => {
+    window.removeEventListener("pointerup", release, true);
+    window.removeEventListener("pointercancel", stop, true);
+    window.clearTimeout(timeout);
+    if (stopPopoverRelease === stop) stopPopoverRelease = undefined;
+  };
+  const release = () => {
+    stop();
+    const releasedAt = toolsetPopoverTimestamp();
+    void import("@tauri-apps/api/event").then(({ emit }) =>
+      emit(TOOLSET_POPOVER_RELEASE_EVENT, { toolsetId, releasedAt })).catch(() => undefined);
+  };
+  const timeout = window.setTimeout(stop, 30_000);
+  stopPopoverRelease = stop;
+  window.addEventListener("pointerup", release, true);
+  window.addEventListener("pointercancel", stop, true);
+}
+
+export async function listenForToolsetPopoverRelease(
+  handler: (payload: { toolsetId: string; releasedAt: number }) => void
+): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<{ toolsetId: string; releasedAt: number }>(TOOLSET_POPOVER_RELEASE_EVENT,
+    event => handler(event.payload));
+}
+
 /**
  * Opens (or repositions) a palette's popover in its own little floating window so it can
  * overflow the palette and float over the document — the native way (a webview can't paint
@@ -220,14 +259,16 @@ export async function openToolsetPopoverWindow(
   toolsetId: string,
   kind: string,
   x: number,
-  y: number
+  y: number,
+  focusMode: ToolsetPopoverFocusMode = "focus"
 ): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
+  if (kind === "flyout") observePopoverOpeningRelease(toolsetId);
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("open_toolset_popover", { toolsetId, kind, x, y });
+  await invoke("open_toolset_popover", { toolsetId, kind, x, y, focusMode });
 }
 
 /**
@@ -267,44 +308,43 @@ export async function closeToolsetPopoverWindow(toolsetId: string): Promise<void
   await invoke("close_toolset_popover", { toolsetId }).catch(() => undefined);
 }
 
-/** Toggle a palette window's focusability. Palettes ship non-focusable (they never steal key status);
- *  the in-place customize gallery flips this on so its search field can take keystrokes, and off again
- *  on exit. No-op in the browser build. */
-export async function setToolsetWindowFocusable(toolsetId: string, focusable: boolean): Promise<void> {
-  if (!isDesktopRuntime()) {
-    return;
-  }
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("set_toolset_window_focusable", { toolsetId, focusable }).catch(() => undefined);
-}
-
 /** Route param identifying a palette popover webview (see App.tsx / PalettePopoverWindow). */
 export const TOOLSET_POPOVER_WINDOW_KIND = "toolsetPopover";
 
 /** Broadcast that any open palette popover (e.g. the colour picker) should dismiss itself. */
 export const TOOLSET_POPOVER_DISMISS_EVENT = "chemdraft://dismiss-toolset-popovers";
 
+/** Epoch-based monotonic time, comparable between the document and utility webviews. */
+export function toolsetPopoverTimestamp(): number {
+  return performance.timeOrigin + performance.now();
+}
+
+export interface ToolsetPopoverDismissPayload {
+  /** Captured synchronously at the originating press, before any asynchronous IPC. */
+  requestedAt: number;
+}
+
 /**
  * Ask any open palette popover window to close. The document window and the palettes fire this on
  * a pointer-down anywhere that isn't the popover itself (a popover lives in its own window, so its
  * own clicks never reach these emitters) — giving the popover "stays while you click inside it,
  * closes when you click anything else" behaviour without depending on macOS key-window semantics.
+ * Pass the press timestamp before starting IPC; omit it for an unconditional dismissal.
  */
-export async function dismissToolsetPopovers(): Promise<void> {
+export async function dismissToolsetPopovers(requestedAt?: number): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
   const { emit } = await import("@tauri-apps/api/event");
-  await emit(TOOLSET_POPOVER_DISMISS_EVENT).catch(() => undefined);
+  await emit(TOOLSET_POPOVER_DISMISS_EVENT, requestedAt === undefined ? undefined : { requestedAt }).catch(() => undefined);
 }
 
-export async function listenForToolsetPopoverDismiss(handler: () => void): Promise<Unlisten> {
+export async function listenForToolsetPopoverDismiss(handler: (payload?: ToolsetPopoverDismissPayload) => void): Promise<Unlisten> {
   if (!isDesktopRuntime()) {
     return () => undefined;
   }
-  return listenTauriEvent(TOOLSET_POPOVER_DISMISS_EVENT, () => handler());
+  return listenTauriEvent<ToolsetPopoverDismissPayload | undefined>(TOOLSET_POPOVER_DISMISS_EVENT, event => handler(event.payload));
 }
 
 /** One command in a flyout dropdown, snapshotted at open time so the popover window can render it. */
@@ -332,7 +372,8 @@ export interface ToolsetFlyoutSnapshot {
    * inline toolbar-distribute-menu always used; without this the grid in the icon+label layout
    * places a lone icon-less label into the narrow icon column and it gets ellipsized.
    */
-  variant?: "menu" | "distribute";
+  variant?: "menu" | "distribute" | "bondStereo";
+  keyboardOpen?: boolean;
 }
 
 /**
@@ -340,9 +381,14 @@ export interface ToolsetFlyoutSnapshot {
  * so opening the colour picker vs a flyout dropdown just swaps the content in the same window —
  * no per-kind windows to keep in sync, and no way for a stale kind to coexist.
  */
-export type ToolsetPopoverContent =
+export type ToolsetPopoverContent = {
+  /** Captured by the opener before any async work, using toolsetPopoverTimestamp().
+   *  Retained on startup replays so a delayed snapshot cannot undo click-away. */
+  openedAt?: number;
+} & (
   | { kind: "artColor" }
-  | { kind: "flyout"; flyout: ToolsetFlyoutSnapshot };
+  | { kind: "flyout"; flyout: ToolsetFlyoutSnapshot }
+);
 
 /** Where the popover's top-left belongs, in global logical coordinates. Rides the content
  *  push so the popover can re-assert it AFTER sizing itself: macOS anchors window resizes
@@ -404,6 +450,23 @@ export async function listenForToolsetPopoverContentRequests(
   return listenTauriEvent<{ toolsetId: string }>(TOOLSET_POPOVER_CONTENT_REQUEST_EVENT, (event) =>
     handler(event.payload.toolsetId)
   );
+}
+
+export interface BondStereoPopoverAction {
+  sessionId: string;
+  action: "geometry" | "flipped" | "keep" | "close";
+}
+const BOND_STEREO_POPOVER_ACTION_EVENT = "chemdraft://bond-stereo-popover-action";
+
+export async function sendBondStereoPopoverAction(payload: BondStereoPopoverAction): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit(BOND_STEREO_POPOVER_ACTION_EVENT, payload);
+}
+
+export async function listenForBondStereoPopoverActions(handler: (payload: BondStereoPopoverAction) => void): Promise<Unlisten> {
+  if (!isDesktopRuntime()) return () => undefined;
+  return listenTauriEvent<BondStereoPopoverAction>(BOND_STEREO_POPOVER_ACTION_EVENT, event => handler(event.payload));
 }
 
 export async function toggleSpin3dDebuggerWindow(): Promise<void> {
@@ -702,15 +765,16 @@ export async function setMenuChecked(commandId: string, checked: boolean): Promi
   await invoke("set_menu_checked", { commandId, checked }).catch(() => undefined);
 }
 
-export async function sendPaletteCommand(commandId: string): Promise<void> {
-  return routeToolsetCommand(commandId);
+export async function sendPaletteCommand(commandId: string, options?: { preserveInputFocus: boolean }): Promise<void> {
+  return routeToolsetCommand(commandId, options);
 }
 
 export async function sendPaletteCommandPreview(commandId: string): Promise<void> {
   return emitToolsetCommandEvent(PALETTE_COMMAND_PREVIEW_EVENT, commandId);
 }
 
-export async function sendPaletteCommandCommit(commandId: string): Promise<void> {
+export async function sendPaletteCommandCommit(commandId: string, options?: { settleBeforeForward: true }): Promise<void> {
+  if (options?.settleBeforeForward && isDesktopRuntime()) return routeToolsetCommand(commandId, { commit: true });
   return emitToolsetCommandEvent(PALETTE_COMMAND_COMMIT_EVENT, commandId);
 }
 
@@ -718,17 +782,54 @@ export async function sendPaletteCommandCancel(commandId: string): Promise<void>
   return emitToolsetCommandEvent(PALETTE_COMMAND_CANCEL_EVENT, commandId);
 }
 
-export async function routeToolsetCommand(commandId: string): Promise<void> {
+// Only shortcut-settle commits share this queue with app commands. Ordinary commits stay
+// on the event bus with their previews and cancels.
+let paletteCommandQueue: Promise<void> = Promise.resolve();
+const pendingPaletteEvents = new Set<Promise<void>>();
+// Only bounds a stuck event-plugin emit. Normal ordering is preserved because emit
+// resolves after Tauri enqueues the destination eval, before the subsequent invoke.
+export const PALETTE_EVENT_SETTLE_TIMEOUT_MS = 500;
+export function routeToolsetCommand(
+  commandId: string, options?: { preserveInputFocus?: boolean; commit?: boolean }
+): Promise<void> {
   // Single delivery: the invoke routes through Rust `route_toolset_command`, which dispatches the
   // native-command DOM event into the main window (the one listener in `listenForToolsetCommands`).
   // No client-side `emit` — that used to also fan out over the tauri event bus, so every command
   // arrived several times and needed `dedupeAdjacentCommands` to collapse it.
   const payload = createToolsetCommandPayload(commandId);
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("route_toolset_command", payload as unknown as Record<string, unknown>);
+  // The number control also has a previewing slider. Flush all earlier event sends,
+  // including its release commit, before entering synchronous IPC. Tauri emit resolves
+  // after enqueueing the destination eval; the subsequent route cannot pass that eval.
+  const earlierEvents = options?.commit ? [...pendingPaletteEvents] : [];
+  const next = paletteCommandQueue.then(async () => {
+    if (options?.commit && earlierEvents.length > 0) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(earlierEvents),
+          new Promise<void>((resolve) => { timeout = setTimeout(resolve, PALETTE_EVENT_SETTLE_TIMEOUT_MS); })
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("route_toolset_command", { ...payload, ...options });
+  });
+  paletteCommandQueue = next;
+  // A failed commit also rejects its already-queued command. Fresh gestures may retry.
+  void next.catch(() => { if (paletteCommandQueue === next) paletteCommandQueue = Promise.resolve(); });
+  return next;
 }
 
-async function emitToolsetCommandEvent(eventName: string, commandId: string): Promise<void> {
+function emitToolsetCommandEvent(eventName: string, commandId: string): Promise<void> {
+  const pending = deliverToolsetCommandEvent(eventName, commandId);
+  pendingPaletteEvents.add(pending);
+  void pending.then(() => pendingPaletteEvents.delete(pending), () => pendingPaletteEvents.delete(pending));
+  return pending;
+}
+
+async function deliverToolsetCommandEvent(eventName: string, commandId: string): Promise<void> {
   const payload = createToolsetCommandPayload(commandId);
   dispatchDomToolsetEvent(eventName, payload);
   if (!isDesktopRuntime()) {
@@ -803,7 +904,7 @@ export async function startPaletteWindowDrag(grabX: number, grabY: number): Prom
   await invoke("start_window_drag", { grabX, grabY });
 }
 
-export async function currentWindowLogicalPosition(): Promise<ToolsetWindowPosition | undefined> {
+export async function currentWindowLogicalPosition(origin: "outer" | "inner" = "outer"): Promise<ToolsetWindowPosition | undefined> {
   if (!isDesktopRuntime()) {
     return undefined;
   }
@@ -813,7 +914,11 @@ export async function currentWindowLogicalPosition(): Promise<ToolsetWindowPosit
   // the first popover open to a fabricated origin while every later call was fine. Rust
   // asks the window server directly and has no warm-up.
   const { invoke } = await import("@tauri-apps/api/core");
-  const position = await invoke<{ x: number; y: number }>("window_logical_position");
+  // Canvas client rectangles start inside the document's native title bar and borders.
+  // Undecorated palettes retain their existing outer-origin contract.
+  const position = origin === "inner"
+    ? await invoke<{ x: number; y: number }>("window_logical_position", { contentOrigin: true })
+    : await invoke<{ x: number; y: number }>("window_logical_position");
   if (typeof position?.x !== "number" || typeof position?.y !== "number") {
     return undefined;
   }
@@ -843,21 +948,73 @@ export async function setCurrentWindowLogicalSize(size: ToolsetWindowSize): Prom
   await getCurrentWindow().setSize(new LogicalSize(size.width, size.height));
 }
 
+/** Use the destination monitor's work area and scale, including taskbar/Dock exclusions.
+ * Never use this webview's height: content-fit windows would shrink their own cap on every resize. */
+export async function currentWindowLogicalWorkArea(): Promise<MonitorLogicalBounds> {
+  if (isDesktopRuntime()) {
+    const { currentMonitor } = await import("@tauri-apps/api/window");
+    const monitor = await currentMonitor().catch(() => null);
+    if (monitor) {
+      const scale = monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
+      const area = monitor.workArea;
+      const left = area.position.x / scale;
+      const top = area.position.y / scale;
+      return { left, top, right: left + area.size.width / scale, bottom: top + area.size.height / scale };
+    }
+  }
+  const screen = window.screen as Screen & { availLeft?: number; availTop?: number };
+  const left = screen.availLeft ?? 0;
+  const top = screen.availTop ?? 0;
+  return { left, top, right: left + (screen.availWidth || 1024), bottom: top + (screen.availHeight || 768) };
+}
+
+/** Re-evaluate the cap after moving to another display or changing display scale/resolution. */
+export async function listenForCurrentWindowWorkAreaChanges(handler: () => void): Promise<Unlisten> {
+  window.addEventListener("resize", handler);
+  const listeners = await Promise.allSettled([
+    listenCurrentWindowEvent("tauri://move", handler),
+    listenCurrentWindowEvent("tauri://scale-change", handler)
+  ]);
+  return () => {
+    window.removeEventListener("resize", handler);
+    for (const listener of listeners) {
+      if (listener.status === "fulfilled") listener.value();
+    }
+  };
+}
+
+/** Preserve the top-left across macOS content resizes, then keep the whole palette on its monitor. */
+export async function fitCurrentPaletteWindow(size: ToolsetWindowSize, area: MonitorLogicalBounds): Promise<void> {
+  const position = await currentWindowLogicalPosition();
+  const height = Math.min(size.height, area.bottom - area.top);
+  await setCurrentWindowLogicalSize({ width: size.width, height });
+  if (!position) return;
+  const target = {
+    x: Math.max(area.left, Math.min(position.x, area.right - size.width)),
+    y: Math.max(area.top, Math.min(position.y, area.bottom - height))
+  };
+  const resizedPosition = await currentWindowLogicalPosition();
+  if (resizedPosition?.x !== target.x || resizedPosition?.y !== target.y) {
+    await setCurrentWindowLogicalPosition(target);
+  }
+}
+
 /**
  * Reveal the calling palette popover above the palette it belongs to. Rust shows it and then raises
  * it among the document's owned windows: the JS window `show()` alone left it underneath its palette
  * on Windows whenever the two overlapped. Falls back to that plain `show()` if the command is
- * unavailable, so a popover can never be left invisible.
+ * unavailable for focusable popovers. A preserve-focus open must never fall back to an activating show.
  */
-export async function showCurrentToolsetPopoverWindow(): Promise<void> {
+export async function showCurrentToolsetPopoverWindow(focusMode: ToolsetPopoverFocusMode = "focus", kind?: ToolsetPopoverContent["kind"]): Promise<void> {
   if (!isDesktopRuntime()) {
     return;
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
   try {
-    await invoke("show_toolset_popover_window");
-  } catch {
+    await invoke("show_toolset_popover_window", { focusMode, ...(kind ? { kind } : {}) });
+  } catch (error) {
+    if (focusMode === "preserve") throw error;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().show();
   }

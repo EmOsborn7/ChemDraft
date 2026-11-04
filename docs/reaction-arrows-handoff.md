@@ -232,3 +232,20 @@ Do not run `./run-app --dev` or `pnpm dev` unless the user explicitly requests l
 The previous dev launch noted above is historical, not the preferred preview workflow now.
 The owner ran a packaged preview and confirmed the latest visual changes. The agent did not launch
 it or inspect its build stamp. Do not represent that confirmation as Windows verification.
+
+
+## 2026-11-03: merge 1.1.0 main
+
+Merged upstream main `8c27d481` into PR #202. Retained conditions, independent
+preferences, arrangement routing and attachments alongside upstream tables, templates,
+text-editing fixes and release version 1.1.0. Resolved shared dialog capabilities and
+protocols. Script SVG rendering retains upstream flat spans, explicit pixel sizes and
+parent-size script offsets; condition labels reserve measured multiline extents.
+
+Root TypeScript passed with a 4 GB Node heap after the default heap was exhausted.
+Whitespace checks passed. All 348 tests in nine focused workflow, dialog, layout and SVG suites passed, as did
+the two conditions-editor DOM suites. All 22 targeted text/SVG/PDF regression checks
+passed after reconciliation. The broader export run hit large-image and raster timeouts;
+no complete export-suite pass is claimed. Full CI and native macOS/Windows hands-on
+checks remain required before landing on main. No packaged native build was attempted
+in this low-usage merge update.

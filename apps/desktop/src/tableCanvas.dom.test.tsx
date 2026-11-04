@@ -1,0 +1,261 @@
+// @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deserializeDocument, nativeTextStyleFromObjectStyle, type ChemDraftDocument } from "@chemdraft/chem-core";
+import { planPageSvgRender, planTableLayout, tableVisualBoundsForArrangement,
+  transformPointForObject, type PageSvgFragment } from "@chemdraft/layout-engine";
+import { MainWindow } from "./MainWindow";
+import { DOM_COMMAND_EVENT, listenForToolsetTextStyle } from "./window-manager";
+import { createPhase4Document } from "./documentWorkflow";
+import { InsertTableForm } from "./dialogs/InsertTableForm";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+describe("native tables on the canvas", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  beforeEach(() => {
+    window.history.replaceState(null, "", "/?agentBridge=1");
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 0));
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    for (const prototype of [HTMLElement.prototype, SVGElement.prototype]) {
+      for (const key of ["setPointerCapture", "releasePointerCapture", "hasPointerCapture"]) {
+        Object.defineProperty(prototype, key, { configurable: true, value: key === "hasPointerCapture" ? () => false : () => {} });
+      }
+    }
+    container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+  });
+  afterEach(() => {
+    act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks();
+    window.history.replaceState(null, "", "/"); delete window.__CHEMDRAFT_AGENT__;
+    for (const prototype of [HTMLElement.prototype, SVGElement.prototype]) for (const key of ["setPointerCapture", "releasePointerCapture", "hasPointerCapture"]) Reflect.deleteProperty(prototype, key);
+  });
+  const fixture = () => deserializeDocument(readFileSync("packages/fixtures/tables/sharpless-reagent-table.json", "utf8"));
+  async function render(nativeDocument: ChemDraftDocument) {
+    await act(async () => root.render(createElement(MainWindow, { initialDocument: nativeDocument,
+      initialActiveToolCommandId: "tool.select", initialPaletteMode: "hidden", nativePalette: true,
+      initialCrosshairsVisible: false, initialRulersVisible: false })));
+    const page = container.querySelector<HTMLElement>(".page")!;
+    page.getBoundingClientRect = () => ({ x: 0, y: 0, left: 0, top: 0, right: 816, bottom: 1056, width: 816, height: 1056, toJSON: () => ({}) });
+  }
+  async function command(commandId: string) {
+    await act(async () => window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId } })));
+  }
+  async function pointer(target: Element, type: string, x: number, y: number) {
+    const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, buttons: type === "pointerup" ? 0 : 1, detail: 1, clientX: x, clientY: y });
+    Object.defineProperties(event, { isPrimary: { value: true }, pointerId: { value: 17 }, pointerType: { value: "mouse" } });
+    await act(async () => target.dispatchEvent(event));
+  }
+
+  it("renders the shared page SVG fragment, selects the entire bounds, deletes and undoes", async () => {
+    const nativeDocument = fixture();
+    const table = nativeDocument.pages[0].objects[0];
+    if (table.type !== "table") throw new Error("Expected a table");
+    const fragment = planPageSvgRender(nativeDocument.pages[0]).fragments.find(f => f.attrs["data-object-id"] === table.id)!;
+    await render(nativeDocument);
+    const visual = container.querySelector(`[data-page-svg-object-visual='${table.id}']`)!;
+    expect(visual.textContent).toContain("Sharpless epoxidation");
+    const check = (part: PageSvgFragment) => {
+      if (part.kind === "text") return;
+      const id = part.attrs.id;
+      if (id) {
+        const element = visual.querySelector(`[id='${id}']`)!;
+        expect(element, String(id)).not.toBeNull();
+        for (const key of ["x", "y", "x1", "x2", "y1", "y2", "font-size", "stroke-width"]) {
+          if (part.attrs[key] !== undefined) expect(element.getAttribute(key)).toBe(String(part.attrs[key]));
+        }
+      }
+      part.children.forEach(check);
+    };
+    check(fragment);
+    const hit = visual.querySelector("[data-table-hit-target]")!;
+    expect(Number(hit.getAttribute("height"))).toBeCloseTo(planTableLayout(table).height);
+    // The full bounds catcher includes whitespace in the footnote area.
+    await pointer(hit, "pointerdown", table.x + 10, table.y + planTableLayout(table).height - 2);
+    await pointer(container.querySelector(".page")!, "pointerup", table.x + 10, table.y + planTableLayout(table).height - 2);
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().selection.objectIds).toEqual([table.id]);
+    expect(container.querySelector(`[data-object-controls='${table.id}'].selected`)).not.toBeNull();
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Delete", bubbles: true })));
+    expect(container.querySelector(`[data-page-svg-object-visual='${table.id}']`)).toBeNull();
+    await command("edit.undo");
+    expect(container.querySelector(`[data-page-svg-object-visual='${table.id}']`)).not.toBeNull();
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0]).toEqual(table);
+  });
+
+  it("registers insertion and table editing commands with one labelled undo each", async () => {
+    await render(createPhase4Document());
+    await command("table.insert.r6c7h1");
+    let snapshot = window.__CHEMDRAFT_AGENT__!.snapshot();
+    const table = snapshot.document.pages[0].objects[0];
+    expect(table.type).toBe("table");
+    if (table.type !== "table") throw new Error("Expected table");
+    expect(table.rows).toHaveLength(6); expect(table.columns).toHaveLength(7);
+    expect(snapshot.selection.objectIds).toEqual([table.id]);
+    await command("edit.undo");
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects).toHaveLength(0);
+    expect(container.textContent).toContain("Undid Insert table");
+    await command("edit.redo");
+    for (const [id, label] of [["table.row.insertBelow", "Insert row"], ["table.column.insertRight", "Insert column"], ["table.style.grid", "Style table"], ["table.caption.toggle", "Edit caption"], ["table.footnote.add", "Edit footnotes"]]) {
+      const before = window.__CHEMDRAFT_AGENT__!.snapshot().document;
+      await command(id);
+      snapshot = window.__CHEMDRAFT_AGENT__!.snapshot();
+      expect(snapshot.selection.objectIds).toEqual([table.id]);
+      expect(snapshot.document).not.toEqual(before);
+      await command("edit.undo");
+      expect(window.__CHEMDRAFT_AGENT__!.snapshot().document).toEqual(before);
+      expect(container.textContent).toContain(`Undid ${label}`);
+    }
+  });
+
+  it("opens and edits a body cell in a newly inserted default empty table", async () => {
+    await render(createPhase4Document());
+    await command("table.insert.r6c4h1");
+    const table = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0];
+    if (table.type !== "table") throw new Error("Expected table");
+    expect(table.rows).toHaveLength(6); expect(table.columns).toHaveLength(4);
+    const layout = planTableLayout(table);
+    const fontSize = nativeTextStyleFromObjectStyle(table.style).fontSizePx;
+    const minimum = Math.ceil((3 * fontSize + 2 * table.tableStyle.cellPaddingPx.x) * 2) / 2;
+    expect(layout.columns.every(column => column.width >= minimum)).toBe(true);
+    const box = layout.cells.find(cell => cell.rowIndex === 2 && cell.columnIndex === 0)!.box;
+    const next = layout.cells.find(cell => cell.rowIndex === 2 && cell.columnIndex === 1)!.box;
+    const scale = (window.__CHEMDRAFT_AGENT__!.snapshot().viewport as { scale: number }).scale;
+    const x = (box.x + 5) * scale, y = (box.y + box.height / 2) * scale;
+    const nextX = (next.x + next.width / 2) * scale, nextY = (next.y + next.height / 2) * scale;
+    const hit = container.querySelector("[data-table-hit-target]")!;
+    for (let i = 0; i < 2; i++) {
+      await pointer(hit, "pointerdown", x, y);
+      await pointer(container.querySelector(".page")!, "pointerup", x, y);
+    }
+    await act(async () => hit.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2, clientX: x, clientY: y })));
+    const editor = container.querySelector<HTMLTextAreaElement>("[data-table-cell-editor] textarea");
+    expect(editor).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor, "1");
+      editor!.dispatchEvent(new Event("input", { bubbles: true }));
+      editor!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    const edited = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0] as typeof table;
+    expect(edited.rows[2].cells[0].text).toBe("1");
+    expect(edited.rows.flatMap(row => row.cells).filter(cell => cell.text !== "")).toHaveLength(1);
+    const editedLayout = planTableLayout(edited);
+    expect(editedLayout.columns[0].width).toBe(layout.columns[0].width);
+    expect(editedLayout.columns[0].width).toBeGreaterThanOrEqual(minimum);
+    const editedHit = container.querySelector("[data-table-hit-target]")!;
+    for (let i = 0; i < 2; i++) {
+      await pointer(editedHit, "pointerdown", nextX, nextY);
+      await pointer(container.querySelector(".page")!, "pointerup", nextX, nextY);
+    }
+    await act(async () => editedHit.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2, clientX: nextX, clientY: nextY })));
+    const nextEditor = container.querySelector<HTMLTextAreaElement>("[data-table-cell-editor] textarea");
+    expect(nextEditor).not.toBeNull();
+    expect(nextEditor!.parentElement!.dataset.rowId).toBe(table.rows[2].id);
+    expect(nextEditor!.parentElement!.dataset.columnId).toBe(table.columns[1].id);
+  });
+
+  it("lets an all-empty column without an auto minimum shrink to natural width after typing", async () => {
+    const nativeDocument = fixture(), table = nativeDocument.pages[0].objects[0];
+    if (table.type !== "table") throw new Error("Expected table");
+    delete table.tableStyle.autoColumnMinEm;
+    for (const row of table.rows) row.cells[0].text = "";
+    await render(nativeDocument);
+    const layout = planTableLayout(table);
+    const minimum = Math.ceil((3 * nativeTextStyleFromObjectStyle(table.style).fontSizePx + 2 * table.tableStyle.cellPaddingPx.x) * 2) / 2;
+    expect(layout.columns[0].width).toBeGreaterThanOrEqual(minimum);
+    const box = layout.cells.find(cell => cell.rowIndex === 1 && cell.columnIndex === 0)!.box;
+    const scale = (window.__CHEMDRAFT_AGENT__!.snapshot().viewport as { scale: number }).scale;
+    const x = (box.x + 5) * scale, y = (box.y + box.height / 2) * scale;
+    const hit = container.querySelector("[data-table-hit-target]")!;
+    for (let i = 0; i < 2; i++) {
+      await pointer(hit, "pointerdown", x, y);
+      await pointer(container.querySelector(".page")!, "pointerup", x, y);
+    }
+    await act(async () => hit.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2, clientX: x, clientY: y })));
+    const editor = container.querySelector<HTMLTextAreaElement>("[data-table-cell-editor] textarea");
+    expect(editor).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor, "1");
+      editor!.dispatchEvent(new Event("input", { bubbles: true }));
+      editor!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    const edited = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0];
+    if (edited.type !== "table") throw new Error("Expected table");
+    const editedLayout = planTableLayout(edited);
+    expect(editedLayout.columns[0].width).toBe(editedLayout.columns[0].contentWidth);
+    expect(editedLayout.columns[0].width).toBeLessThan(minimum);
+  });
+
+  it("leaves the empty bounding-box corners outside a 45-degree table hit rect", async () => {
+    const nativeDocument = fixture(), table = nativeDocument.pages[0].objects[0];
+    if (table.type !== "table") throw new Error("Expected table");
+    table.rotation = 45;
+    await render(nativeDocument);
+    const hit = container.querySelector("[data-table-hit-target]")!;
+    const fragment = planPageSvgRender(nativeDocument.pages[0]).fragments
+      .find(part => part.attrs["data-object-id"] === table.id)!;
+    expect(hit.getAttribute("transform")).toBe(fragment.attrs.transform);
+    const layout = planTableLayout(table);
+    expect(Number(hit.getAttribute("x"))).toBe(table.x);
+    expect(Number(hit.getAttribute("y"))).toBe(table.y);
+    expect(Number(hit.getAttribute("width"))).toBe(layout.width);
+    expect(Number(hit.getAttribute("height"))).toBe(layout.height);
+    const bounds = tableVisualBoundsForArrangement(table);
+    const point = { x: bounds.x + 1, y: bounds.y + 1 };
+    expect(point.x).toBeLessThan(bounds.x + bounds.width);
+    expect(point.y).toBeLessThan(bounds.y + bounds.height);
+    // jsdom has no SVG hit tester. Invert the rendered transform and test the actual rect geometry.
+    const [angle, cx, cy] = hit.getAttribute("transform")!.match(/-?\d+(?:\.\d+)?/g)!.map(Number);
+    const local = transformPointForObject({ ...table, rotation: -angle,
+      x: cx - table.width / 2, y: cy - table.height / 2 }, point);
+    const inside = local.x >= Number(hit.getAttribute("x"))
+      && local.x <= Number(hit.getAttribute("x")) + Number(hit.getAttribute("width"))
+      && local.y >= Number(hit.getAttribute("y"))
+      && local.y <= Number(hit.getAttribute("y")) + Number(hit.getAttribute("height"));
+    expect(inside).toBe(false);
+    await pointer(container.querySelector(".page")!, "pointerdown", point.x, point.y);
+    await pointer(container.querySelector(".page")!, "pointerup", point.x, point.y);
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().selection.objectIds).toEqual([]);
+  });
+
+  it("broadcasts the selected table state to the floating inspector", async () => {
+    const snapshots: unknown[] = [];
+    const stop = await listenForToolsetTextStyle(payload => snapshots.push(payload.currentTable));
+    try {
+      const nativeDocument = fixture();
+      nativeDocument.selection = { pageId: nativeDocument.pages[0].id, objectIds: ["table-sharpless"] };
+      await render(nativeDocument);
+      expect(snapshots.at(-1)).toMatchObject({ tableId: "table-sharpless", hasCaption: true, footnoteCount: 1,
+        activeColumn: { id: "col-material", align: "left", formula: "auto" } });
+      await command("table.style.grid");
+      expect(snapshots.at(-1)).toMatchObject({ preset: "grid" });
+    } finally { stop(); }
+  });
+
+  it("moves a table with the ordinary canvas drag path and undoes the move", async () => {
+    await render(fixture());
+    const hit = container.querySelector("[data-table-hit-target]")!;
+    const before = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0];
+    await pointer(hit, "pointerdown", before.x + 10, before.y + 10);
+    await pointer(container.querySelector(".page")!, "pointermove", before.x + 40, before.y + 30);
+    await pointer(container.querySelector(".page")!, "pointerup", before.x + 40, before.y + 30);
+    const moved = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0];
+    expect(moved.x).toBeGreaterThan(before.x);
+    expect(moved.y).toBeGreaterThan(before.y);
+    await command("edit.undo");
+    expect(window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0].objects[0]).toEqual(before);
+  });
+
+  it.each(["macos", "windows"] as const)("submits defaults and cancels with Escape on %s", async platform => {
+    const onSubmit = vi.fn(), onCancel = vi.fn();
+    await act(async () => root.render(<InsertTableForm platform={platform} title="Drawing"
+      initial={{ rows: 6, columns: 4, headerRows: 1, preset: "three-line" }} onSubmit={onSubmit} onCancel={onCancel} />));
+    expect(document.activeElement).toBe(container.querySelector("input"));
+    await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({ rows: 6, columns: 4, headerRows: 1, preset: "three-line" });
+    await act(async () => container.querySelector("input")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+});

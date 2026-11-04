@@ -29,18 +29,19 @@ function define<N extends AssistantToolName>(name: N, description: string, permi
   return { name, description, inputSchema: toolJsonSchema(name), permissions, timeoutMs, readOnly,
     handler: async (context, input) => handler(context, toolSchemas[name].parse(input) as ToolInput<N>) };
 }
-// The amended table enumerates fourteen names (four reads, three chemistry, seven writes).
+// Four reads, three chemistry tools, and eight writes.
 export const ASSISTANT_TOOLS: readonly AssistantToolDefinition[] = [
   define("get_document", "Read a bounded summary of the pinned document. inScope marks objects the request may change.", READ, true, read.getDocument),
   define("get_selection", "Read the objects selected when Send was pressed; empty means only insertion is allowed.", ["selection.read"], true, read.getSelection),
   define("get_structure", "Read a molecule's live graph as SMILES or molfile, with conversion warnings.", READ, true, read.getStructure),
   define("render", "Render a page or objects as PNG, at most 4 MiB and 1568 px by default.", READ, true, read.render),
-  define("name_to_structure", "Parse a chemical name with the local OPSIN engine.", ["chemistry.compute", "native.execute"], true, chemistry.nameToStructure, 60_000),
+  define("name_to_structure", "Check ChemDraft built-in templates before the local OPSIN engine. Use host names such as beta-cyclodextrin rather than writing SMILES.", ["chemistry.compute", "native.execute"], true, chemistry.nameToStructure, 60_000),
   define("validate_smiles", "Validate SMILES using RDKit, reporting canonical SMILES, formula, and heavy atom count (maximum 500).", ["chemistry.compute"], true, chemistry.validateSmiles),
   define("structure_to_name", "Name a document molecule using the installed naming engine; never opens an install dialog.", ["chemistry.compute", "native.execute", "selection.read"], true, chemistry.structureToName, 60_000),
   define("insert_structures", "Insert up to 24 molecule/group/text items in a host-positioned row or grid. Molecule labels are captions; group labels are native abbreviation or condensed-formula atoms (e.g. methyl: {kind:'group',label:'CH3'}, Ph, Boc, OTs).", CHEM_WRITE, false, write.insertStructures, 60_000),
-  define("insert_reaction", "Insert a reaction scheme with up to six reactants and six products, plus reagent and condition labels.", CHEM_WRITE, false, write.insertReaction, 60_000),
+  define("insert_reaction", "Insert a reaction scheme with up to six reactants and products. Put reagents and catalysts above, one per line; solvent, temperature and time below; number steps as 1. ..., 2. ...; use caption for notes under the scheme. Write formulas plainly (CH2Cl2): subscripts are automatic; no footnote stars.", CHEM_WRITE, false, write.insertReaction, 60_000),
   define("insert_text", "Insert up to 2000 characters, optionally beside a document object. The host chooses coordinates.", WRITE, false, write.insertText),
+  define("insert_table", "Insert a native editable table, optionally beside besideObjectId; the host chooses placement. Formulas typed as plain strings in text columns get subscripts automatically. Put numbers in decimal columns and units in the header. The table never computes values.", WRITE, false, write.insertTable),
   define("edit_structure", "Replace an in-scope molecule with verified SMILES, preserving its centre by default.", CHEM_WRITE, false, write.editStructure, 60_000),
   define("delete_objects", "Delete up to 100 in-scope objects. Any out-of-scope id refuses the entire call.", WRITE, false, write.deleteObjects),
   define("style_objects", "Change only style on up to 100 in-scope objects; atoms and bonds stay unchanged.", WRITE, false, write.styleObjects),
@@ -82,12 +83,12 @@ export async function callAssistantTool(context: AssistantToolContext, name: str
         try { return await context.confirmPageGrowth(growth, abort.signal); }
         finally { resumePreparation?.(); }
       },
-      write: async (patch, _signal, checkPreconditions) => {
+      write: async (patch, _signal, checkPreconditions, expectedSmiles) => {
         if (!active) throw new Error(`Assistant tool ${name} timed out.`);
         requireDocument(context);
         const beforeIds = new Set(context.getDocument()!.pages.flatMap(page => page.objects.map(object => object.id)));
         waitForWrite?.();
-        const written = await context.write(patch, abort.signal, checkPreconditions);
+        const written = await context.write(patch, abort.signal, checkPreconditions, expectedSmiles);
         recordAssistantInsertions(context, written.objectIds.filter(id => !beforeIds.has(id)));
         return written;
       }

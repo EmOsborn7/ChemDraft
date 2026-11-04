@@ -1,5 +1,5 @@
 /**
- * Ionizable-site assessment (PLANS.md §9 Later phases; §8's "protonation-state enumeration").
+ * Ionizable-site assessment (docs/plans/PLANS.md §9 Later phases; §8's "protonation-state enumeration").
  *
  * **Two stages, from two different sources.** The site table *locates* ionizable positions; the model
  * in `pkaModel.ts`, trained here on measured pKa, *values* them. Keeping them apart is the whole
@@ -194,6 +194,7 @@ import {
 } from "./pkaModel";
 import { PKA_GNN_TRAINING, PKA_INTERVAL_CALIBRATION, predictSitePka } from "./pkaGnn";
 import { siteContext } from "./pkaAromaticity";
+import { coordGenWithinSizeGuard } from "./conformer";
 
 /**
  * The held-out figure, read from the artifact the measurement wrote.
@@ -769,6 +770,7 @@ export function molblockWithCharges(
 
 /** The subset of MinimalLib a depiction needs. Both are optional on the vendored build. */
 export interface DepictableMolecule {
+  get_json?(): string;
   set_new_coords?(useCoordGen?: boolean): boolean;
   get_molblock?(): string;
 }
@@ -794,7 +796,10 @@ export function depictionFor(
 ): NonNullable<IonizationResult["depiction"]> | undefined {
   if (!molecule.set_new_coords || !molecule.get_molblock) return undefined;
   try {
-    if (!molecule.set_new_coords(true) && !molecule.set_new_coords(false)) return undefined;
+    const useCoordGen = coordGenWithinSizeGuard(molecule);
+    if (!molecule.set_new_coords(useCoordGen)) {
+      if (!useCoordGen || !molecule.set_new_coords(false)) return undefined;
+    }
   } catch {
     return undefined;
   }

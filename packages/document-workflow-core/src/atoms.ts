@@ -5,6 +5,7 @@
 
 import {
   drawnLabelBondSide,
+  normalizeAtomIsotope,
   type ChemDraftDocument,
   type ChemicalMetadata,
   type CompatibilityWarning,
@@ -255,6 +256,32 @@ export function nativeElementMass(element: string): { average: number; exact: nu
   return mass;
 }
 
+// Neutral atomic nuclide masses, u: AME2020, Wang et al., Chinese Physics C 45 (2021) 030003,
+// https://www-nds.iaea.org/amdc/ame2020/mass_1.mas20.txt (atomic-mass column, not mass excess).
+// This deliberately small table declines unlisted nuclides; a mass number is never an atomic mass.
+const nativeNuclideMass: Readonly<Record<string, number>> = {
+  "1H": 1.007825031898,
+  "11C": 11.011432597,
+  "13C": 13.00335483534,
+  "14C": 14.00324198862,
+  "15N": 15.00010889827,
+  "17O": 16.99913175595,
+  "18O": 17.99915961214,
+  "18F": 18.000937324,
+  "32P": 31.973907643,
+  "33P": 32.971725692,
+  "34S": 33.967867011,
+  "35S": 34.969032321,
+  "36Cl": 35.968306822,
+  "37Cl": 36.965902573,
+  "79Br": 78.918337574,
+  "81Br": 80.916288197,
+  "123I": 122.905589753,
+  "124I": 123.906210297,
+  "125I": 124.904630610,
+  "131I": 130.906126375
+};
+
 /**
  * `atoms` is the whole molecule: an aromatic bond is counted at its Kekulé order, and resolving
  * that needs every ring atom. Left out, an atom on an aromatic bond is reported unresolved.
@@ -391,14 +418,21 @@ export function nativeAtomValidationState(
     if (atom.labelLiteral === true) {
       const spelled = nativeSingleHeavyElementLabelValence(symbol);
       if (spelled && !nativeLiteralAtomValenceComplete(spelled.element, valenceUsed + spelled.hydrogens, effectiveFormalCharge)) {
+        const total = valenceUsed + spelled.hydrogens;
+        const expected = nativeAtomValenceForCharge(spelled.element, effectiveFormalCharge);
+        const bondCount = (count: number) => `${count} bond${count === 1 ? "" : "s"}`;
+        const chargeText = effectiveFormalCharge === 0
+          ? "neutral"
+          : `${spelled.element} with charge ${effectiveFormalCharge > 0 ? "+" : ""}${effectiveFormalCharge}`;
+        const message = `${symbol} puts ${bondCount(total)} on ${spelled.element} (${valenceUsed} from bonds to other atoms + ${spelled.hydrogens} H); ${chargeText}${effectiveFormalCharge === 0 ? ` ${spelled.element}` : ""} normally makes ${expected}.`;
         return {
           atomId: atom.id,
           element: symbol,
           valenceUsed,
           formalCharge: effectiveFormalCharge,
           valid: false,
-          invalidReason: `${symbol} accounts for ${valenceUsed + spelled.hydrogens} of ${nativeAtomValenceForCharge(spelled.element, effectiveFormalCharge)} bonds.`,
-          invalidDetail: `${symbol} atom ${atom.id} accounts for ${valenceUsed + spelled.hydrogens} of ${nativeAtomValenceForCharge(spelled.element, effectiveFormalCharge)} bonds.`
+          invalidReason: message,
+          invalidDetail: `${symbol} atom ${atom.id}: ${message}`
         };
       }
     }
@@ -708,6 +742,14 @@ export function nativeAtomLabelFreeValence(
   return undefined;
 }
 
+/** The element at a label's attachment atom, when its connectivity is known. */
+export function nativeAtomLabelHeadElement(label: string, context: NativeAtomLabelContext = {}): string | undefined {
+  const reading = nativeAtomLabelReading(label, context);
+  if (reading.kind === "element" || reading.kind === "spelled") return reading.element;
+  if (reading.kind === "group") return nativeLabelGroupAttachment(reading.group).element;
+  return undefined;
+}
+
 /** The bond ceiling the drawing tools grow any atom to; a group never needs more. */
 const nativeAtomInvalidGrowthLimit = 8;
 
@@ -936,7 +978,8 @@ export function nativeSingleBondGraphMetadata(
   // An element symbol standing for a group (a bonded "Ar", aryl) is a placeholder: it counts nothing.
   const placeholders = nativeElementLabelPlaceholders(atoms, bonds);
 
-  countedAtoms.forEach((atom) => {
+  countedAtoms.forEach((sourceAtom) => {
+    const atom = normalizeAtomIsotope(sourceAtom);
     if (placeholders.has(atom.id)) {
       return;
     }
@@ -961,7 +1004,8 @@ export function nativeSingleBondGraphMetadata(
       });
       return;
     }
-    elementCounts.set(element, (elementCounts.get(element) ?? 0) + 1);
+    const formulaElement = atom.isotope === undefined ? element : `[${atom.isotope}${element}]`;
+    elementCounts.set(formulaElement, (elementCounts.get(formulaElement) ?? 0) + 1);
 
     // A literal label (typed with the text tool) contributes exactly what it says — the
     // formula must not invent hydrogens for it: a lone typed "C" is C, not CH4. Drawn atoms
@@ -978,40 +1022,64 @@ export function nativeSingleBondGraphMetadata(
     }
   });
 
-  // Every key is an element the label parser produced, and the table covers every element the
-  // parser knows, so a miss here is a programming error and throws — never a silent 0 that
-  // leaves the weight short by an atom the formula lists.
-  const averageMass = [...elementCounts.entries()].reduce(
-    (sum, [element, count]) => sum + nativeElementMass(element).average * count,
-    0
-  );
-  const exactMass = [...elementCounts.entries()].reduce(
-    (sum, [element, count]) => sum + nativeElementMass(element).exact * count,
-    0
-  );
+  // Natural-abundance elements have a complete table; an unknown symbol is a programming error.
+  // Labelled nuclides have only the explicit table above, and an unlisted one declines both masses.
+  let averageMass = 0;
+  let exactMass = 0;
+  let missingMass = false;
+  for (const [element, count] of elementCounts) {
+    const isotope = element.startsWith("[") ? element.slice(1, -1) : undefined;
+    const nuclideMass = isotope === undefined ? undefined : nativeNuclideMass[isotope];
+    if (isotope !== undefined && nuclideMass === undefined) {
+      missingMass = true;
+      warnings.push({
+        code: "native.isotope_mass_unknown",
+        message: `Atomic mass for isotope ${isotope} is unavailable; ` +
+          "average and exact mass were not calculated."
+      });
+      continue;
+    }
+    const mass = nuclideMass === undefined ? nativeElementMass(element) :
+      { average: nuclideMass, exact: nuclideMass };
+    averageMass += mass.average * count;
+    exactMass += mass.exact * count;
+  }
 
   return {
     formula: formulaFromElementCounts(elementCounts),
-    averageMass: Number(averageMass.toFixed(3)),
-    exactMass: Number(exactMass.toFixed(5)),
+    averageMass: missingMass ? undefined : Number(averageMass.toFixed(3)),
+    exactMass: missingMass ? undefined : Number(exactMass.toFixed(5)),
     atomCount: atoms.length,
     bondCount: bonds.length,
     totalCharge,
     radicalCount,
-    isotopeLabels: [],
+    isotopeLabels: [...new Set(countedAtoms.flatMap((atom) => atom.element === "D" ? ["2H"] :
+      atom.element === "T" ? ["3H"] : atom.isotope === undefined ? [] :
+        [`${atom.isotope}${atom.element}`]))].sort(),
     stereochemistry: [],
     warnings
   };
 }
 
 function formulaFromElementCounts(counts: ReadonlyMap<string, number>): string {
-  const carbonCount = counts.get("C") ?? 0;
-  const remainingElements = [...counts.keys()]
-    .filter((element) => element !== "C" && element !== "H")
-    .sort();
-  const orderedElements = carbonCount > 0
-    ? ["C", "H", ...remainingElements]
-    : [...counts.keys()].sort();
+  const atomKey = (symbol: string): { element: string; mass: number } => {
+    const isotope = symbol.match(/^\[(\d+)([A-Z][a-z]?)\]$/);
+    return isotope ? { element: isotope[2]!, mass: Number(isotope[1]) } : { element: symbol, mass: 0 };
+  };
+  // RDKit MolOps::getMolFormula / HillCompare (Code/GraphMol/MolProps.cpp): C, H, D, T first,
+  // ascending isotope within C/H (natural = 0); remaining keys sort by (mass number, symbol).
+  // Thus natural O precedes [15N], and labelled carbon stays first without any natural carbon.
+  // https://github.com/rdkit/rdkit/blob/master/Code/GraphMol/MolProps.cpp
+  // Unlabelled, carbon-free formulas retain the existing conventional alphabetical Hill order.
+  const carbonOrIsotopes = [...counts.keys()].some((symbol) => atomKey(symbol).element === "C" ||
+    symbol === "D" || symbol === "T" || symbol.startsWith("["));
+  const ranks: Readonly<Record<string, number>> = carbonOrIsotopes ? { C: 0, H: 1, D: 2, T: 3 } : {};
+  const orderedElements = [...counts.keys()].sort((left, right) => {
+    const a = atomKey(left);
+    const b = atomKey(right);
+    const elementOrder = a.element === b.element ? 0 : a.element < b.element ? -1 : 1;
+    return (ranks[a.element] ?? 4) - (ranks[b.element] ?? 4) || a.mass - b.mass || elementOrder;
+  });
 
   return orderedElements
     .map((element) => ({ element, count: counts.get(element) ?? 0 }))

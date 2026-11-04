@@ -122,6 +122,8 @@ body.palette-window-body #root {
 html.palette-popover-window-html,
 body.palette-popover-window-body,
 body.palette-popover-window-body #root {
+  overflow: hidden;
+  overflow-anchor: none;
   min-width: 0;
   width: max-content;
   height: max-content;
@@ -165,6 +167,8 @@ body.palette-tooltip-window-body #root {
 }
 
 .palette-popover-shell {
+  overflow: hidden;
+  overflow-anchor: none;
   box-sizing: border-box;
   width: max-content;
   height: max-content;
@@ -911,12 +915,14 @@ textarea:focus-visible,
   position: absolute; top: 0; left: 0; right: 0; height: 7px;
   cursor: ns-resize; touch-action: none;
 }
+.plugin-canvas-overlay-header, .plugin-canvas-overlay-header *,
+.plugin-canvas-overlay-resize, .plugin-canvas-overlay-resize * { -webkit-user-select: none; user-select: none; }
 .plugin-canvas-overlay-resize::after {
   content: ""; display: block; width: 28px; height: 2px; margin: 2px auto;
   background: var(--cd-border-control);
 }
 .plugin-canvas-overlay-transcript {
-  flex: 1 1 48px; min-height: 32px; overflow: auto; overflow-wrap: anywhere;
+  flex: 1 1 48px; min-height: 0; overflow: auto; overflow-wrap: anywhere;
   margin-top: var(--cd-space-2); overscroll-behavior: contain;
 }
 .plugin-canvas-overlay-entry { white-space: pre-wrap; line-height: 16px; margin-bottom: 4px; }
@@ -937,7 +943,7 @@ textarea:focus-visible,
 }
 .plugin-canvas-overlay-icon[hidden] { display: none; }
 .plugin-canvas-overlay-icon img { width: 24px; height: 24px; }
-.plugin-canvas-overlay-header { display: flex; align-items: center; justify-content: space-between; cursor: ns-resize; touch-action: none; user-select: none; }
+.plugin-canvas-overlay-header { display: flex; align-items: center; justify-content: space-between; cursor: ns-resize; touch-action: none; }
 .plugin-report-composer-counter { margin: var(--cd-space-2) 0 0; color: var(--cd-text-muted); font-size: 11px; text-align: right; }
 .plugin-canvas-overlay-header button { color: var(--cd-text-secondary); background: transparent; border: 0; cursor: pointer; }
 .plugin-canvas-overlay .plugin-report-composer { position: static; margin: 0; padding: var(--cd-space-3) 0 0; border: 0; }
@@ -1206,6 +1212,30 @@ textarea:focus-visible,
   min-width: 0;
 }
 
+.molecule-inspector-bond-stereo-actions {
+  display: grid;
+  gap: 4px;
+}
+
+.molecule-inspector-bond-stereo-actions button {
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--cd-border);
+  border-radius: 4px;
+  background: var(--cd-bg);
+  color: var(--cd-text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.molecule-inspector-bond-stereo-actions button[aria-pressed="true"] {
+  background: var(--cd-bg-selected);
+}
+
+.molecule-inspector-bond-stereo-actions button:disabled {
+  color: var(--cd-text-muted);
+}
+
 .molecule-inspector-field > span:first-child {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -1276,6 +1306,23 @@ textarea:focus-visible,
   justify-content: center;
   padding: 0 10px;
   font-size: 11px;
+  white-space: nowrap;
+}
+
+/* Table settings use the same fields, effect toggles and action buttons as molecule settings.
+   Only their single-column layout differs; the palette body owns scrolling for the whole window. */
+.table-inspector-controls {
+  box-sizing: border-box;
+  grid-column: auto;
+  grid-template-columns: minmax(0, 1fr);
+  width: 520px;
+  max-height: none;
+  padding: 8px;
+}
+
+.table-inspector-controls .molecule-inspector-field > span:first-child {
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 .molecule-inspector-checkbox-field {
@@ -1304,11 +1351,15 @@ textarea:focus-visible,
   padding: 0 6px;
   justify-content: center;
   overflow: hidden;
-  font-size: 10px;
   line-height: 1;
   text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.molecule-inspector-effect-row .toolbar-text-button,
+.table-inspector-controls .molecule-inspector-template-button {
+  font-size: 10px;
 }
 
 .molecule-inspector-none-button {
@@ -1563,6 +1614,18 @@ textarea:focus-visible,
   font-size: 12px;
   line-height: 22px;
   white-space: nowrap;
+}
+
+/* Keep native palette menus light without changing the inspector's closed-control styling. */
+.toolbar-select,
+.molecule-inspector-field select {
+  color-scheme: light;
+}
+
+.toolbar-select option,
+.molecule-inspector-field select option {
+  background-color: var(--cd-bg-control);
+  color: var(--cd-text-primary);
 }
 
 .toolbar-font-select {
@@ -2272,6 +2335,11 @@ textarea:focus-visible,
   line-height: 1;
 }
 
+.table-inspector-controls .molecule-inspector-template-button {
+  width: auto;
+  padding: 0 10px;
+}
+
 .toolbar-metric-group .toolbar-text-button {
   width: 34px;
   font-size: 10px;
@@ -2391,6 +2459,14 @@ textarea:focus-visible,
 
 .palette-window-shell:active {
   cursor: grabbing;
+}
+
+.palette-window-content {
+  min-height: 0;
+  /* Initial safety cap until PaletteWindow reads the monitor's work area. This must be independent
+     of the webview viewport: the shell's measured content drives the native window size. */
+  max-height: 746px;
+  overflow-y: auto;
 }
 
 .palette-title {
@@ -4179,7 +4255,7 @@ textarea:focus-visible,
 .graphic-gradient-control-layer {
   position: absolute;
   inset: 0;
-  z-index: 3;
+  z-index: 5;
   display: block;
   width: 100%;
   height: 100%;
@@ -4214,7 +4290,7 @@ textarea:focus-visible,
 
 .graphic-gradient-handle {
   position: absolute;
-  z-index: 4;
+  z-index: 6;
   width: 12px;
   height: 12px;
   padding: 0;
@@ -4594,6 +4670,14 @@ textarea:focus-visible,
   will-change: transform;
 }
 
+/* Typed controls share the frame's geometry but escape its handle stacking context. */
+.object-transform-input-layer {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  will-change: transform;
+}
+
 /* Bounding box around a multi-object selection (group rotate/resize chrome). */
 .group-selection-frame {
   border: 1.5px dashed var(--cd-accent-border);
@@ -4943,7 +5027,8 @@ textarea:focus-visible,
   top: calc(100% + 8px);
 }
 
-.object-transform-frame[data-has-tilt3d="true"] .object-rotation-input-popover[data-rotation-input-kind="z"] {
+.object-transform-frame[data-has-tilt3d="true"] .object-rotation-input-popover[data-rotation-input-kind="z"],
+.object-transform-input-layer[data-has-tilt3d="true"] .object-rotation-input-popover[data-rotation-input-kind="z"] {
   left: calc(50% - 17px);
 }
 
@@ -5074,6 +5159,24 @@ textarea:focus-visible,
 
 .native-atom-invalid-marker {
   pointer-events: none;
+}
+
+/* A sibling of the selection's transform frame (z-index: 3), not a child of
+   its lower SVG overlay. Only the badge itself accepts hits; the rest passes through. */
+.native-bond-stereo-badge-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.native-bond-stereo-marker {
+  cursor: pointer;
+  pointer-events: all;
+}
+
+@media print {
+  .native-bond-stereo-marker { display: none !important; }
 }
 
 .native-atom-invalid-ring {
@@ -5850,6 +5953,10 @@ textarea:focus-visible,
   opacity: 0.7;
 }
 
+.status-message {
+  pointer-events: auto;
+}
+
 /* Shrinks far ahead of the status (its shrink factor dwarfs the left part's), down to its floor; the
    full stamp is in its title tooltip, the one reason it takes the pointer. */
 .build-stamp {
@@ -6179,6 +6286,8 @@ textarea:focus-visible,
 
 .plugin-panel-content {
   flex: 1;
+  min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   padding: 10px 12px;
   font-size: 12px;
@@ -6186,6 +6295,10 @@ textarea:focus-visible,
      ordinary Cmd/Ctrl+C is left to the focused webview. */
   user-select: text;
   -webkit-user-select: text;
+}
+
+.plugin-panel-content > .plugin-report {
+  overflow: visible;
 }
 
 .plugin-panel-content button,
@@ -6361,12 +6474,15 @@ textarea:focus-visible,
   flex-direction: column;
   gap: var(--cd-space-6);
   min-height: 0;
+  min-width: 0;
   overflow-y: auto;
   padding: var(--cd-space-5);
 }
 
 .plugin-report-section {
   margin: 0;
+  min-width: 0;
+  flex-shrink: 0;
 }
 
 .plugin-report-section h4 {
@@ -6408,6 +6524,8 @@ textarea:focus-visible,
 }
 
 .plugin-report-table-scroll {
+  max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
 }
 
@@ -7147,10 +7265,12 @@ textarea:focus-visible,
   display: flex;
   flex-direction: column;
   gap: var(--cd-space-3);
+  min-width: 0;
 }
 
 .lf-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--cd-space-4);
@@ -7164,6 +7284,8 @@ textarea:focus-visible,
 
 .lf-toolbar-actions {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: center;
   gap: var(--cd-space-2);
 }
@@ -7188,6 +7310,8 @@ textarea:focus-visible,
 
 .lf-meta-field {
   display: inline-flex;
+  flex-wrap: wrap;
+  max-width: 100%;
   align-items: center;
   gap: var(--cd-space-2);
 }
@@ -7198,6 +7322,7 @@ textarea:focus-visible,
 }
 
 .lf-select {
+  max-width: 100%;
   height: 20px;
   border: 1px solid var(--cd-border-control);
   border-radius: var(--cd-radius-control);
@@ -7212,6 +7337,7 @@ textarea:focus-visible,
 }
 
 .lf-btn {
+  flex-shrink: 0;
   height: 22px;
   min-width: 26px;
   padding: 0 var(--cd-space-3);
@@ -7368,7 +7494,7 @@ textarea:focus-visible,
   fill: var(--cd-accent-text);
 }
 
-/* Estimation quality (ChemDraw-style): a shift's color tells the reader how much to trust it. */
+/* Estimation quality: a shift's color tells the reader how much to trust it. */
 .lf-shift-label.is-good {
   fill: #2f6fed;
 }
@@ -7413,40 +7539,38 @@ textarea:focus-visible,
   color: #d0421b;
 }
 
-/* Full-size spectrum modal (portalled to <body>). */
-.lf-modal-backdrop {
+/* Full-size spectrum view (portalled to <body>). */
+.lf-modal {
   position: fixed;
   inset: 0;
   z-index: var(--cd-z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--cd-space-5);
-  background: rgba(0, 0, 0, 0.55);
-}
-
-.lf-modal {
-  position: relative;
-  width: min(1200px, 96vw);
-  max-height: 92vh;
   overflow: auto;
-  padding: var(--cd-space-6) var(--cd-space-5) var(--cd-space-5);
+  padding: var(--cd-space-3);
   background: var(--cd-bg-panel-raised);
-  border: 1px solid var(--cd-border);
-  border-radius: var(--cd-radius-panel);
-  box-shadow: var(--cd-shadow-panel);
 }
 
 .lf-modal-close {
-  position: absolute;
-  top: var(--cd-space-3);
-  right: var(--cd-space-3);
-  z-index: 1;
+  position: static;
 }
 
-/* In the modal the spectrum dominates; a wider SVG is proportionally taller (fixed viewBox aspect). */
-.lf-root.is-fullscreen .lf-figures {
-  flex-wrap: nowrap;
+.lf-export-menu {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--cd-space-2);
+}
+
+.lf-status {
+  font-size: 11px;
+  color: var(--cd-text-secondary);
+}
+
+.lf-modal > .lf-root {
+  min-height: 100%;
+}
+
+.lf-modal .lf-figures {
+  flex: 1;
+  align-items: center;
 }
 .lf-root.is-fullscreen .lf-spectrum {
   flex: 3 1 720px;
@@ -7813,6 +7937,26 @@ textarea:focus-visible,
 .cd-page-size-form { padding: 18px; background: var(--cd-bg-panel); color: var(--cd-text-primary); box-sizing: border-box; min-height: 100vh; font-size: 13px; }
 .cd-page-size-form h2 { font-size: 16px; margin: 0 0 12px; }
 .cd-page-size-form p { color: var(--cd-text-secondary); }
+.cd-insert-table-drawing { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Content-fit dialogs (`fit_content` in dialog_windows.rs): the form fills the window exactly, its
+   body scrolls and its button row is pinned, so the buttons stay reachable even when the window is
+   shorter than the content (a narrow work area wraps the fields, a long message wraps). The host
+   sizes the window to the measured natural height, so normally nothing scrolls and no band shows.
+   dialogContentFit.ts lifts these constraints while measuring. The body's 4px padding, cancelled by
+   its margin, keeps focus rings inside the scroll clip without moving anything. */
+.cd-dialog-fit { display: flex; flex-direction: column; height: 100vh; min-height: 0; }
+.cd-dialog-fit-body { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow: auto; margin: -4px; padding: 4px; }
+.cd-dialog-fit-footer { flex: none; }
+/* Fixed row metrics on both WebKit and WebView2. An empty status paragraph must
+   reserve the same two lines as a validation message. */
+.cd-insert-table-form h2 { line-height: 19px; margin: 0 0 13px; }
+.cd-insert-table-form .cd-insert-table-drawing { line-height: 16px; margin: 0 0 13px; }
+.cd-insert-table-form .cd-page-size-fields label { line-height: 16px; }
+.cd-insert-table-form .cd-page-size-fields input,
+.cd-insert-table-form .cd-page-size-fields select,
+.cd-insert-table-form button { box-sizing: border-box; height: 30px; }
+.cd-insert-table-form [role="status"] { flex: 1 0 auto; min-height: 32px; line-height: 16px; margin: 13px 0 0; }
+.cd-insert-table-form .cd-dialog-fit-footer { padding-top: 13px; }
 .cd-page-size-fields { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
 .cd-page-size-fields label { display: flex; flex-direction: column; gap: 4px; }
 .cd-page-size-fields input { width: 90px; }
@@ -7836,3 +7980,22 @@ textarea:focus-visible,
   white-space: nowrap;
 }
 .preferences-compound-layout-features:disabled { opacity: .6; }
+
+/* Disabled native form controls may suppress pointer events entirely in WebKit.
+   Let the wrapper classify the click and lease the palette shell as a keyboard sink. */
+.palette-window-shell :is(input, textarea, select):disabled,
+.palette-popover-shell :is(input, textarea, select):disabled {
+  pointer-events: none;
+}
+
+/* The real hit target is the immediate wrapper (including the number-field label).
+   Non-key utility windows need the cursor even when the OS does not supply :hover. */
+.palette-window-shell :has(> :is(input, textarea, select):disabled),
+.palette-popover-shell :has(> :is(input, textarea, select):disabled) {
+  cursor: not-allowed;
+}
+
+.native-bond-stereo-marker:focus-visible .native-atom-invalid-ring { stroke: var(--cd-accent, #2965c7); stroke-width: 3; }
+.bond-stereo-popover { width: 290px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.bond-stereo-popover p { margin: 0; line-height: 1.4; white-space: normal; }
+.bond-stereo-popover button { min-height: 28px; text-align: left; }

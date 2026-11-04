@@ -7,8 +7,10 @@ import {
   type NativeTextStyle,
   nativeTextStyleFromObjectStyle,
   type TextObject,
+  type TextSpan,
   textStyleToObjectStyle
 } from "@chemdraft/chem-core";
+import { measureNativeTextSpanLineWidth, textObjectSpanLines } from "@chemdraft/layout-engine";
 import { clamp, firstPage, nextObjectId, type PagePoint, phase4Timestamp } from "./shared";
 import { nativeTextObjectLineMetrics, nativeTextSpanMetrics } from '@chemdraft/layout-engine';
 
@@ -29,13 +31,20 @@ const nativeTextBoxVerticalPadding = 4;
 export function nativeTextObjectSizeForText(
   text: string,
   style: Record<string, unknown> | Partial<NativeTextStyle> = {},
-  options: { width?: number; height?: number; maxWidth?: number; maxHeight?: number } = {}
+  options: { width?: number; height?: number; maxWidth?: number; maxHeight?: number; spans?: TextSpan[] } = {}
 ): { width: number; height: number } {
   const textStyle = nativeTextStyleFromObjectStyle(style);
   const paragraphs = normalizeTextLines(text);
+  const plainLineWidths = paragraphs.map(line => estimateNativeTextLineWidth(line, textStyle));
+  // This path historically sized unformatted text. Keep that floor when spans are supplied,
+  // so smaller/script runs cannot shrink a box compared with its previous sizing behavior.
+  const lineWidths = options.spans
+    ? textObjectSpanLines({ text, spans: options.spans }).map((line, index) =>
+      Math.max(plainLineWidths[index] ?? 0, estimateNativeTextSpanLineWidth(line, textStyle)))
+    : plainLineWidths;
   const lineHeightPx = textStyle.fontSizePx * textStyle.lineHeight;
   const naturalContentWidth = Math.max(
-    ...paragraphs.map((line) => estimateNativeTextLineWidth(line, textStyle)),
+    ...lineWidths,
     nativeTextObjectMinimumDimensions.width - nativeTextBoxHorizontalPadding
   );
   const maxWidth = options.maxWidth ?? nativeTextObjectDimensions.width;
@@ -44,8 +53,8 @@ export function nativeTextObjectSizeForText(
     nativeTextObjectMinimumDimensions.width,
     Math.max(nativeTextObjectMinimumDimensions.width, maxWidth)
   );
-  const wrappedLineCount = paragraphs.reduce((count, line) => (
-    count + wrappedNativeTextLineCount(line, textStyle, width - nativeTextBoxHorizontalPadding)
+  const wrappedLineCount = lineWidths.reduce((count, lineWidth) => (
+    count + Math.max(1, Math.ceil(lineWidth / Math.max(1, width - nativeTextBoxHorizontalPadding)))
   ), 0);
   const paragraphSpacing = Math.max(0, paragraphs.length - 1) * textStyle.paragraphSpacingPx;
   const naturalHeight = clamp(
@@ -141,44 +150,35 @@ function normalizeTextLines(text: string): string[] {
   return lines.length > 0 ? lines : [""];
 }
 
-function estimateNativeTextLineWidth(line: string, style: NativeTextStyle): number {
+export function estimateNativeTextLineWidth(line: string, style: NativeTextStyle): number {
   if (line.length === 0) {
     return style.fontSizePx * 0.5;
   }
 
-  return [...line].reduce((width, character, index) => (
-    width + style.fontSizePx * nativeTextCharacterWidthFactor(character)
-      + (index > 0 ? style.letterSpacingPx : 0)
-  ), 0);
+  return estimateNativeTextSpanLineWidth([{ text: line, script: "normal", style: {} }], style);
 }
 
-function wrappedNativeTextLineCount(line: string, style: NativeTextStyle, contentWidth: number): number {
-  const safeContentWidth = Math.max(1, contentWidth);
-  return Math.max(1, Math.ceil(estimateNativeTextLineWidth(line, style) / safeContentWidth));
+/** Matches the shared SVG renderer: scripts are 72% of the object's font size, while normal
+ * spans may override their font size. Letter spacing continues across span boundaries. */
+export function estimateNativeTextSpanLineWidth(spans: readonly TextSpan[], style: NativeTextStyle): number {
+  return measureNativeTextSpanLineWidth(spans, style);
 }
 
-function nativeTextCharacterWidthFactor(character: string): number {
-  if (character === "\t") {
-    return 1.6;
-  }
-
-  if (character.trim().length === 0) {
-    return 0.34;
-  }
-
-  if ("ilI.,:;!|".includes(character)) {
-    return 0.28;
-  }
-
-  if ("mwMW@#%&".includes(character)) {
-    return 0.82;
-  }
-
-  if (/[A-Z0-9]/.test(character)) {
-    return 0.62;
-  }
-
-  return 0.54;
+/** Sizes explicit rendered lines, with no implicit wrapping or maximum-width clamp. The line
+ * box starts at object.y, as in planTextObjectSvg; the box's padding follows its content. */
+export function nativeTextObjectSizeForSpanLines(
+  lines: readonly (readonly TextSpan[])[],
+  style: NativeTextStyle
+): { width: number; height: number; lineBoxHeight: number; contentWidth: number } {
+  const contentWidth = Math.max(0, ...lines.map((line) => estimateNativeTextSpanLineWidth(line, style)));
+  const lineBoxHeight = lines.length * style.fontSizePx * style.lineHeight
+    + Math.max(0, lines.length - 1) * style.paragraphSpacingPx;
+  return {
+    width: roundToTextBoxPixel(Math.max(nativeTextObjectMinimumDimensions.width, contentWidth + nativeTextBoxHorizontalPadding)),
+    height: roundToTextBoxPixel(Math.max(nativeTextObjectMinimumDimensions.height, lineBoxHeight + nativeTextBoxVerticalPadding)),
+    lineBoxHeight,
+    contentWidth
+  };
 }
 
 function roundToTextBoxPixel(value: number): number {

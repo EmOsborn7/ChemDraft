@@ -1,6 +1,7 @@
 import type { SVGProps } from "react";
 
 export type IconName =
+  | "templates"
   | "arrange"
   | "arrangeOval"
   | "arrangeGridLeft"
@@ -15,6 +16,8 @@ export type IconName =
   | "align"
   | "atom"
   | "bond"
+  | "doubleBond"
+  | "tripleBond"
   | "bracket"
   | "charge"
   | "chain"
@@ -33,6 +36,10 @@ export type IconName =
   | "plugin"
   | "redo"
   | "ring"
+  | "ring3"
+  | "ring4"
+  | "ring7"
+  | "ring8"
   | "save"
   | "select"
   | "style"
@@ -58,6 +65,8 @@ export function Icon({ name, ...props }: IconProps) {
   };
 
   switch (name) {
+    case "templates":
+      return <svg {...common}><path d="m8 3 5 3v6l-5 3-5-3V6z" /><rect x="14" y="13" width="7" height="8" rx="1" /><path d="M14 17h7M17.5 13v8" /></svg>;
     case "close":
       return <svg {...common}><path d="m6 6 12 12M18 6 6 18" /></svg>;
     case "nextTab":
@@ -118,6 +127,10 @@ export function Icon({ name, ...props }: IconProps) {
           <path d="M12 4c-4 2.4-4 13.6 0 16" />
         </svg>
       );
+    case "doubleBond":
+      return <svg {...common}><path d="M4 15 18 5M6 19 20 9" /></svg>;
+    case "tripleBond":
+      return <svg {...common}><path d="M3 14 17 4M5 17 19 7M7 20 21 10" /></svg>;
     case "bond":
       return (
         <svg {...common}>
@@ -265,6 +278,17 @@ export function Icon({ name, ...props }: IconProps) {
           <path d="M19 13c-2.2-4.4-9.5-5.4-13-1.4" />
         </svg>
       );
+    case "ring3":
+    case "ring4":
+    case "ring7":
+    case "ring8": {
+      const size = Number(name.slice(4));
+      const points = Array.from({ length: size }, (_, index) => {
+        const angle = -Math.PI / 2 + index * Math.PI * 2 / size;
+        return `${12 + 9 * Math.cos(angle)},${12 + 9 * Math.sin(angle)}`;
+      }).join(" ");
+      return <svg {...common}><polygon points={points} /></svg>;
+    }
     case "ring":
       return (
         <svg {...common}>

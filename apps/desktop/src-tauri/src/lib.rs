@@ -1,4 +1,7 @@
 mod assistant_mcp;
+mod clipboard_formats;
+mod clipboard_images;
+mod clipboard_limits;
 mod dialog_windows;
 mod document_session;
 mod download_diagnosis;
@@ -16,7 +19,11 @@ mod network_error;
 mod network_test_http;
 mod ocsr_engine;
 mod opsin;
+mod panel_full_size;
 mod panel_window;
+mod panel_window_controls;
+mod panel_window_frame;
+mod perf_log;
 mod plugin_package;
 #[cfg(test)]
 mod plugin_panel_acl_tests;
@@ -25,8 +32,16 @@ mod screen_capture;
 mod utility_suspension;
 #[cfg(test)]
 mod utility_suspension_tests;
+mod webview_context_menus;
+#[cfg(test)]
+mod webview_context_menus_tests;
 mod window_drag;
 mod windows_clipboard;
+
+use clipboard_formats::{
+    validate_clipboard_items, ClipboardWriteItem, ClipboardWriteResult, ValidatedClipboardItem,
+};
+use clipboard_images::{ClipboardImageItem, SkippedClipboardImageItem};
 
 use std::{
     collections::HashMap,
@@ -51,6 +66,7 @@ use tauri::{
     webview::PageLoadEvent,
     Emitter, Listener, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use webview_context_menus::disable_default_context_menus;
 
 #[cfg(target_os = "macos")]
 use objc2::MainThreadMarker;
@@ -569,6 +585,8 @@ const TOOLSET_LAYOUT_STATE_FILENAME: &str = "toolbar-state.json";
 const TOOLSET_CUSTOMIZATION_STATE_FILENAME: &str = "toolbar-layout-state.json";
 const DOCUMENT_SESSION_FILENAME: &str = "document-session.json";
 const MENU_COMMAND_IDS: &[&str] = &[
+    "table.insertDialog",
+    "template.insertDialog",
     "edit.undo",
     "edit.redo",
     "edit.selectAll",
@@ -614,11 +632,13 @@ const MENU_COMMAND_IDS: &[&str] = &[
 ];
 
 /// A plugin's contributed menu item, synced from the webview (which owns the plugin registry) so the
-/// native menu can include it. `id` is the `plugin.*` command id, routed back by prefix (ADR-0016).
+/// native menu can include it. Plugin ids route by prefix; core items opt in explicitly (ADR-0016).
 #[derive(Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginMenuItemInput {
     id: String,
+    #[serde(default)]
+    core_routed: bool,
     label: String,
     #[serde(default = "default_plugin_menu_location")]
     location: String,
@@ -632,6 +652,12 @@ fn default_plugin_menu_location() -> String {
 
 fn default_menu_item_enabled() -> bool {
     true
+}
+
+fn is_core_routed_dynamic_menu_command(command_id: &str, items: &[PluginMenuItemInput]) -> bool {
+    items
+        .iter()
+        .any(|item| item.core_routed && item.id == command_id)
 }
 
 fn plugin_menu_items_in<'a>(
@@ -770,6 +796,10 @@ struct ClipboardTextItem {
 struct ClipboardReadPayload {
     types: Vec<String>,
     text_items: Vec<ClipboardTextItem>,
+    image_items: Vec<ClipboardImageItem>,
+    skipped_image_items: Vec<SkippedClipboardImageItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_items: Vec<clipboard_limits::SkippedClipboardItem>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -832,6 +862,8 @@ struct ToolsetLayoutState {
     /// `ensure_main_window_visible`; centering is only the fallback when nothing usable was saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_window: Option<MainWindowGeometry>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    plugin_panels: HashMap<String, panel_window_frame::Frame>,
 }
 
 impl Default for ToolsetLayoutState {
@@ -840,6 +872,7 @@ impl Default for ToolsetLayoutState {
             version: 1,
             toolsets: HashMap::new(),
             main_window: None,
+            plugin_panels: HashMap::new(),
         }
     }
 }
@@ -864,6 +897,8 @@ const MAIN_WINDOW_TITLE_GRAB_PT: f64 = 22.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let perf_enabled = agent_bridge_status().enabled;
+    let perf_log = perf_log::PerfLog::new(perf_enabled);
     let builder = tauri::Builder::default();
 
     // Registered first, as the plugin requires. A second launch forwards its argv here (a document
@@ -895,9 +930,27 @@ pub fn run() {
         }
     }));
 
+    let builder = if perf_enabled {
+        builder.plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("perf-probe")
+                .on_window_ready(|window| {
+                    if let Some(state) = window.app_handle().try_state::<perf_log::PerfLog>() {
+                        state.window_created(window.label());
+                    }
+                })
+                .js_init_script(
+                    "Object.defineProperty(window, '__CHEMDRAFT_PERF_ALLOWED__', { value: true });",
+                )
+                .build(),
+        )
+    } else {
+        builder
+    };
     let builder = builder
+        .manage(perf_log)
         .manage(PendingOpenDocument::default())
         .manage(panel_window::PanelFocusState::default())
+        .manage(panel_full_size::State::default())
         .manage(Engine3dSidecarSessions::default())
         .manage(ocsr_engine::OcsrEngineState::default())
         .manage(external_tools::ExternalToolsState::default())
@@ -935,7 +988,19 @@ pub fn run() {
 
     builder
         .on_page_load(|webview, payload| {
-            if is_plugin_panel_window_label(webview.label())
+            if matches!(payload.event(), PageLoadEvent::Finished) {
+                if let Some(window) = webview.app_handle().get_webview_window(webview.label()) {
+                    let target = window.clone();
+                    if let Err(error) = run_on_main_thread_blocking(&window, move || {
+                        panel_window::install_pointer_guard(&target)
+                    })
+                    .and_then(|result| result)
+                    {
+                        eprintln!("Could not observe window pointer intent: {error}");
+                    }
+                }
+            }
+            if is_input_focus_window_label(webview.label())
                 && matches!(payload.event(), PageLoadEvent::Started)
             {
                 // Reset before the new page can install its focus listener or acquire a lease.
@@ -980,7 +1045,9 @@ pub fn run() {
                 close_key_window(app);
                 return;
             }
-            if is_routed_menu_command(command_id) {
+            if is_routed_menu_command(command_id)
+                || is_core_routed_dynamic_menu_command(command_id, &current_plugin_menu_items(app))
+            {
                 if let Err(error) = emit_menu_command(app, command_id) {
                     eprintln!("Could not route ChemDraft menu command {command_id}: {error}");
                 }
@@ -1015,6 +1082,7 @@ pub fn run() {
                         // ExitRequested. Raise the quit flag so palette destruction that follows
                         // isn't recorded as user closes.
                         APP_QUITTING.store(true, Ordering::SeqCst);
+                        panel_full_size::restore_all(window.app_handle());
                         dialog_windows::dismiss_owned(window.app_handle(), "quit");
                         window.state::<ocsr_engine::OcsrEngineState>().shutdown();
                         external_tools::shutdown(window.app_handle());
@@ -1070,40 +1138,43 @@ pub fn run() {
                     .closed(window.label());
             }
 
+            // Focused is queued by Tao and may describe an older activation by delivery.
+            // Lease ownership is observed synchronously at the OS boundary instead.
+            if is_input_focus_window_label(window.label())
+                && matches!(event, WindowEvent::Destroyed)
+            {
+                panel_window::forget(window);
+            }
+
+            if is_input_focus_window_label(window.label())
+                && matches!(event, WindowEvent::CloseRequested { .. })
+            {
+                panel_window::end_for_hide(window.app_handle(), window.label());
+            }
+
             // A report or analysis window closed natively (Window > Close Window, Cmd+W) must take
             // the same path as its own close control: hidden, not destroyed, and the main document
             // told, so a plugin gets its close signal (AGENTS.md §8a) and a later report re-shows the
             // window. Destroying it left the main window believing it was still open.
             if is_plugin_panel_window_label(window.label()) {
-                // Native resize edges sit outside the DOM's focus hook. Resizing finishes an
-                // input lease too, on both platforms, without changing the resize gesture.
-                if matches!(event, WindowEvent::Resized(_))
-                    && window.is_focused().unwrap_or(false)
-                    && !window.is_minimized().unwrap_or(true)
-                {
-                    if let Some(panel) = window.app_handle().get_webview_window(window.label()) {
-                        panel_window::activation(&panel, false);
+                if matches!(
+                    event,
+                    WindowEvent::Moved(_)
+                        | WindowEvent::Resized(_)
+                        | WindowEvent::CloseRequested { .. }
+                ) {
+                    if let Err(error) = persist_plugin_panel_geometry(window) {
+                        eprintln!(
+                            "Could not persist ChemDraft panel frame {}: {error}",
+                            window.label()
+                        );
                     }
-                    let _ = window.set_focusable(false);
-                    #[cfg(windows)]
-                    if let (Ok(panel), Some(main)) = (
-                        window.hwnd(),
-                        window.app_handle().get_webview_window(MAIN_WINDOW_LABEL),
-                    ) {
-                        let _ = panel_window::return_focus_to_document(panel.0, &main);
-                    }
-                    #[cfg(not(windows))]
-                    let _ = focus_main_document_window_impl(
-                        window.app_handle(),
-                        MainWindowFocusMode::OnlyIfAppActive,
-                    );
                 }
-                // Focused is queued by Tao and may describe an older activation by delivery.
-                // Lease ownership is observed synchronously at the OS boundary instead.
                 if matches!(event, WindowEvent::Destroyed) {
-                    panel_window::forget(window);
+                    panel_full_size::forget(window);
                 }
                 if let WindowEvent::CloseRequested { api, .. } = event {
+                    panel_full_size::will_hide(window);
                     if APP_QUITTING.load(Ordering::SeqCst) {
                         return;
                     }
@@ -1183,6 +1254,7 @@ pub fn run() {
         })
         .setup(|app| {
             let app = app.handle();
+            panel_window::observe_document_pointer_release(app);
             // Programmatic panel removal hides a reusable window, so it produces neither
             // CloseRequested nor Destroyed. Cancel its native restore work via the same bridge
             // messages that clear the report and notify the host of a panel's close control.
@@ -1299,6 +1371,9 @@ pub fn run() {
             open_plugin_panel_window,
             plugin_panel_action_forward,
             plugin_panel_event_forward,
+            set_plugin_panel_full_size,
+            panel_window_controls::hide_plugin_panel_window,
+            panel_window_controls::hide_plugin_panel_from_main,
             register_plugin_panel_input_focus,
             set_plugin_panel_input_focus,
             open_toolset_popover,
@@ -1318,16 +1393,21 @@ pub fn run() {
             quit_prompt_showing,
             cancel_quit,
             close_toolset_popover,
-            set_toolset_window_focusable,
             route_toolset_command,
             sync_plugin_menu_items,
             read_clipboard_payload,
+            write_clipboard_items,
             write_clipboard_text_items,
             write_clipboard_image,
             toggle_spin3d_debugger_window,
             toggle_preferences_window,
             window_logical_position,
             agent_bridge_status,
+            palette_focus_diagnostic,
+            perf_log::perf_log_clock,
+            perf_log::perf_log_append,
+            perf_log::perf_log_complete,
+            perf_log::perf_log_window_state,
             opsin::opsin_status,
             opsin::opsin_name_to_structure,
             naming_engine::naming_engine_status,
@@ -1374,6 +1454,7 @@ pub fn run() {
                     request_quit(app);
                 } else {
                     APP_QUITTING.store(true, Ordering::SeqCst);
+                    panel_full_size::restore_all(app);
                     app.state::<ocsr_engine::OcsrEngineState>().shutdown();
                     external_tools::shutdown(app);
                     assistant_mcp::shutdown();
@@ -1385,6 +1466,7 @@ pub fn run() {
                 // only when the preference is enabled. System termination and preference-off
                 // AppKit quit still reach this final, non-blocking cleanup as before.
                 APP_QUITTING.store(true, Ordering::SeqCst);
+                panel_full_size::restore_all(app);
                 app.state::<ocsr_engine::OcsrEngineState>().shutdown();
                 external_tools::shutdown(app);
                 assistant_mcp::shutdown();
@@ -1449,6 +1531,14 @@ fn ensure_main_window_visible<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(
         None => create_main_window(app)?,
     };
 
+    let target = window.clone();
+    if let Err(error) = run_on_main_thread_blocking(&window, move || {
+        panel_window::install_pointer_guard(&target)
+    })
+    .and_then(|result| result)
+    {
+        eprintln!("Could not observe window pointer intent: {error}");
+    }
     let already_on_screen = window.is_visible().unwrap_or(false);
     main_window_placement::reveal_after_preparation(
         |errors| {
@@ -1509,7 +1599,9 @@ fn configure_document_webview<R: Runtime>(window: &tauri::WebviewWindow<R>) -> R
 }
 
 #[cfg(not(target_os = "macos"))]
-fn configure_document_webview<R: Runtime>(_window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+fn configure_document_webview<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+    // Also covers Tauri's automatically created config window, which skips create_main_window.
+    disable_default_context_menus(window);
     Ok(())
 }
 
@@ -1658,11 +1750,12 @@ fn create_main_window<R: Runtime>(
             .map_err(|error| error.to_string())?
             .build()
             .map_err(|error| error.to_string())?;
+        disable_default_context_menus(&window);
         let _ = window.set_title(&title);
         return Ok(window);
     }
 
-    WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("/".into()))
+    let window = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("/".into()))
         .title(&title)
         .inner_size(1280.0, 820.0)
         .min_inner_size(900.0, 640.0)
@@ -1671,7 +1764,9 @@ fn create_main_window<R: Runtime>(
         // Match the config window: ensure_main_window_visible places it before revealing it.
         .visible(false)
         .build()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    disable_default_context_menus(&window);
+    Ok(window)
 }
 
 /// Window geometry supplied by JS (which owns the toolbar registry) when opening a palette, so Rust
@@ -1947,6 +2042,8 @@ async fn suspend_toolset_windows(
                 {
                     continue;
                 }
+                panel_window::end_for_hide(window.app_handle(), window.label());
+                panel_full_size::before_hide(&window);
                 if let Err(error) = window.hide() {
                     // A failed acquisition must undo its own temporary hides; JS will not release
                     // an acquisition that rejected and will use the in-app fallback instead.
@@ -2383,6 +2480,7 @@ fn close_toolset_window(
     let state = mark_toolset_window_closed(&app, &toolset_id)?;
 
     if let Some(window) = window {
+        panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
     }
 
@@ -2881,7 +2979,7 @@ struct OpenPluginPanelRequest {
     width: Option<f64>,
     height: Option<f64>,
     /// Legacy reveal hint from the host. Opening a panel never grants keyboard focus;
-    /// only an input or deliberate report-text selection may lease it via set_plugin_panel_input_focus.
+    /// only a native pointer activation may grant it, independently of report updates.
     #[serde(default, rename = "focus")]
     _focus: bool,
 }
@@ -2914,6 +3012,21 @@ fn plugin_panel_window_label(panel_id: &str) -> String {
 }
 
 const PLUGIN_PANEL_WINDOW_LABEL_PREFIX: &str = "plugin-panel-";
+
+#[tauri::command]
+async fn set_plugin_panel_full_size(
+    window: tauri::WebviewWindow,
+    enabled: bool,
+    width: f64,
+    height: f64,
+) -> Result<panel_full_size::Status, String> {
+    panel_full_size::authorize(window.label())?;
+    let target = window.clone();
+    run_on_main_thread_blocking(&window, move || {
+        let webview: &tauri::Webview = target.as_ref();
+        panel_full_size::set(&webview.window(), enabled, width, height)
+    })?
+}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2954,7 +3067,49 @@ fn plugin_panel_action_forward(
 }
 
 /// Panel windows cannot emit arbitrary events (including forged authenticated actions).
-/// Preserve their existing non-command bridges through this fixed list only.
+/// Preserve their bridges through this fixed list only. Shortcut forwarding uses the live
+/// host command catalog and the same document dispatcher as toolbars, without moving focus.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginPanelShortcut {
+    command_id: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    meta_key: bool,
+    #[serde(default)]
+    ctrl_key: bool,
+    #[serde(default)]
+    alt_key: bool,
+}
+
+impl PluginPanelShortcut {
+    fn parse(payload: &serde_json::Value) -> Result<Self, String> {
+        let shortcut: Self = serde_json::from_value(payload.clone())
+            .map_err(|_| "Invalid panel shortcut.".to_string())?;
+        if shortcut.key.len() > 256
+            || shortcut.command_id.is_empty()
+            || shortcut.command_id.len() > 4096
+            || shortcut.command_id.trim() != shortcut.command_id
+            || shortcut.command_id == "document.closeTab"
+            || shortcut.command_id.starts_with("document.closeTab.")
+        {
+            return Err("Invalid panel shortcut command.".into());
+        }
+        Ok(shortcut)
+    }
+
+    fn document_command_id(&self) -> String {
+        // The panel already declined local editing. Like other secondary windows, skip any
+        // editor the inactive document webview retained when the user clicked the panel.
+        if is_edit_history_command(&self.command_id) || self.command_id == "edit.selectAll" {
+            format!("{}:forceDocumentHistory", self.command_id)
+        } else {
+            self.command_id.clone()
+        }
+    }
+}
+
 fn validate_plugin_panel_event(
     label: &str,
     event: &str,
@@ -2974,9 +3129,23 @@ fn validate_plugin_panel_event(
             }
             Ok(())
         }
-        "chemdraft://analysis-window-action" => Ok(()),
+        "chemdraft://analysis-window-action" if payload.is_object() => Ok(()),
+        "chemdraft://toolset-command-specs-request" if payload == &serde_json::json!({}) => Ok(()),
+        "chemdraft://plugin-panel-shortcut" => PluginPanelShortcut::parse(payload).map(|_| ()),
         _ => Err("This event cannot be forwarded by a panel window.".into()),
     }
+}
+
+fn authenticated_plugin_panel_event(
+    label: &str,
+    event: &str,
+    mut payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    validate_plugin_panel_event(label, event, &payload)?;
+    if event == "chemdraft://analysis-window-action" {
+        payload["sourceLabel"] = serde_json::Value::String(label.into());
+    }
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -2985,7 +3154,25 @@ fn plugin_panel_event_forward(
     event: String,
     payload: serde_json::Value,
 ) -> Result<(), String> {
-    validate_plugin_panel_event(window.label(), &event, &payload)?;
+    let payload = authenticated_plugin_panel_event(window.label(), &event, payload)?;
+    if event == "chemdraft://plugin-panel-shortcut" {
+        let shortcut = PluginPanelShortcut::parse(&payload)?;
+        let target = window.clone();
+        return run_on_main_thread_blocking(&window, move || {
+            if !utility_windows_suspended()
+                && !panel_window::palette_blocks_forwarded_shortcut(
+                    &shortcut.key,
+                    shortcut.meta_key,
+                    shortcut.ctrl_key,
+                    shortcut.alt_key,
+                )
+                && panel_window::is_active(&target)?
+            {
+                return emit_command_to_main(target.app_handle(), &shortcut.document_command_id());
+            }
+            Ok(())
+        })?;
+    }
     window
         .app_handle()
         .emit_to(MAIN_WINDOW_LABEL, &event, payload)
@@ -2994,11 +3181,19 @@ fn plugin_panel_event_forward(
 
 /// The IPC injects the calling window; it never accepts a caller-selected target label.
 fn validate_plugin_panel_focus_caller(label: &str) -> Result<(), String> {
-    if is_plugin_panel_window_label(label) {
+    if is_input_focus_window_label(label) {
         Ok(())
     } else {
-        Err("Only a ChemDraft panel window may request panel input focus.".into())
+        Err("Only a ChemDraft panel or tool palette window may request input focus.".into())
     }
+}
+
+fn is_input_focus_window_label(label: &str) -> bool {
+    is_plugin_panel_window_label(label)
+        || label.strip_prefix("toolset-").is_some_and(|suffix| {
+            // Popovers share a window between command flyouts and editable colour fields.
+            !suffix.is_empty() && suffix != "tooltip" && suffix != "popover" && suffix != "popover-"
+        })
 }
 
 #[tauri::command]
@@ -3007,8 +3202,198 @@ fn register_plugin_panel_input_focus(window: tauri::WebviewWindow) -> Result<Str
     Ok(panel_window::page_token(&window))
 }
 
+// Keep the existing flat IPC payload compatible.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn set_plugin_panel_input_focus(
+    window: tauri::WebviewWindow,
+    page_token: String,
+    editing: bool,
+    generation: u64,
+    click_sequence: Option<u64>,
+    pointer_before: Option<u64>,
+    return_focus: Option<bool>,
+    select_interaction: Option<bool>,
+) -> Result<bool, String> {
+    validate_plugin_panel_focus_caller(window.label())?;
+    if is_plugin_panel_window_label(window.label()) {
+        return set_plugin_panel_activation(window, page_token, editing, generation);
+    }
+    let result: Result<bool, String> = (|| {
+        validate_plugin_panel_focus_caller(window.label())?;
+        let before = pointer_before.unwrap_or(0);
+        // Register the pending generation BEFORE marshalling acquisition to the UI thread.
+        // A native loss while that operation is queued must cancel it, not be forgotten.
+        let Some(epoch) = panel_window::request(
+            &window,
+            generation,
+            &page_token,
+            editing,
+            select_interaction.unwrap_or(false),
+        ) else {
+            if !editing {
+                palette_focus_log(format_args!(
+                    "hand-back label={} result=skipped reason=stale-page-or-generation",
+                    window.label()
+                ));
+            }
+            panel_window::end_pointer_guard(
+                window.app_handle(),
+                window.label(),
+                panel_window::PointerGuardEnd::Refused,
+                click_sequence,
+                before,
+            );
+            return Ok(false);
+        };
+        let target = window.clone();
+        run_on_main_thread_blocking(&window, move || {
+            if !panel_window::is_current(&target, generation, epoch)
+                || (editing && !panel_window::acquired(&target, generation, epoch, true))
+            {
+                if !editing {
+                    palette_focus_log(format_args!(
+                        "hand-back label={} result=skipped reason=stale-or-deactivated-lease",
+                        target.label()
+                    ));
+                }
+                panel_window::end_pointer_guard(
+                    target.app_handle(),
+                    target.label(),
+                    panel_window::PointerGuardEnd::Refused,
+                    click_sequence,
+                    before,
+                );
+                return Ok(false);
+            }
+            if editing {
+                let result = (|| -> Result<bool, String> {
+                    // An acquisition dispatched before a hide can arrive afterwards.
+                    // Hidden reusable palettes must wait for a fresh visible click.
+                    if !target.is_visible().unwrap_or(false) {
+                        return Ok(false);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        // makeKeyWindow must not lend a background app a persistent lease.
+                        let marker = MainThreadMarker::new()
+                            .ok_or("Panel focus requires the main thread.")?;
+                        if !objc2_app_kit::NSApplication::sharedApplication(marker).isActive() {
+                            return Ok(false);
+                        }
+                        target
+                            .set_focusable(true)
+                            .map_err(|error| error.to_string())?;
+                        let pointer =
+                            target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
+                        let panel = unsafe { pointer.as_ref() }.ok_or_else(|| {
+                            "Could not access native ChemDraft panel window.".to_string()
+                        })?;
+                        // Tao's set_focus activates NSApplication even for a NonactivatingPanel.
+                        // Only make this panel key: an exposed input click or delayed IPC must never
+                        // activate ChemDraft after the user has switched to another application.
+                        panel.makeKeyWindow();
+                    }
+                    #[cfg(windows)]
+                    {
+                        // Never use Tao's force_window_active (including its synthetic Alt fallback).
+                        // Keep NOACTIVATE throughout the lease and drop delayed background requests.
+                        let hwnd = target.hwnd().map_err(|error| error.to_string())?.0;
+                        let already_active = unsafe {
+                            windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+                                == hwnd
+                        };
+                        if !panel_window::focus_if_app_active(hwnd) {
+                            return Ok(false);
+                        }
+                        // A native colour popup may have opened during the click default before
+                        // this IPC runs. Refocusing its WebView2 owner would dismiss the popup.
+                        if already_active {
+                            return Ok(true);
+                        }
+                    }
+                    #[cfg(not(any(target_os = "macos", windows)))]
+                    {
+                        target
+                            .set_focusable(false)
+                            .map_err(|error| error.to_string())?;
+                        target.set_focus().map_err(|error| error.to_string())?;
+                    }
+                    let webview: &tauri::Webview = target.as_ref();
+                    webview.set_focus().map_err(|error| error.to_string())?;
+                    #[cfg(windows)]
+                    return Ok(unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
+                            == target.hwnd().map_err(|error| error.to_string())?.0
+                    });
+                    #[cfg(target_os = "macos")]
+                    return Ok(unsafe {
+                        &*(target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow)
+                    }
+                    .isKeyWindow());
+                    #[cfg(not(any(target_os = "macos", windows)))]
+                    target.is_focused().map_err(|error| error.to_string())
+                })();
+                let held = panel_window::acquired(
+                    &target,
+                    generation,
+                    epoch,
+                    result.as_ref().copied().unwrap_or(false),
+                );
+                panel_window::end_pointer_guard(
+                    target.app_handle(),
+                    target.label(),
+                    if held {
+                        panel_window::PointerGuardEnd::Acquired
+                    } else {
+                        panel_window::PointerGuardEnd::Refused
+                    },
+                    click_sequence,
+                    before,
+                );
+                if !held && panel_window::is_current(&target, generation, epoch) {
+                    let _ = target.set_focusable(false);
+                }
+                result.map(|_| held)
+            } else {
+                panel_window::end_pointer_guard(
+                    target.app_handle(),
+                    target.label(),
+                    panel_window::PointerGuardEnd::Released,
+                    click_sequence,
+                    before,
+                );
+                // Hand back before disabling key eligibility: AppKit can resign a panel as
+                // that flag changes. The helper checks the actual key/foreground window,
+                // current lease and app activation; native loss/cleanup never request it.
+                if let Err(error) = panel_window::return_focus_after_interaction(
+                    &target,
+                    return_focus.unwrap_or(false),
+                ) {
+                    palette_focus_log(format_args!(
+                        "hand-back label={} result=skipped reason=error error={error}",
+                        target.label()
+                    ));
+                    eprintln!("Could not return panel keyboard focus after release: {error}");
+                }
+                target
+                    .set_focusable(false)
+                    .map_err(|error| error.to_string())?;
+                Ok(false)
+            }
+        })?
+    })();
+    palette_focus_log(format_args!(
+        "set_plugin_panel_input_focus label={} editing={editing} returnFocus={} clickSequencePresent={} selectInteraction={} result={result:?}",
+        window.label(),
+        return_focus.unwrap_or(false),
+        click_sequence.is_some(),
+        select_interaction.unwrap_or(false)
+    ));
+    result
+}
+// Plugin panels never enter the palette lease/acquisition/hand-back path above.
+fn set_plugin_panel_activation(
     window: tauri::WebviewWindow,
     page_token: String,
     editing: bool,
@@ -3017,7 +3402,8 @@ async fn set_plugin_panel_input_focus(
     validate_plugin_panel_focus_caller(window.label())?;
     // Register the pending generation BEFORE marshalling acquisition to the UI thread.
     // A native loss while that operation is queued must cancel it, not be forgotten.
-    let Some(epoch) = panel_window::request(&window, generation, &page_token, editing) else {
+    let Some(epoch) = panel_window::request(&window, generation, &page_token, editing, false)
+    else {
         return Ok(false);
     };
     let target = window.clone();
@@ -3027,102 +3413,31 @@ async fn set_plugin_panel_input_focus(
         {
             return Ok(false);
         }
-        if editing {
-            let result = (|| -> Result<bool, String> {
-                #[cfg(target_os = "macos")]
-                {
-                    // makeKeyWindow must not lend a background app a persistent lease.
-                    let marker =
-                        MainThreadMarker::new().ok_or("Panel focus requires the main thread.")?;
-                    if !objc2_app_kit::NSApplication::sharedApplication(marker).isActive() {
-                        return Ok(false);
-                    }
-                    target
-                        .set_focusable(true)
-                        .map_err(|error| error.to_string())?;
-                    let pointer =
-                        target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
-                    let panel = unsafe { pointer.as_ref() }.ok_or_else(|| {
-                        "Could not access native ChemDraft panel window.".to_string()
-                    })?;
-                    // Tao's set_focus activates NSApplication even for a NonactivatingPanel.
-                    // Only make this panel key: an exposed input click or delayed IPC must never
-                    // activate ChemDraft after the user has switched to another application.
-                    panel.makeKeyWindow();
-                }
-                #[cfg(windows)]
-                {
-                    // Never use Tao's force_window_active (including its synthetic Alt fallback).
-                    // Keep NOACTIVATE throughout the lease and drop delayed background requests.
-                    let hwnd = target.hwnd().map_err(|error| error.to_string())?.0;
-                    if !panel_window::focus_if_app_active(hwnd) {
-                        return Ok(false);
-                    }
-                }
-                #[cfg(not(any(target_os = "macos", windows)))]
-                {
-                    target
-                        .set_focusable(false)
-                        .map_err(|error| error.to_string())?;
-                    target.set_focus().map_err(|error| error.to_string())?;
-                }
-                let webview: &tauri::Webview = target.as_ref();
-                webview.set_focus().map_err(|error| error.to_string())?;
-                #[cfg(windows)]
-                return Ok(unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
-                        == target.hwnd().map_err(|error| error.to_string())?.0
-                });
-                #[cfg(target_os = "macos")]
-                return Ok(unsafe {
-                    &*(target.ns_window().map_err(|error| error.to_string())? as *mut NSWindow)
-                }
-                .isKeyWindow());
-                #[cfg(not(any(target_os = "macos", windows)))]
-                target.is_focused().map_err(|error| error.to_string())
-            })();
-            let held = panel_window::acquired(
-                &target,
-                generation,
-                epoch,
-                result.as_ref().copied().unwrap_or(false),
-            );
-            if !held && panel_window::is_current(&target, generation, epoch) {
-                let _ = target.set_focusable(false);
-            }
-            result.map(|_| held)
-        } else {
-            // Tao tracks focus on the parent HWND; WebView2 moves it into a child HWND.
-            // The foreground top-level window remains the authoritative Windows lease owner.
-            #[cfg(windows)]
-            let was_focused = unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow()
-                    == target.hwnd().map_err(|error| error.to_string())?.0
-            };
-            #[cfg(not(windows))]
-            let was_focused = target.is_focused().unwrap_or(false);
-            target
-                .set_focusable(false)
-                .map_err(|error| error.to_string())?;
-            // A blur caused by clicking the document/another app must not raise or activate it.
-            if was_focused {
-                #[cfg(windows)]
-                if let Some(main) = target.app_handle().get_webview_window(MAIN_WINDOW_LABEL) {
-                    panel_window::return_focus_to_document(
-                        target.hwnd().map_err(|error| error.to_string())?.0,
-                        &main,
-                    )?;
-                }
-                #[cfg(not(windows))]
-                focus_main_document_window_impl(
-                    target.app_handle(),
-                    MainWindowFocusMode::OnlyIfAppActive,
-                )?;
-            }
-            Ok(false)
+        if !editing {
+            // Releasing input bookkeeping never moves OS focus. Only a user switching windows
+            // (or closing this one) ends panel activation.
+            return Ok(false);
         }
+        let result = (|| -> Result<bool, String> {
+            // Pointer activation already made the panel key/foreground. A delayed request must
+            // never reclaim it from the document, another panel, or another application.
+            if !panel_window::is_active(&target)? {
+                return Ok(false);
+            }
+            let webview: &tauri::Webview = target.as_ref();
+            webview.set_focus().map_err(|error| error.to_string())?;
+            panel_window::is_active(&target)
+        })();
+        let held = panel_window::acquired(
+            &target,
+            generation,
+            epoch,
+            result.as_ref().copied().unwrap_or(false),
+        );
+        result.map(|_| held)
     })?
 }
+
 /// Sent to the main window with the closed window's label; `listenForNativePanelWindowCloses` in
 /// panelBridge.ts decodes it back to the panel.
 const PLUGIN_PANEL_WINDOW_CLOSED_EVENT: &str = "chemdraft://plugin-panel-window-closed";
@@ -3253,6 +3568,161 @@ mod plugin_panel_label_tests {
     }
 
     #[test]
+    fn panel_shortcut_length_caps_allow_real_catalog_ids_and_long_keyboard_names() {
+        use super::PluginPanelShortcut;
+        let command = format!("plugin.synthetic.{}", "a".repeat(380));
+        let payload = serde_json::json!({"commandId": command, "key": "AudioVolumeDown"});
+        let parsed = PluginPanelShortcut::parse(&payload).unwrap();
+        assert_eq!(parsed.command_id, command);
+        assert_eq!(parsed.key, "AudioVolumeDown");
+        for bad in [
+            serde_json::json!({"commandId": "x".repeat(4097)}),
+            serde_json::json!({"commandId": "edit.undo", "key": "x".repeat(257)}),
+        ] {
+            assert!(PluginPanelShortcut::parse(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn panel_shortcut_bridge_is_typed_caller_bound_and_cannot_close_documents() {
+        use super::validate_plugin_panel_event;
+        let label = plugin_panel_window_label("panel.test");
+        let event = "chemdraft://plugin-panel-shortcut";
+        let undo = serde_json::json!({"commandId": "edit.undo"});
+        assert!(validate_plugin_panel_event(&label, event, &undo).is_ok());
+        assert!(validate_plugin_panel_event("main", event, &undo).is_err());
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"commandId": ""}),
+            serde_json::json!({"commandId": " edit.undo"}),
+            serde_json::json!({"commandId": "document.closeTab"}),
+            serde_json::json!({"commandId": "document.closeTab.other"}),
+            serde_json::json!({"commandId": "edit.undo", "sourceLabel": "main"}),
+        ] {
+            assert!(validate_plugin_panel_event(&label, event, &payload).is_err());
+        }
+        let request = "chemdraft://toolset-command-specs-request";
+        assert!(validate_plugin_panel_event(&label, request, &serde_json::json!({})).is_ok());
+        assert!(validate_plugin_panel_event(&label, request, &undo).is_err());
+    }
+
+    #[test]
+    fn panel_shortcuts_preserve_secondary_window_document_routing() {
+        use super::PluginPanelShortcut;
+        for command in ["edit.undo", "edit.redo", "edit.selectAll"] {
+            let shortcut =
+                PluginPanelShortcut::parse(&serde_json::json!({"commandId": command})).unwrap();
+            let forwarded = shortcut.document_command_id();
+            assert_eq!(forwarded, format!("{command}:forceDocumentHistory"));
+            let already_forwarded =
+                PluginPanelShortcut::parse(&serde_json::json!({"commandId": forwarded})).unwrap();
+            assert_eq!(already_forwarded.document_command_id(), forwarded);
+        }
+        for command in ["tool.bond", "clipboard.copy", "plugin.example.run"] {
+            let shortcut =
+                PluginPanelShortcut::parse(&serde_json::json!({"commandId": command})).unwrap();
+            assert_eq!(shortcut.document_command_id(), command);
+        }
+    }
+
+    #[test]
+    fn plugin_panel_analysis_actions_overwrite_forged_sources() {
+        use super::authenticated_plugin_panel_event;
+        let label = plugin_panel_window_label("v1x61x62");
+        let event = "chemdraft://analysis-window-action";
+        for kind in [
+            "close",
+            "copyMolecularInspector",
+            "changeMolecularInterpretation",
+            "acceptPluginProposal",
+            "rejectPluginProposal",
+            "copySpectrum",
+            "saveBinaryFile",
+            "saveTextFile",
+        ] {
+            for source in [
+                serde_json::Value::Null,
+                serde_json::json!("plugin-panel-other"),
+            ] {
+                let payload = serde_json::json!({"kind": kind, "sourceLabel": source});
+                let forwarded = authenticated_plugin_panel_event(&label, event, payload).unwrap();
+                assert_eq!(forwarded["sourceLabel"], label);
+                assert_eq!(forwarded["kind"], kind);
+            }
+            let forwarded =
+                authenticated_plugin_panel_event(&label, event, serde_json::json!({"kind": kind}))
+                    .unwrap();
+            assert_eq!(forwarded["sourceLabel"], label);
+        }
+        for payload in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(1),
+        ] {
+            assert!(authenticated_plugin_panel_event(&label, event, payload).is_err());
+        }
+    }
+
+    #[test]
+    fn plugin_panel_publications_are_private_and_document_owned() {
+        use super::{plugin_panel_publication_script, PluginPanelPublication};
+        let state = std::sync::Mutex::new(super::utility_suspension::UtilitySuspension::default());
+        let mut publication = PluginPanelPublication {
+            target_label: plugin_panel_window_label("v1x61x62"),
+            event: "chemdraft://analysis-window-snapshot".into(),
+            payload: serde_json::json!({"text": "\"}); alert('untrusted'); //"}),
+        };
+        for source in ["plugin-panel-other", "preferences", "toolset-core-main"] {
+            assert!(plugin_panel_publication_script(source, &publication, &state).is_err());
+        }
+        let script = plugin_panel_publication_script("main", &publication, &state).unwrap();
+        assert!(script.starts_with("window.dispatchEvent(new CustomEvent("));
+        assert!(script.contains("JSON.parse("));
+        assert!(!script.contains("__TAURI_EVENT_PLUGIN_INTERNALS__"));
+        for event in [
+            "chemdraft://plugin-panel-report",
+            "chemdraft://plugin-panel-report-cleared",
+            "chemdraft://plugin-panel-staleness",
+            "chemdraft://analysis-window-snapshot",
+            "chemdraft://analysis-window-action-result",
+            "chemdraft://plugin-panel-action-result",
+        ] {
+            publication.event = event.into();
+            assert!(plugin_panel_publication_script("main", &publication, &state).is_ok());
+        }
+        publication.event = "chemdraft://analysis-window-action".into();
+        assert!(plugin_panel_publication_script("main", &publication, &state).is_err());
+        publication.event = "chemdraft://analysis-window-snapshot".into();
+        publication.target_label = "main".into();
+        assert!(plugin_panel_publication_script("main", &publication, &state).is_err());
+    }
+
+    #[test]
+    fn plugin_panel_private_tombstones_cancel_suspended_restores() {
+        use super::{
+            dispatch_plugin_panel_open, plugin_panel_publication_script,
+            resume_deferred_plugin_panels, PluginPanelPublication,
+        };
+        let state = std::sync::Mutex::new(super::utility_suspension::UtilitySuspension::default());
+        let label = plugin_panel_window_label("v1x61x62");
+        state.lock().unwrap().begin([], None);
+        let request = serde_json::from_value(serde_json::json!({
+            "panelId": "v1x61x62", "title": "Result"
+        }))
+        .unwrap();
+        dispatch_plugin_panel_open(&state, request, false, |_| panic!("suspended")).unwrap();
+        let publication = PluginPanelPublication {
+            target_label: label,
+            event: super::PLUGIN_PANEL_REPORT_CLEARED_EVENT.into(),
+            payload: serde_json::json!({"pluginId": "a", "panelId": "b", "revision": 2}),
+        };
+        plugin_panel_publication_script("main", &publication, &state).unwrap();
+        state.lock().unwrap().release(false);
+        resume_deferred_plugin_panels(&state, || false, |_| panic!("removed panel restored"))
+            .unwrap();
+    }
+
+    #[test]
     fn suspended_panel_opens_skip_builder_and_duplicates_build_once_after_last_resume() {
         use super::{dispatch_plugin_panel_open, resume_deferred_plugin_panels};
         let state = std::sync::Mutex::new(super::utility_suspension::UtilitySuspension::default());
@@ -3371,10 +3841,27 @@ mod plugin_panel_label_tests {
     }
 
     #[test]
-    fn input_focus_command_accepts_only_its_injected_panel_caller() {
+    fn input_focus_command_accepts_only_its_injected_panel_or_palette_caller() {
         use super::validate_plugin_panel_focus_caller;
         assert!(validate_plugin_panel_focus_caller(&plugin_panel_window_label("panel.a")).is_ok());
-        for label in ["main", "toolset-core-main", "preferences", "plugin-panel-"] {
+        for label in [
+            "toolset-core-main",
+            "toolset-core-drawnStructureSettings",
+            "toolset-popover-core-art",
+        ] {
+            assert!(validate_plugin_panel_focus_caller(label).is_ok(), "{label}");
+        }
+        for label in [
+            "",
+            "main",
+            "dialog-main-export-1",
+            "preferences",
+            "plugin-panel-",
+            "toolset-",
+            "toolset-tooltip",
+            "toolset-popover",
+            "toolset-popover-",
+        ] {
             assert!(
                 validate_plugin_panel_focus_caller(label).is_err(),
                 "{label}"
@@ -3505,13 +3992,65 @@ mod plugin_panel_label_tests {
     }
 }
 
-/// Host-owned analysis windows. Plugin reports and built-in Analyze surfaces share this one
-/// transport; each window is parented to the main document rather than being globally floating.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginPanelPublication {
+    target_label: String,
+    event: String,
+    payload: serde_json::Value,
+}
+
+fn plugin_panel_publication_script(
+    source: &str,
+    publication: &PluginPanelPublication,
+    suspension: &Mutex<utility_suspension::UtilitySuspension>,
+) -> Result<String, String> {
+    if source != MAIN_WINDOW_LABEL || !is_plugin_panel_window_label(&publication.target_label) {
+        return Err("Only the document window may publish to a panel.".into());
+    }
+    match publication.event.as_str() {
+        "chemdraft://plugin-panel-report"
+        | "chemdraft://plugin-panel-report-cleared"
+        | "chemdraft://plugin-panel-staleness"
+        | "chemdraft://analysis-window-snapshot"
+        | "chemdraft://analysis-window-action-result"
+        | "chemdraft://plugin-panel-action-result" => {}
+        _ => return Err("This event cannot be published to a panel.".into()),
+    }
+    let event = serde_json::to_string(&publication.event).map_err(|error| error.to_string())?;
+    let payload = serde_json::to_string(&publication.payload).map_err(|error| error.to_string())?;
+    if publication.event == PLUGIN_PANEL_REPORT_CLEARED_EVENT {
+        cancel_plugin_panel_restore(suspension, &payload);
+    }
+    let payload = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "window.dispatchEvent(new CustomEvent({event}, {{ detail: JSON.parse({payload}) }}));"
+    ))
+}
+
+/// Host-owned analysis windows share their existing document-window grant for private publications.
+/// Publication mode delivers content without opening or revealing a window.
 #[tauri::command]
 async fn open_plugin_panel_window(
     app: tauri::AppHandle,
-    request: OpenPluginPanelRequest,
+    window: tauri::WebviewWindow,
+    request: Option<OpenPluginPanelRequest>,
+    publication: Option<PluginPanelPublication>,
 ) -> Result<(), String> {
+    if let Some(publication) = publication {
+        if request.is_some() {
+            return Err("Cannot open and publish a panel in the same request.".into());
+        }
+        let script =
+            plugin_panel_publication_script(window.label(), &publication, &UTILITY_SUSPENSION)?;
+        // Tauri's emit_to also reaches Any listeners in other webviews. Evaluate only in the
+        // recipient so proposal snapshots and replies never enter that shared event bus.
+        if let Some(target) = app.get_webview_window(&publication.target_label) {
+            target.eval(script).map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    let request = request.ok_or("Missing plugin panel request.")?;
     if !is_valid_plugin_storage_id(&request.panel_id) {
         return Err(format!("Invalid plugin panel id \"{}\".", request.panel_id));
     }
@@ -3650,6 +4189,20 @@ fn build_or_show_plugin_panel<R: Runtime>(
                 restore_utility_in_document_group(&target)
             })?;
         }
+        if !window.is_visible().unwrap_or(true) {
+            // Reopening a reusable window also checks for a monitor disconnected since close.
+            // Prompt restoration above deliberately leaves its live frame and ordering alone.
+            let webview: &tauri::Webview<R> = window.as_ref();
+            let live = current_plugin_panel_geometry(&webview.window());
+            let (_, _, placement) = plugin_panel_initial_geometry(app, &request, live);
+            if let Some(placement) = placement {
+                let target = window.clone();
+                run_on_main_thread_blocking(&window, move || {
+                    let webview: &tauri::Webview<R> = target.as_ref();
+                    panel_full_size::apply(&webview.window(), placement)
+                })??;
+            }
+        }
         // `show()` makes the window key on macOS (tao's `set_visible` is makeKeyAndOrderFront), so
         // an automatic re-show leaves visibility to `configure_analysis_window`, which only orders
         // the window front.
@@ -3660,9 +4213,11 @@ fn build_or_show_plugin_panel<R: Runtime>(
         return Ok(());
     }
 
-    let width = request.width.unwrap_or(380.0);
-    let height = request.height.unwrap_or(520.0);
-    let position = analysis_window_initial_position(app, width, height);
+    let saved = load_toolset_layout_state(app)
+        .plugin_panels
+        .get(&request.panel_id)
+        .cloned();
+    let (width, height, placement) = plugin_panel_initial_geometry(app, &request, saved);
     // `.parent` is an owner window on Windows (no taskbar entry, stays above the document), the
     // same relationship utility_window_builder gives the palettes.
     let mut builder = WebviewWindowBuilder::new(
@@ -3672,12 +4227,15 @@ fn build_or_show_plugin_panel<R: Runtime>(
     )
     .title(format!("ChemDraft {}", request.title))
     .inner_size(width, height)
-    .min_inner_size(280.0, 200.0)
+    .min_inner_size(
+        panel_window_frame::MIN_WIDTH,
+        panel_window_frame::MIN_HEIGHT,
+    )
     .accept_first_mouse(true)
     .focusable(false)
     // Windows uses this creation trait for EVERY later show, not just the initial reveal.
     .focused(presentation.focused_on_build)
-    .visible(presentation.visible_on_build)
+    .visible(presentation.visible_on_build && placement.is_none())
     .resizable(true)
     .decorations(false)
     // Overlapping panels need a visible edge, matching the palette popover's native shadow.
@@ -3690,12 +4248,22 @@ fn build_or_show_plugin_panel<R: Runtime>(
             builder = builder.parent(&main).map_err(|error| error.to_string())?;
         }
     }
-    if let Some(position) = position {
-        builder = builder.position(position.x, position.y);
-    }
     let window = builder.build().map_err(|error| error.to_string())?;
+    disable_default_context_menus(&window);
     let target = window.clone();
     let installed = run_on_main_thread_blocking(&window, move || {
+        #[cfg(target_os = "macos")]
+        {
+            // Finalize the one-time nonactivation style before placing the panel and adding
+            // its resize overlay. Later reveals see the same style and skip the setter.
+            let pointer = target.ns_window().map_err(|error| error.to_string())?;
+            let native = unsafe { &*(pointer as *const NSWindow) };
+            configure_analysis_window_traits(&target, native)?;
+        }
+        if let Some(placement) = placement {
+            let webview: &tauri::Webview<R> = target.as_ref();
+            panel_full_size::apply(&webview.window(), placement)?;
+        }
         panel_window::install_resize_hit_test(&target)
     })
     .and_then(|result| result);
@@ -3709,8 +4277,92 @@ fn build_or_show_plugin_panel<R: Runtime>(
             restore_utility_in_document_group(&target)
         })?;
     }
+    if !cfg!(target_os = "macos") {
+        window.show().map_err(|error| error.to_string())?;
+    }
     configure_analysis_window(&window)?;
     Ok(())
+}
+
+fn current_plugin_panel_geometry<R: Runtime>(
+    window: &tauri::Window<R>,
+) -> Option<panel_window_frame::Frame> {
+    let position = window.outer_position().ok()?;
+    let size = window.inner_size().ok()?;
+    let monitor =
+        panel_window_frame::Monitor::from_native(&window.current_monitor().ok().flatten()?);
+    panel_window_frame::Frame::from_physical(
+        (position.x, position.y),
+        (size.width, size.height),
+        &monitor,
+    )
+}
+
+fn plugin_panel_initial_geometry<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    request: &OpenPluginPanelRequest,
+    saved: Option<panel_window_frame::Frame>,
+) -> (f64, f64, Option<panel_window_frame::Placement>) {
+    let (width, height) = panel_window_frame::default_size(request.width, request.height);
+    let placement = saved
+        .as_ref()
+        .and_then(|frame| plugin_panel_saved_placement(app, frame))
+        .or_else(|| plugin_panel_default_placement(app, width, height));
+    (width, height, placement)
+}
+
+fn plugin_panel_saved_placement<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    frame: &panel_window_frame::Frame,
+) -> Option<panel_window_frame::Placement> {
+    let monitors = app.available_monitors().unwrap_or_default();
+    let monitors: Vec<_> = monitors
+        .iter()
+        .map(panel_window_frame::Monitor::from_native)
+        .collect();
+    frame.restore(&monitors)
+}
+
+fn plugin_panel_restore_geometry<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    saved: &panel_window_frame::Frame,
+) -> Option<(panel_window_frame::Placement, panel_window_frame::Frame)> {
+    let monitors = app.available_monitors().unwrap_or_default();
+    let monitors: Vec<_> = monitors
+        .iter()
+        .map(panel_window_frame::Monitor::from_native)
+        .collect();
+    if let Some(placement) = saved.restore_normal(&monitors) {
+        let monitor = monitors.iter().find(|m| m.identity == saved.monitor)?;
+        let frame =
+            panel_window_frame::Frame::from_physical(placement.position, placement.size, monitor)?;
+        return Some((placement, frame));
+    }
+    let (width, height) = panel_window_frame::default_size(None, None);
+    let placement = plugin_panel_default_placement(app, width, height)?;
+    let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    let monitor = panel_window_frame::Monitor::from_native(&main.current_monitor().ok().flatten()?);
+    let frame =
+        panel_window_frame::Frame::from_physical(placement.position, placement.size, &monitor)?;
+    Some((placement, frame))
+}
+
+fn plugin_panel_default_placement<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    width: f64,
+    height: f64,
+) -> Option<panel_window_frame::Placement> {
+    let position = analysis_window_initial_position(app, width, height)?;
+    let main = app.get_webview_window(MAIN_WINDOW_LABEL)?;
+    let monitor = main.current_monitor().ok().flatten()?;
+    let scale = monitor.scale_factor();
+    let position = position.to_physical::<i32>(scale);
+    let size = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+    Some(panel_window_frame::Placement {
+        position: (position.x, position.y),
+        size: (size.width, size.height),
+        scale,
+    })
 }
 
 fn analysis_window_initial_position<R: Runtime>(
@@ -3886,20 +4538,33 @@ fn configure_analysis_window_on_main_thread<R: Runtime>(
 
 #[cfg(target_os = "macos")]
 fn configure_analysis_window_traits<R: Runtime>(
-    window: &tauri::WebviewWindow<R>,
+    _window: &tauri::WebviewWindow<R>,
     ns_window: &NSWindow,
 ) -> Result<(), String> {
     // Normal level + a native parent keeps this movable/resizable, non-activating panel with its
-    // document. Focusability is enabled only for an input's temporary keyboard-focus lease.
+    // document. Only native pointer activation enables keyboard focus.
     ns_window.setLevel(NSNormalWindowLevel);
     ns_window.setHidesOnDeactivate(false);
     ns_window.setCanHide(true);
     ns_window.setIgnoresMouseEvents(false);
-    ns_window.setStyleMask(panel_window::macos_style(ns_window.styleMask()));
+    // Resizable is already set by the builder. Even an unchanged style setter can rebuild
+    // the content hierarchy, so configure only the missing nonactivation bit, once.
+    panel_window::configure_macos_style(ns_window.styleMask(), |style| {
+        let responder = ns_window.firstResponder();
+        ns_window.setStyleMask(style);
+        // AppKit can reset keyboard routing during a style change. Keep Wry's responder,
+        // without taking key status or asking tao to focus its original, detached NSView.
+        if let Some(responder) = responder {
+            let current = ns_window
+                .firstResponder()
+                .is_some_and(|current| std::ptr::eq(&*current, &*responder));
+            if !current {
+                ns_window.makeFirstResponder(Some(&responder));
+            }
+        }
+    });
     ns_window.setAcceptsMouseMovedEvents(true);
-    window
-        .set_focusable(false)
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 /// Makes `child` a child window of the main document window again, if it is not one already.
@@ -4053,6 +4718,7 @@ fn observe_hide_for_document_key_restore<R: Runtime>(app: tauri::AppHandle<R>) {
     let center = NSNotificationCenter::defaultCenter();
     let hide_app = app.clone();
     let on_hide = block2::RcBlock::new(move |_: NonNull<NSNotification>| {
+        // Hiding the app keeps enlarged panels enlarged; quit and panel hide/close restore them.
         let was_key = main_ns_window(&hide_app).is_some_and(|main| main.isKeyWindow());
         if let Ok(mut state) = DOCUMENT_KEY_AFTER_UNHIDE.lock() {
             state.will_hide(was_key);
@@ -4090,6 +4756,16 @@ fn observe_hide_for_document_key_restore<R: Runtime>(app: tauri::AppHandle<R>) {
     }
 }
 
+/// Preserve document focus for E/Z mouse opens; permit an explicit focus lease for keyboard
+/// opens and the shared color picker's text fields.
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ToolsetPopoverFocusMode {
+    Preserve,
+    #[default]
+    Focus,
+}
+
 /// Opens (or repositions + reshows) a small floating popover window for a palette — e.g. the
 /// Art color picker. A webview can't paint outside its own window, so palette popovers that are
 /// taller/wider than the little palette window clip at its edge; giving the popover its OWN
@@ -4105,8 +4781,10 @@ async fn open_toolset_popover(
     kind: String,
     x: f64,
     y: f64,
+    focus_mode: Option<ToolsetPopoverFocusMode>,
 ) -> Result<(), String> {
     let label = toolset_popover_window_label(&toolset_id);
+    let focus_mode = effective_toolset_popover_focus_mode(&label, focus_mode.unwrap_or_default());
     let _creation = lock_window_creation()?;
     if utility_windows_suspended() {
         return Ok(());
@@ -4122,12 +4800,15 @@ async fn open_toolset_popover(
         // can nudge an NSWindow's frame, and the first open after a prewarm used to land the
         // popover away from its anchor. An explicit LogicalPosition set is the final word in
         // both the warm and cold paths.
-        configure_toolset_popover_window(&window, false)?;
+        configure_toolset_popover_window(&window, focus_mode)?;
+        window
+            .set_title(toolset_popover_title(&label, &kind))
+            .map_err(|error| error.to_string())?;
         set_window_global_logical_position(&window, x, y)?;
         return Ok(());
     }
 
-    build_toolset_popover_window(&app, &label, &toolset_id, &kind, false, x, y)
+    build_toolset_popover_window(&app, &label, &toolset_id, &kind, false, (x, y), focus_mode)
 }
 
 /// Builds a palette's popover window hidden, before any flyout/color press needs it. The cold build
@@ -4144,7 +4825,15 @@ async fn prewarm_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> R
         return Ok(());
     }
 
-    build_toolset_popover_window(&app, &label, &toolset_id, "artColor", true, 0.0, 0.0)
+    build_toolset_popover_window(
+        &app,
+        &label,
+        &toolset_id,
+        "artColor",
+        true,
+        (0.0, 0.0),
+        effective_toolset_popover_focus_mode(&label, ToolsetPopoverFocusMode::Focus),
+    )
 }
 
 /// Builds the shared tooltip window hidden, once a palette has painted. It used to be built in
@@ -4158,76 +4847,137 @@ async fn prewarm_toolset_tooltip(app: tauri::AppHandle) -> Result<(), String> {
     build_toolset_tooltip_window(&app)
 }
 
+fn toolset_popover_title(label: &str, kind: &str) -> &'static str {
+    if label == toolset_popover_window_label("core.bondStereo") {
+        "E/Z not specified"
+    } else if kind == "artColor" {
+        "ChemDraft color picker"
+    } else {
+        "ChemDraft tools"
+    }
+}
+
+/// The actual builder configuration is also the test seam for native creation.
+/// `parent` is an owner on Windows (not a child HWND). Keep macOS popovers unparented:
+/// AppKit child windows can reveal hidden/prewarmed windows and alter their level/Spaces behavior.
+fn toolset_popover_window_config(
+    label: &str,
+    toolset_id: &str,
+    kind: &str,
+    prewarm: bool,
+    focus_mode: ToolsetPopoverFocusMode,
+) -> tauri::utils::config::WindowConfig {
+    let prewarm_param = if prewarm { "&prewarm=1" } else { "" };
+    tauri::utils::config::WindowConfig {
+        label: label.into(),
+        url: WebviewUrl::App(
+            format!("/?window=toolsetPopover&toolsetId={toolset_id}&kind={kind}{prewarm_param}")
+                .into(),
+        ),
+        title: toolset_popover_title(&toolset_popover_window_label(toolset_id), kind).into(),
+        #[cfg(windows)]
+        parent: Some(MAIN_WINDOW_LABEL.into()),
+        #[cfg(not(windows))]
+        parent: None,
+        width: 320.0,
+        height: 300.0,
+        min_width: Some(96.0),
+        min_height: Some(56.0),
+        accept_first_mouse: true,
+        // Tao creates WS_EX_NOACTIVATE when focusable is false. Keyboard opens
+        // and the color picker's text fields still explicitly permit focus.
+        focusable: focus_mode == ToolsetPopoverFocusMode::Focus,
+        // Also selects SW_SHOWNOACTIVATE for Tao's Windows show path.
+        focus: false,
+        resizable: false,
+        decorations: false,
+        skip_taskbar: true,
+        // Both cold and prewarmed windows reveal only after their content is ready.
+        visible: false,
+        ..Default::default()
+    }
+}
+
 fn build_toolset_popover_window(
     app: &tauri::AppHandle,
     label: &str,
     toolset_id: &str,
     kind: &str,
     prewarm: bool,
-    x: f64,
-    y: f64,
+    position: (f64, f64),
+    focus_mode: ToolsetPopoverFocusMode,
 ) -> Result<(), String> {
-    let prewarm_param = if prewarm { "&prewarm=1" } else { "" };
-    let window = utility_window_builder(
-        WebviewWindowBuilder::new(
-            app,
-            label,
-            WebviewUrl::App(
-                format!(
-                    "/?window=toolsetPopover&toolsetId={toolset_id}&kind={kind}{prewarm_param}"
-                )
-                .into(),
-            ),
-        ),
-        app,
-    )
-    .title("ChemDraft color picker")
-    // The JS side sizes this to the popover content (setCurrentWindowLogicalSize); start with a
-    // sensible color-picker footprint so the first paint isn't jarringly wrong.
-    .inner_size(320.0, 300.0)
-    .min_inner_size(96.0, 56.0)
-    .accept_first_mouse(true)
-    // Unlike the button-only palettes, the color picker has hex/RGB text inputs, so its window
-    // must be able to take keyboard focus. It stays a NonactivatingPanel (see below), so
-    // becoming key doesn't yank the app's activation away from the document.
-    .focusable(true)
-    .resizable(false)
-    .decorations(false)
-    .skip_taskbar(true)
-    // Build hidden on the FIRST open so the cold webview doesn't flash a blank 320x300 window while
-    // it loads. The popover reveals itself (getCurrentWindow().show()) once it has painted its real
-    // content at the right size — see PalettePopoverWindow.
-    .visible(false)
-    .position(x, y)
-    .build()
-    .map_err(|error| error.to_string())?;
+    let config = toolset_popover_window_config(label, toolset_id, kind, prewarm, focus_mode);
+    let window = WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|error| error.to_string())?
+        .position(position.0, position.1)
+        .build()
+        .map_err(|error| error.to_string())?;
 
-    configure_toolset_popover_window(&window, false)?;
+    disable_default_context_menus(&window);
+    configure_toolset_popover_window(&window, focus_mode)?;
+    install_toolset_input_focus(&window)?;
     // Re-assert the anchor as the FINAL step, mirroring the warm path: panel configuration
     // can nudge the frame, and builder-time positioning has proven less trustworthy than an
     // explicit post-build LogicalPosition set (first opens landed away from the anchor).
     // Prewarm builds pass (0, 0), where this is harmless — the warm open repositions.
-    set_window_global_logical_position(&window, x, y)?;
+    set_window_global_logical_position(&window, position.0, position.1)?;
     Ok(())
 }
 
-/// Same floating NonactivatingPanel treatment as the palettes, but focusable so the color
-/// picker's text inputs work. `configure_toolset_utility_window` force-sets focusable(false),
-/// so re-assert focusable(true) afterwards.
+/// Reapply the requested focus policy on every reuse, including keyboard → mouse.
+/// Only E/Z keyboard opens use Focus; palette colour fields borrow the keyboard through
+/// the guarded input lease instead (see `effective_toolset_popover_focus_mode`).
 fn configure_toolset_popover_window<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
-    order_front: bool,
+    focus_mode: ToolsetPopoverFocusMode,
 ) -> Result<(), String> {
-    configure_toolset_utility_window(window, order_front)?;
-    window
-        .set_focusable(true)
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    let target = window.clone();
+    run_on_main_thread_blocking(window, move || {
+        configure_toolset_utility_window(&target, false)?;
+        target
+            .set_focusable(focus_mode == ToolsetPopoverFocusMode::Focus)
+            .map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
+            };
+            let hwnd = target.hwnd().map_err(|error| error.to_string())?.0;
+            // SAFETY: this is a live owned window, on its UI thread, after Tao's
+            // focusability update. Preserve unrelated styles; never remove ownership.
+            unsafe {
+                SetWindowLongPtrW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    toolset_popover_extended_style(
+                        GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+                        focus_mode,
+                    ),
+                );
+            }
+        }
+        Ok(())
+    })?
+}
+
+#[cfg(windows)]
+fn toolset_popover_extended_style(style: isize, focus_mode: ToolsetPopoverFocusMode) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    };
+    let style = (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+    if focus_mode == ToolsetPopoverFocusMode::Preserve {
+        style | WS_EX_NOACTIVATE as isize
+    } else {
+        style & !(WS_EX_NOACTIVATE as isize)
+    }
 }
 
 #[tauri::command]
 fn close_toolset_popover(app: tauri::AppHandle, toolset_id: String) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&toolset_popover_window_label(&toolset_id)) {
+        panel_window::end_for_hide(window.app_handle(), window.label());
         window.hide().map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -4237,23 +4987,19 @@ fn toolset_popover_window_label(toolset_id: &str) -> String {
     format!("toolset-popover-{}", toolset_id.replace('.', "-"))
 }
 
-/// Toggle a palette window's focusability. Palettes ship `focusable(false)` (they never steal key
-/// status — see `toolset_window_focusable`), but the in-place customize gallery's search field needs
-/// keyboard focus. Mirrors the popover precedent: `configure_toolset_popover_window` re-asserts
-/// `set_focusable(true)` on a NonactivatingPanel and the color-picker hex input proves a text field
-/// then receives input without the panel activating the app. The palette re-asserts `false` on exit.
-#[tauri::command]
-fn set_toolset_window_focusable(
-    app: tauri::AppHandle,
-    toolset_id: String,
-    focusable: bool,
-) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(&toolset_window_label(&toolset_id)) {
-        window
-            .set_focusable(focusable)
-            .map_err(|error| error.to_string())?;
+/// Palette popovers (colour pickers and flyouts) never take key status when they open: their
+/// text fields borrow the keyboard through the guarded input lease (`install_toolset_input_focus`),
+/// like palette settings. Only the E/Z popover honours a keyboard open's request for real focus,
+/// because its choices are buttons, which never lease.
+fn effective_toolset_popover_focus_mode(
+    label: &str,
+    requested: ToolsetPopoverFocusMode,
+) -> ToolsetPopoverFocusMode {
+    if label == toolset_popover_window_label("core.bondStereo") {
+        requested
+    } else {
+        ToolsetPopoverFocusMode::Preserve
     }
-    Ok(())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -4268,12 +5014,18 @@ struct WindowLogicalPosition {
 /// palette-local offset, as if the palette sat at the origin — and every later call
 /// was fine. Native reads have no warm-up; the window server is the source of truth.
 #[tauri::command]
-fn window_logical_position(window: tauri::WebviewWindow) -> Result<WindowLogicalPosition, String> {
+fn window_logical_position(
+    window: tauri::WebviewWindow,
+    content_origin: Option<bool>,
+) -> Result<WindowLogicalPosition, String> {
     let scale = window.scale_factor().map_err(|error| error.to_string())?;
-    let position = window
-        .outer_position()
-        .map_err(|error| error.to_string())?
-        .to_logical::<f64>(scale);
+    let position = if content_origin.unwrap_or(false) {
+        window.inner_position()
+    } else {
+        window.outer_position()
+    }
+    .map_err(|error| error.to_string())?
+    .to_logical::<f64>(scale);
     Ok(WindowLogicalPosition {
         x: position.x,
         y: position.y,
@@ -4288,6 +5040,14 @@ fn start_window_drag(window: tauri::WebviewWindow, grab_x: f64, grab_y: f64) -> 
 
 const TOOLSET_TOOLTIP_WINDOW_LABEL: &str = "toolset-tooltip";
 
+/// Read current native visibility rather than keeping a second open/closed ledger: prewarming,
+/// click-away, app deactivation, and closing a palette can all hide a popover independently.
+fn toolset_tooltip_suppressed<'a>(windows: impl IntoIterator<Item = (&'a str, bool)>) -> bool {
+    windows
+        .into_iter()
+        .any(|(label, visible)| label.starts_with("toolset-popover-") && visible)
+}
+
 /// Place the (pre-built, hidden) tooltip window at global-logical `x`/`y` (when given) and order it
 /// front. The tooltip webview invokes this after sizing itself: palettes and popovers become visible
 /// through this same NSWindow::orderFront path, whereas Tauri's JS `show()` did not reliably display
@@ -4299,6 +5059,18 @@ fn show_toolset_tooltip_window(
     y: Option<f64>,
 ) -> Result<(), String> {
     if utility_windows_suspended() {
+        return Ok(());
+    }
+    // Both reveal commands are synchronous on the main thread. A delayed hover request must
+    // recheck here, immediately before showing, even if its measurement began before the popover.
+    // Hidden/prewarmed popovers do not block the next hover after the last popover closes.
+    let windows = app.webview_windows();
+    // A window being torn down may have unreadable visibility; it must not suppress tooltips.
+    if toolset_tooltip_suppressed(
+        windows
+            .iter()
+            .map(|(label, window)| (label.as_str(), window.is_visible().unwrap_or(false))),
+    ) {
         return Ok(());
     }
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
@@ -4357,15 +5129,47 @@ fn raise_among_owned_windows<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Re
 }
 
 /// Reveal the calling palette popover once it has painted its content at the right size, and put it
-/// above the palette it belongs to. The popover used to reveal itself with the JS window `show()`,
-/// which on Windows left it underneath its palette whenever the two overlapped (the Art toolbar's
-/// colour picker opens over the toolbar's own lower rows). `show()` here is the same call that JS
-/// made, so macOS behaves exactly as before.
+/// above the palette it belongs to. A mouse-opened E/Z popover must not become key/active.
 #[tauri::command]
-fn show_toolset_popover_window(window: tauri::WebviewWindow) -> Result<(), String> {
+fn show_toolset_popover_window(
+    window: tauri::WebviewWindow,
+    focus_mode: Option<ToolsetPopoverFocusMode>,
+    kind: Option<String>,
+) -> Result<(), String> {
+    if !window.label().starts_with("toolset-popover-") {
+        return Err("Only toolset popovers may reveal popover content".into());
+    }
     if utility_windows_suspended() {
         return Ok(());
     }
+    // The page owns the live content, including a prewarmed/reused Art window switching
+    // between its colour picker and command flyouts. Titles are fixed native strings.
+    if let Some(kind) = kind {
+        window
+            .set_title(toolset_popover_title(window.label(), &kind))
+            .map_err(|error| error.to_string())?;
+    }
+    let focus_mode =
+        effective_toolset_popover_focus_mode(window.label(), focus_mode.unwrap_or_default());
+    configure_toolset_popover_window(&window, focus_mode)?;
+    // Remove a tooltip already on screen before revealing this popover on either platform.
+    // Subsequent tooltip-show commands are blocked by its native visibility until it hides.
+    // Best-effort: a tooltip-hide failure must not prevent opening the requested popover.
+    let _ = hide_toolset_tooltip_window(window.app_handle().clone());
+    #[cfg(target_os = "macos")]
+    if focus_mode == ToolsetPopoverFocusMode::Preserve {
+        // TaoWindow subclasses NSWindow; focusable(false) guards canBecomeKeyWindow.
+        // Use orderFront rather than show's makeKeyAndOrderFront to keep the document key.
+        let target = window.clone();
+        run_on_main_thread_blocking(&window, move || {
+            configure_toolset_utility_window_on_main_thread(&target, true)
+        })??;
+    } else {
+        window.show().map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    // `focus: false` at creation makes Tao use SW_SHOWNOACTIVATE on Windows.
+    // Keep its visibility state in sync (a raw ShowWindow alone breaks later hide()).
     window.show().map_err(|error| error.to_string())?;
     raise_among_owned_windows(&window)
 }
@@ -4517,6 +5321,7 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
     .build()
     .map_err(|error| error.to_string())?;
 
+    disable_default_context_menus(&window);
     configure_toolset_utility_window(&window, false)?;
     // Pure chrome: click-through and invisible to hit-testing. Without this, the tooltip appearing
     // under the cursor would win windowNumberAtPoint in the pointer feed, read as "cursor left the
@@ -4543,8 +5348,14 @@ fn build_toolset_tooltip_window(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn route_toolset_command(app: tauri::AppHandle, command_id: String) -> Result<(), String> {
-    if utility_windows_suspended() {
+fn route_toolset_command(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    command_id: String,
+    preserve_input_focus: Option<bool>,
+    commit: Option<bool>,
+) -> Result<(), String> {
+    if utility_windows_suspended() && !commit.unwrap_or(false) {
         return Ok(());
     }
     let command_id = command_id.trim();
@@ -4552,7 +5363,29 @@ fn route_toolset_command(app: tauri::AppHandle, command_id: String) -> Result<()
         return Err("Toolset command id cannot be empty.".to_string());
     }
 
+    if commit.unwrap_or(false) {
+        let main = app
+            .get_webview_window(MAIN_WINDOW_LABEL)
+            .ok_or_else(|| "Main document window is not available.".to_string())?;
+        // Shortcut-settle commits retain the event-bus commit's no-focus behavior and
+        // delivery while utility windows are suspended (for example by a native prompt).
+        return dispatch_dom_toolset_event(
+            &main,
+            &ToolsetCommandPayload {
+                command_id: command_id.to_string(),
+            },
+            "chemdraft://palette-command-commit",
+        );
+    }
     emit_command_to_main(&app, command_id)?;
+    // Select changes and clean-number undo update the document while the control
+    // keeps the keyboard. Button/background clicks release the lease themselves.
+    if panel_window::keeps_palette_focus(
+        window.label(),
+        panel_window::holds_input_focus(&window) || preserve_input_focus.unwrap_or(false),
+    ) {
+        return Ok(());
+    }
     if let Err(error) = focus_main_document_window_impl(&app, MainWindowFocusMode::Force) {
         eprintln!(
             "Could not refocus ChemDraft document after toolbar command {command_id}: {error}"
@@ -4580,11 +5413,42 @@ fn read_clipboard_payload() -> Result<ClipboardReadPayload, String> {
 
 #[cfg(windows)]
 #[tauri::command]
+async fn write_clipboard_items(
+    app: tauri::AppHandle,
+    items: Vec<ClipboardWriteItem>,
+) -> Result<ClipboardWriteResult, String> {
+    write_clipboard_items_checked(&app, items)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn write_clipboard_items(
+    app: tauri::AppHandle,
+    items: Vec<ClipboardWriteItem>,
+) -> Result<ClipboardWriteResult, String> {
+    write_clipboard_items_checked(&app, items)
+}
+
+fn write_clipboard_items_checked(
+    app: &tauri::AppHandle,
+    items: Vec<ClipboardWriteItem>,
+) -> Result<ClipboardWriteResult, String> {
+    let (items, warnings) = clipboard_formats::validate_clipboard_items_with_warnings(items)?;
+    let mut result = write_clipboard_items_impl(app, &items)?;
+    result.warnings.extend(warnings);
+    Ok(result)
+}
+
+// Retain the legacy IPC signatures pinned by the command-separation test and used by the ignored
+// native pasteboard test. All writes, including these compatibility shims, use the one writer.
+#[cfg(windows)]
+#[tauri::command]
 async fn write_clipboard_text_items(
     app: tauri::AppHandle,
     items: Vec<ClipboardWriteTextItem>,
 ) -> Result<(), String> {
-    write_clipboard_text_items_impl(&app, normalize_clipboard_write_text_items(items)?)
+    let items = normalize_clipboard_write_text_items(items)?;
+    clipboard_write_succeeded(write_clipboard_items_impl(&app, &items)?)
 }
 
 #[cfg(not(windows))]
@@ -4593,17 +5457,16 @@ fn write_clipboard_text_items(
     app: tauri::AppHandle,
     items: Vec<ClipboardWriteTextItem>,
 ) -> Result<(), String> {
-    write_clipboard_text_items_impl(&app, normalize_clipboard_write_text_items(items)?)
+    let items = normalize_clipboard_write_text_items(items)?;
+    clipboard_write_succeeded(write_clipboard_items_impl(&app, &items)?)
 }
 
-/// Copy As ▸ PNG: put raster image bytes on the system pasteboard as `public.png`.
 #[cfg(windows)]
 #[tauri::command]
 async fn write_clipboard_image(app: tauri::AppHandle, png_bytes: Vec<u8>) -> Result<(), String> {
     write_clipboard_image_checked(&app, &png_bytes)
 }
 
-/// Copy As ▸ PNG: put raster image bytes on the system pasteboard as `public.png`.
 #[cfg(not(windows))]
 #[tauri::command]
 fn write_clipboard_image(app: tauri::AppHandle, png_bytes: Vec<u8>) -> Result<(), String> {
@@ -4611,10 +5474,30 @@ fn write_clipboard_image(app: tauri::AppHandle, png_bytes: Vec<u8>) -> Result<()
 }
 
 fn write_clipboard_image_checked(app: &tauri::AppHandle, png_bytes: &[u8]) -> Result<(), String> {
-    if png_bytes.is_empty() {
-        return Err("Empty PNG payload.".to_string());
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    clipboard_write_succeeded(write_clipboard_items_checked(
+        app,
+        vec![ClipboardWriteItem {
+            r#type: "image/png".to_string(),
+            text: None,
+            bytes_base64: Some(STANDARD.encode(png_bytes)),
+            required: true,
+        }],
+    )?)
+}
+
+fn clipboard_write_succeeded(result: ClipboardWriteResult) -> Result<(), String> {
+    if result.ok {
+        Ok(())
+    } else {
+        Err(result
+            .failed
+            .into_iter()
+            .map(|failure| format!("{}: {}", failure.r#type, failure.reason))
+            .collect::<Vec<_>>()
+            .join("; "))
     }
-    write_clipboard_image_impl(app, png_bytes)
 }
 
 /// The window that owns clipboard writes on Windows. EmptyClipboard with no owner leaves the
@@ -4627,54 +5510,20 @@ fn clipboard_owner_window(app: &tauri::AppHandle) -> windows_sys::Win32::Foundat
         .unwrap_or(std::ptr::null_mut())
 }
 
-#[cfg(target_os = "macos")]
-fn write_clipboard_image_impl(_app: &tauri::AppHandle, png_bytes: &[u8]) -> Result<(), String> {
-    use objc2_foundation::NSData;
-
-    let pasteboard = NSPasteboard::generalPasteboard();
-    pasteboard.clearContents();
-    let png_type = NSString::from_str("public.png");
-    if pasteboard.setData_forType(Some(&NSData::with_bytes(png_bytes)), &png_type) {
-        Ok(())
-    } else {
-        Err("Could not write PNG data to the clipboard.".to_string())
-    }
-}
-
-#[cfg(windows)]
-fn write_clipboard_image_impl(app: &tauri::AppHandle, png_bytes: &[u8]) -> Result<(), String> {
-    windows_clipboard::native::write_png(clipboard_owner_window(app), png_bytes)
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn write_clipboard_image_impl(_app: &tauri::AppHandle, _png_bytes: &[u8]) -> Result<(), String> {
-    Err("Native clipboard image writes are only implemented for macOS and Windows.".to_string())
-}
-
 fn normalize_clipboard_write_text_items(
     items: Vec<ClipboardWriteTextItem>,
-) -> Result<Vec<ClipboardWriteTextItem>, String> {
-    let mut seen_types = Vec::<String>::new();
-    let mut normalized_items = Vec::<ClipboardWriteTextItem>::new();
-
-    for item in items {
-        let item_type = item.r#type.trim().to_string();
-        if item_type.is_empty() || item.text.is_empty() || seen_types.contains(&item_type) {
-            continue;
-        }
-
-        seen_types.push(item_type.clone());
-        normalized_items.push(ClipboardWriteTextItem {
-            r#type: item_type,
-            text: item.text,
-        });
-    }
-
-    if normalized_items.is_empty() {
-        return Err("Clipboard write requires at least one text item.".to_string());
-    }
-
-    Ok(normalized_items)
+) -> Result<Vec<ValidatedClipboardItem>, String> {
+    validate_clipboard_items(
+        items
+            .into_iter()
+            .map(|item| ClipboardWriteItem {
+                r#type: item.r#type,
+                text: Some(item.text),
+                bytes_base64: None,
+                required: true,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -4690,70 +5539,205 @@ fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let text_items = pasteboard
-        .types()
-        .map(|types| {
-            types
-                .to_vec()
-                .into_iter()
-                .filter_map(|pasteboard_type| {
-                    clipboard_text_for_type(&pasteboard, &pasteboard_type).map(|text| {
-                        ClipboardTextItem {
-                            r#type: pasteboard_type.to_string(),
-                            text,
-                        }
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Ok(ClipboardReadPayload { types, text_items })
-}
-
-#[cfg(target_os = "macos")]
-fn write_clipboard_text_items_impl(
-    _app: &tauri::AppHandle,
-    items: Vec<ClipboardWriteTextItem>,
-) -> Result<(), String> {
-    write_native_clipboard_text_items(items)
-}
-
-#[cfg(target_os = "macos")]
-fn write_native_clipboard_text_items(items: Vec<ClipboardWriteTextItem>) -> Result<(), String> {
-    let pasteboard = NSPasteboard::generalPasteboard();
-    pasteboard.clearContents();
-
-    let failed_types = items
+    let read_plan = types
         .iter()
-        .filter_map(|item| {
-            if set_clipboard_text_item(&pasteboard, item) {
-                None
+        .map(|source| {
+            let priority = clipboard_limits::text_read_priority(source);
+            let priority = if priority == Some(2) {
+                pasteboard
+                    .dataForType(&NSString::from_str(source))
+                    .as_ref()
+                    .map_or(priority, |data| {
+                        // SAFETY: immutable retained NSData, inspected only during this call.
+                        clipboard_limits::text_priority_with_preview(source, unsafe {
+                            data.as_bytes_unchecked()
+                        })
+                    })
             } else {
-                Some(item.r#type.clone())
-            }
+                priority
+            };
+            (source, priority)
         })
         .collect::<Vec<_>>();
-
-    if failed_types.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Could not write clipboard text for type(s): {}",
-            failed_types.join(", ")
-        ))
+    let mut budget = clipboard_limits::ClipboardReadBudget::default();
+    let mut text_items = Vec::new();
+    let mut image_items = Vec::new();
+    let mut skipped_image_items = Vec::new();
+    let priorities = read_plan
+        .iter()
+        .map(|(_, priority)| *priority)
+        .collect::<Vec<_>>();
+    // Chemistry precedes artwork; plain text, then HTML and RTF follow it, beside a picture too.
+    for step in clipboard_limits::clipboard_read_steps(&priorities) {
+        let source = match step {
+            clipboard_limits::ClipboardReadStep::Pictures => {
+                (image_items, skipped_image_items) =
+                    clipboard_picture_items(&pasteboard, &types, &mut budget);
+                continue;
+            }
+            clipboard_limits::ClipboardReadStep::Text(index) => read_plan[index].0,
+        };
+        if let Some(text) = clipboard_text_for_type(
+            &pasteboard,
+            &NSString::from_str(source),
+            &mut budget,
+            &text_items,
+        ) {
+            text_items.push(ClipboardTextItem {
+                r#type: source.to_string(),
+                text,
+            });
+        }
     }
+    text_items.sort_by_key(|item| types.iter().position(|kind| kind == &item.r#type));
+
+    Ok(ClipboardReadPayload {
+        types,
+        text_items,
+        image_items,
+        skipped_image_items,
+        skipped_items: budget.skipped_items,
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn set_clipboard_text_item(pasteboard: &NSPasteboard, item: &ClipboardWriteTextItem) -> bool {
-    let text = NSString::from_str(&item.text);
-    if item.r#type == "text/plain" {
-        return pasteboard.setString_forType(&text, unsafe { NSPasteboardTypeString });
+fn clipboard_picture_items(
+    pasteboard: &NSPasteboard,
+    types: &[String],
+    budget: &mut clipboard_limits::ClipboardReadBudget,
+) -> (Vec<ClipboardImageItem>, Vec<SkippedClipboardImageItem>) {
+    let mut image_items = Vec::new();
+    let mut skipped_image_items = Vec::new();
+    // Picture flavors bypass the text reader. SVG text is decoded only from these bounded bytes.
+    for (sources, output_type) in [
+        (&["public.png", "public.tiff"][..], "image/png"),
+        (
+            &["public.svg-image", "image/svg+xml", "public.svg"][..],
+            "image/svg+xml",
+        ),
+    ] {
+        if !image_items.is_empty() {
+            break;
+        }
+        for &source in sources {
+            if !types.iter().any(|kind| kind == source) {
+                continue;
+            }
+            let Some(data) = pasteboard.dataForType(&NSString::from_str(source)) else {
+                skipped_image_items.push(SkippedClipboardImageItem::new(
+                    output_type,
+                    0,
+                    format!("Could not read {source} clipboard data"),
+                ));
+                continue;
+            };
+            let byte_length = data.length();
+            let svg = output_type == "image/svg+xml";
+            let admission = if svg {
+                budget.reserve_svg_allocation(source, byte_length)
+            } else {
+                budget.reserve(source, byte_length)
+            };
+            let result = admission.and_then(|()| {
+                // SAFETY: NSData is retained and immutable; decode directly without a byte copy.
+                let bytes = unsafe { data.as_bytes_unchecked() };
+                let item = match source {
+                    "public.png" => clipboard_images::png_image_item(bytes),
+                    "public.tiff" => clipboard_images::tiff_image_item(bytes),
+                    _ => clipboard_images::svg_image_item(bytes, source),
+                };
+                if svg {
+                    budget.release(byte_length);
+                }
+                let item = item?;
+                if svg {
+                    budget.reserve(source, item.retained_byte_length())?;
+                }
+                Ok(item)
+            });
+            match result {
+                Ok(item) => {
+                    if !image_items
+                        .iter()
+                        .any(|item: &ClipboardImageItem| item.r#type == output_type)
+                    {
+                        image_items.push(item);
+                    }
+                    break;
+                }
+                Err(reason) => {
+                    // A failed conversion was not kept and must not penalize its fallback.
+                    // A refused reservation consumed no bytes in the first place.
+                    if !svg
+                        && !budget
+                            .skipped_items
+                            .iter()
+                            .any(|item| item.r#type == source)
+                    {
+                        budget.release(byte_length);
+                    }
+                    skipped_image_items.push(SkippedClipboardImageItem::new(
+                        output_type,
+                        byte_length,
+                        reason,
+                    ));
+                }
+            }
+        }
     }
+    (image_items, skipped_image_items)
+}
 
-    let pasteboard_type = NSString::from_str(&item.r#type);
-    pasteboard.setString_forType(&text, &pasteboard_type)
+#[cfg(target_os = "macos")]
+fn write_clipboard_items_impl(
+    _app: &tauri::AppHandle,
+    items: &[ValidatedClipboardItem],
+) -> Result<ClipboardWriteResult, String> {
+    Ok(write_native_clipboard_items(items))
+}
+
+#[cfg(target_os = "macos")]
+fn write_native_clipboard_items(items: &[ValidatedClipboardItem]) -> ClipboardWriteResult {
+    use clipboard_formats::{macos_type_for_payload_type, ClipboardWriteData};
+    use objc2_foundation::NSData;
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let mut result = ClipboardWriteResult::new();
+    for item in items {
+        let pasteboard_type = NSString::from_str(macos_type_for_payload_type(&item.r#type));
+        let written = match &item.data {
+            ClipboardWriteData::Text(text) => {
+                let text = NSString::from_str(text);
+                if item.r#type == "text/plain" {
+                    pasteboard.setString_forType(&text, unsafe { NSPasteboardTypeString })
+                } else {
+                    pasteboard.setString_forType(&text, &pasteboard_type)
+                }
+            }
+            ClipboardWriteData::Binary(bytes) => {
+                pasteboard.setData_forType(Some(&NSData::with_bytes(bytes)), &pasteboard_type)
+            }
+        };
+        result.record(
+            item,
+            if written {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Could not write clipboard data for type {}.",
+                    item.r#type
+                ))
+            },
+        );
+    }
+    result
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn write_native_clipboard_text_items(items: Vec<ClipboardWriteTextItem>) -> Result<(), String> {
+    let items = normalize_clipboard_write_text_items(items)?;
+    clipboard_write_succeeded(write_native_clipboard_items(&items))
 }
 
 /// Pasteboard flavors whose bytes are private containers, never directly pasteable text.
@@ -4780,20 +5764,107 @@ fn is_opaque_clipboard_type(pasteboard_type: &str) -> bool {
 fn clipboard_text_for_type(
     pasteboard: &NSPasteboard,
     pasteboard_type: &objc2_app_kit::NSPasteboardType,
+    budget: &mut clipboard_limits::ClipboardReadBudget,
+    admitted: &[ClipboardTextItem],
 ) -> Option<String> {
-    if is_opaque_clipboard_type(&pasteboard_type.to_string()) {
+    let kind = pasteboard_type.to_string();
+    if is_opaque_clipboard_type(&kind) {
         return None;
     }
+    clipboard_limits::text_read_priority(&kind)?;
 
-    if let Some(text) = pasteboard.stringForType(pasteboard_type) {
-        let text = text.to_string();
-        if !text.is_empty() {
-            return Some(text);
+    // AppKit must materialize NSData to expose its length; we cannot prevent that OS-owned
+    // allocation, nor any internal NSString conversion it performs. The UTF8String native
+    // buffer used by to_string / alias comparison is another unavoidable OS-owned copy.
+    // Reserve the native size before copying. Never copy NSData into a Rust Vec or build a second
+    // owned Rust text buffer: only the final String crosses into ChemDraft-owned memory.
+    let data = pasteboard.dataForType(pasteboard_type);
+    let data_length = data.as_ref().map_or(0, |data| data.length());
+    if let Some(data) = &data {
+        // SAFETY: immutable retained NSData; comparison never copies or retains its pointer.
+        if clipboard_limits::is_admitted_text_alias(unsafe { data.as_bytes_unchecked() }, admitted)
+        {
+            return None;
+        }
+    }
+    let native_text = pasteboard.stringForType(pasteboard_type);
+    let utf8_length = native_text
+        .as_ref()
+        .map(|text| text.lengthOfBytesUsingEncoding(objc2_foundation::NSUTF8StringEncoding));
+    if let (Some(text), Some(byte_length)) = (native_text.as_ref(), utf8_length) {
+        // Providers may publish an NSString alias without NSData. Check lengths first,
+        // then compare whole UTF-8 buffers with one Objective-C conversion per NSString.
+        // Never issue characterAtIndex calls per character on a large paste.
+        let alias = if admitted.iter().any(|item| item.text.len() == byte_length) {
+            let pointer = text.UTF8String();
+            !pointer.is_null() && {
+                // SAFETY: NSString retains the native UTF-8 buffer for this comparison;
+                // lengthOfBytesUsingEncoding excludes the trailing NUL, including interior NULs.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), byte_length) };
+                admitted.iter().any(|item| item.text.as_bytes() == bytes)
+            }
+        } else {
+            false
+        };
+        if alias {
+            return None;
+        }
+    }
+    let utf16 = kind.contains("utf16")
+        || data.as_ref().is_some_and(|data| {
+            // SAFETY: immutable retained NSData; inspect only a bounded encoding prefix.
+            let bytes = unsafe { data.as_bytes_unchecked() };
+            looks_like_utf16_bytes(&bytes[..bytes.len().min(8192)])
+        });
+    let reservation = if utf16 {
+        let decoded_length = utf8_length.unwrap_or_else(|| {
+            data.as_ref().map_or(0, |data| {
+                // SAFETY: immutable retained NSData, measured without an owned text allocation.
+                clipboard_limits::utf16_utf8_byte_length(unsafe { data.as_bytes_unchecked() })
+            })
+        });
+        budget.reserve_utf16_allocation(&kind, data_length, decoded_length)
+    } else {
+        budget.reserve(&kind, data_length).map(|()| data_length)
+    };
+    let reserved = match reservation {
+        Ok(reserved) => reserved,
+        Err(_) => {
+            if let Some(data) = &data {
+                // SAFETY: immutable retained NSData used only for a bounded preview.
+                budget.mark_chemistry(&kind, unsafe { data.as_bytes_unchecked() });
+            }
+            return None;
+        }
+    };
+    if let Some(text) = native_text {
+        let byte_length = text.lengthOfBytesUsingEncoding(objc2_foundation::NSUTF8StringEncoding);
+        if byte_length > 0 {
+            // Replace the native-size reservation before allocating the final UTF-8 String.
+            budget.release(reserved);
+            if budget.reserve(&kind, byte_length).is_err() {
+                if let Some(data) = &data {
+                    // SAFETY: immutable retained NSData used only for a bounded preview.
+                    budget.mark_chemistry(&kind, unsafe { data.as_bytes_unchecked() });
+                }
+                return None;
+            }
+            return Some(text.to_string());
         }
     }
 
-    let data = pasteboard.dataForType(pasteboard_type)?;
-    decode_clipboard_text_bytes(&data.to_vec())
+    // SAFETY: immutable NSData remains retained for the entire borrowed decode.
+    let text = data
+        .as_ref()
+        .and_then(|data| decode_clipboard_text_bytes(unsafe { data.as_bytes_unchecked() }));
+    budget.release(reserved);
+    let text = text?;
+    if budget.reserve(&kind, text.len()).is_err() {
+        budget.mark_chemistry(&kind, text.as_bytes());
+        return None;
+    }
+    Some(text)
 }
 
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
@@ -4808,7 +5879,7 @@ fn decode_clipboard_text_bytes(bytes: &[u8]) -> Option<String> {
         }
     }
 
-    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+    if let Ok(text) = std::str::from_utf8(bytes) {
         // ChemDraw-style flavors end in a C-string terminator; strip it. An INTERIOR null is
         // different — text never contains one, so its presence means these bytes are binary.
         let text = text.trim_end_matches('\0');
@@ -4912,17 +5983,15 @@ fn decode_utf16_units(content: &[u8], big_endian: bool) -> Option<String> {
         return None;
     }
 
-    let units = content
-        .chunks_exact(2)
-        .map(|chunk| {
-            if big_endian {
-                u16::from_be_bytes([chunk[0], chunk[1]])
-            } else {
-                u16::from_le_bytes([chunk[0], chunk[1]])
-            }
-        })
-        .collect::<Vec<_>>();
-    String::from_utf16(&units)
+    let units = content.chunks_exact(2).map(|chunk| {
+        if big_endian {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_le_bytes([chunk[0], chunk[1]])
+        }
+    });
+    char::decode_utf16(units)
+        .collect::<Result<String, _>>()
         .ok()
         .filter(|text| !text.is_empty() && text_is_plausible_clipboard_text(text))
 }
@@ -4947,11 +6016,11 @@ fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
 }
 
 #[cfg(windows)]
-fn write_clipboard_text_items_impl(
+fn write_clipboard_items_impl(
     app: &tauri::AppHandle,
-    items: Vec<ClipboardWriteTextItem>,
-) -> Result<(), String> {
-    windows_clipboard::native::write_text_items(clipboard_owner_window(app), &items)
+    items: &[ValidatedClipboardItem],
+) -> Result<ClipboardWriteResult, String> {
+    windows_clipboard::native::write_items(clipboard_owner_window(app), items)
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -4959,14 +6028,17 @@ fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
     Ok(ClipboardReadPayload {
         types: Vec::new(),
         text_items: Vec::new(),
+        image_items: Vec::new(),
+        skipped_image_items: Vec::new(),
+        skipped_items: Vec::new(),
     })
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn write_clipboard_text_items_impl(
+fn write_clipboard_items_impl(
     _app: &tauri::AppHandle,
-    _items: Vec<ClipboardWriteTextItem>,
-) -> Result<(), String> {
+    _items: &[ValidatedClipboardItem],
+) -> Result<ClipboardWriteResult, String> {
     Err("Native clipboard writes are only implemented for macOS and Windows.".to_string())
 }
 
@@ -5089,7 +6161,7 @@ fn ensure_spin3d_debugger_window<R: Runtime>(
         return Ok(window);
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         spin3d_debugger_window_label(),
         WebviewUrl::App(spin3d_debugger_window_route().into()),
@@ -5102,7 +6174,9 @@ fn ensure_spin3d_debugger_window<R: Runtime>(
     .visible(true)
     .center()
     .build()
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    disable_default_context_menus(&window);
+    Ok(window)
 }
 
 fn spin3d_debugger_window_label() -> &'static str {
@@ -5135,7 +6209,7 @@ fn ensure_preferences_window<R: Runtime>(
         return Ok(window);
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         PREFERENCES_WINDOW_LABEL,
         WebviewUrl::App(PREFERENCES_WINDOW_ROUTE.into()),
@@ -5148,13 +6222,40 @@ fn ensure_preferences_window<R: Runtime>(
     .visible(true)
     .center()
     .build()
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    disable_default_context_menus(&window);
+    Ok(window)
 }
 
 #[tauri::command]
 fn agent_bridge_status() -> AgentBridgeStatus {
     let env_value = std::env::var(AGENT_BRIDGE_ENV_VAR).ok();
     agent_bridge_status_from(env_value.as_deref(), std::env::args())
+}
+
+#[tauri::command]
+fn palette_focus_diagnostic(window: tauri::WebviewWindow, line: String) -> Result<(), String> {
+    if !agent_bridge_status().enabled {
+        return Ok(());
+    }
+    let label = window.label();
+    if label != "main" && !(label.starts_with("toolset-") && is_input_focus_window_label(label)) {
+        return Err("Palette diagnostics require a document or tool palette window.".into());
+    }
+    let line: String = line
+        .chars()
+        .take(500)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    palette_focus_log(format_args!("{line}"));
+    Ok(())
+}
+
+// Diagnostics share the existing bridge gate; no separate flag.
+fn palette_focus_log(message: std::fmt::Arguments<'_>) {
+    if agent_bridge_status().enabled {
+        eprintln!("[palette-focus] {message}");
+    }
 }
 
 fn agent_bridge_status_from<I, S>(env_value: Option<&str>, args: I) -> AgentBridgeStatus
@@ -5759,6 +6860,9 @@ fn emit_menu_command<R: Runtime>(
         .map(|(label, _)| label);
     let target_label = menu_command_target_label(command_id, focused_label.as_deref());
     if target_label == MAIN_WINDOW_LABEL {
+        if panel_window::palette_blocks_menu(true, command_id) {
+            return Ok(());
+        }
         return emit_command_to_main(app, command_id);
     }
     let target = app
@@ -5793,8 +6897,16 @@ fn dispatch_dom_command_event<R: Runtime>(
     main: &tauri::WebviewWindow<R>,
     payload: &ToolsetCommandPayload,
 ) -> Result<(), String> {
+    dispatch_dom_toolset_event(main, payload, DOM_COMMAND_EVENT)
+}
+
+fn dispatch_dom_toolset_event<R: Runtime>(
+    main: &tauri::WebviewWindow<R>,
+    payload: &ToolsetCommandPayload,
+    event_name: &str,
+) -> Result<(), String> {
     let payload_json = serde_json::to_string(payload).map_err(|error| error.to_string())?;
-    let event_json = serde_json::to_string(DOM_COMMAND_EVENT).map_err(|error| error.to_string())?;
+    let event_json = serde_json::to_string(event_name).map_err(|error| error.to_string())?;
     main.eval(format!(
         "window.dispatchEvent(new CustomEvent({event_json}, {{ detail: {payload_json} }}));"
     ))
@@ -6010,7 +7122,7 @@ impl Default for ViewMenuState {
 
 /// Sync the webview's plugin menu items into the native menu (ADR-0016): store them, then
 /// rebuild + reinstall the app menu so they appear natively. Clicks route back by the `plugin.`
-/// prefix through the existing native→webview command bridge.
+/// prefix or an explicit `core_routed` flag through the existing native→webview command bridge.
 #[tauri::command]
 fn sync_plugin_menu_items(
     app: tauri::AppHandle,
@@ -6134,8 +7246,26 @@ fn reinstall_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), Strin
         .map_err(|error| error.to_string())
 }
 
-/// Build the Analyze submenu: the static "Validate Selected Structure" item plus any plugin items
-/// (synced from the webview), separated. Plugin `id`s are `plugin.*` command ids routed by prefix.
+/// Shared Insert menu for the macOS application menu and Windows document-window menu.
+fn build_insert_submenu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Submenu<R>> {
+    Submenu::with_items(
+        app,
+        "Insert",
+        true,
+        &[
+            &MenuItem::with_id(app, "table.insertDialog", "Table…", true, None::<&str>)?,
+            &MenuItem::with_id(
+                app,
+                "template.insertDialog",
+                "Templates…",
+                true,
+                None::<&str>,
+            )?,
+        ],
+    )
+}
+
+/// Build the Analyze submenu: core entries followed by plugin command IDs.
 fn build_analyze_submenu<R: Runtime>(
     app: &tauri::AppHandle<R>,
     plugin_items: &[PluginMenuItemInput],
@@ -6219,6 +7349,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
     #[cfg(target_os = "macos")]
     let native_app_menu = create_native_app_menu(app)?;
     let page_setup_menu = create_page_setup_menu(app)?;
+    let insert_menu = build_insert_submenu(app)?;
     let view_menu = create_view_menu(app, entries, view_state)?;
     let structure_menu = Submenu::with_items(
         app,
@@ -6327,6 +7458,10 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                             KeybindingScheme::ChemDraw => "CmdOrCtrl+E",
                         }),
                     )?,
+                    &PredefinedMenuItem::separator(app)?,
+                    #[cfg(not(target_os = "macos"))]
+                    &preferences_menu_item(app)?,
+                    #[cfg(not(target_os = "macos"))]
                     &PredefinedMenuItem::separator(app)?,
                     // macOS: Sparkle's check. Windows: the Tauri updater flow in the webview
                     // (appUpdates.ts). Linux has no update channel yet, so no item there.
@@ -6450,6 +7585,7 @@ fn create_app_menu_for_toolsets<R: Runtime>(
                     )?,
                 ],
             )?,
+            &insert_menu,
             &view_menu,
             &structure_menu,
             &analyze_menu,
@@ -6632,6 +7768,8 @@ fn create_native_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resul
         &[
             &PredefinedMenuItem::about(app, None, Some(about_metadata))?,
             &PredefinedMenuItem::separator(app)?,
+            &preferences_menu_item(app)?,
+            &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::services(app, None)?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::hide(app, None)?,
@@ -6698,19 +7836,21 @@ fn create_page_setup_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resul
     )
 }
 
-fn create_view_menu<R: Runtime>(
-    app: &tauri::AppHandle<R>,
-    entries: &[ToolbarMenuEntry],
-    view_state: ViewMenuState,
-) -> tauri::Result<Submenu<R>> {
-    let preferences = MenuItem::with_id(
+fn preferences_menu_item<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<MenuItem<R>> {
+    MenuItem::with_id(
         app,
         PREFERENCES_TOGGLE_COMMAND_ID,
         "Preferences…",
         true,
         Some("CmdOrCtrl+,"),
-    )?;
-    let preferences_separator = PredefinedMenuItem::separator(app)?;
+    )
+}
+
+fn create_view_menu<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    entries: &[ToolbarMenuEntry],
+    view_state: ViewMenuState,
+) -> tauri::Result<Submenu<R>> {
     // Real checked state (from JS), not a hardcoded true — otherwise a full-menu rebuild would
     // re-check these while the feature is off, desyncing the menu from the document.
     let scheme = current_keybinding_scheme(app);
@@ -6766,8 +7906,6 @@ fn create_view_menu<R: Runtime>(
         "View",
         true,
         &[
-            &preferences,
-            &preferences_separator,
             &show_rulers,
             &show_crosshairs,
             &separator,
@@ -6902,20 +8040,34 @@ fn ensure_toolset_window<R: Runtime>(
         }
     };
 
+    disable_default_context_menus(&window);
     configure_toolset_utility_window(&window, true)?;
+    install_toolset_input_focus(&window)?;
     Ok(())
+}
+
+/// Install once at construction, including native focus-loss delivery for every input lease.
+fn install_toolset_input_focus<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+    let target = window.clone();
+    let installed =
+        run_on_main_thread_blocking(window, move || panel_window::install_input_focus(&target))
+            .and_then(|result| result);
+    panel_window::finish_installation(installed, || {
+        window.destroy().map_err(|error| error.to_string())
+    })
 }
 
 /// Run `task` on the main thread and wait for its result. AppKit is main-thread-only, and the
 /// window-creating commands are `async` (a tokio worker — required for WebView2 on Windows), so every
 /// raw NSWindow call they reach must be marshalled. Tauri runs the closure inline when already on the
 /// main thread, so this is also safe to call from there (the result is sent before `recv` blocks).
-fn run_on_main_thread_blocking<R: Runtime, T: Send + 'static>(
-    window: &tauri::WebviewWindow<R>,
+fn run_on_main_thread_blocking<R: Runtime, M: Manager<R>, T: Send + 'static>(
+    window: &M,
     task: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     window
+        .app_handle()
         .run_on_main_thread(move || {
             let _ = sender.send(task());
         })
@@ -6950,7 +8102,7 @@ fn configure_toolset_utility_window_on_main_thread<R: Runtime>(
         | NSWindowStyleMask::UtilityWindow
         | NSWindowStyleMask::NonactivatingPanel;
     ns_window.setStyleMask(style);
-    ns_window.setLevel(toolset_utility_window_level());
+    ns_window.setLevel(toolset_utility_window_level(window.label()));
     ns_window.setHidesOnDeactivate(toolset_window_hides_on_deactivate());
     ns_window.setCanHide(true);
     ns_window.setIgnoresMouseEvents(false);
@@ -6969,7 +8121,7 @@ fn configure_toolset_utility_window_on_main_thread<R: Runtime>(
     window
         .set_focusable(toolset_window_focusable())
         .map_err(|error| error.to_string())?;
-    // A hidden pre-warm build (the popover's first creation) sets its NSPanel traits here but must
+    // A hidden pre-warm build (the popover's first creation) sets its utility traits here but must
     // NOT be ordered front yet — it reveals itself once its webview has painted real content, so the
     // user never sees a blank window loading. Every other caller shows immediately.
     if order_front {
@@ -7138,8 +8290,16 @@ fn toolset_window_focusable() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn toolset_utility_window_level() -> NSWindowLevel {
-    NSFloatingWindowLevel
+fn toolset_utility_window_level(label: &str) -> NSWindowLevel {
+    // AppKit can bring the clicked palette forward when the opening mouse press ends.
+    // orderFront only wins within a level: popovers need their own higher level on every
+    // creation/reuse/reveal, so palette clicks and focus leases cannot cover them.
+    // Windows keeps its existing document ownership and nonactivating HWND_TOP raise.
+    if label.starts_with("toolset-popover-") {
+        NSFloatingWindowLevel + 1
+    } else {
+        NSFloatingWindowLevel
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7529,6 +8689,49 @@ fn persist_main_window_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result
     })
 }
 
+fn persist_plugin_panel_geometry<R: Runtime>(window: &tauri::Window<R>) -> Result<(), String> {
+    if APP_QUITTING.load(Ordering::SeqCst) || utility_windows_suspended() {
+        return Ok(());
+    }
+    // Native state is authoritative before Tao's cached minimized flag catches up. Windows may
+    // move an owned panel to its minimized parking position before reporting the owner's resize.
+    let native = main_window_placement::snapshot(window)?;
+    let owner_minimized = window
+        .app_handle()
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .is_some_and(|owner| owner.is_minimized().unwrap_or(true));
+    let Some(frame) = panel_full_size::frame_for_save(window) else {
+        return Ok(());
+    };
+    let Some(frame) = frame.for_save(
+        native.minimized || window.is_minimized().unwrap_or(true),
+        owner_minimized,
+        native.fullscreen || window.is_fullscreen().unwrap_or(true),
+    ) else {
+        return Ok(());
+    };
+    save_plugin_panel_frame(window, frame)
+}
+
+fn save_plugin_panel_frame<R: Runtime>(
+    window: &tauri::Window<R>,
+    frame: panel_window_frame::Frame,
+) -> Result<(), String> {
+    // Reject off-screen/parked positions rather than replacing the last usable frame.
+    if plugin_panel_saved_placement(window.app_handle(), &frame).is_none() {
+        return Ok(());
+    }
+    let Some(id) = window
+        .label()
+        .strip_prefix(PLUGIN_PANEL_WINDOW_LABEL_PREFIX)
+    else {
+        return Ok(());
+    };
+    update_toolset_layout_state(window.app_handle(), |layout| {
+        layout.plugin_panels.insert(id.replace(':', "."), frame);
+    })
+}
+
 fn update_main_window_geometry(
     saved: &mut Option<MainWindowGeometry>,
     update: MainWindowGeometryUpdate,
@@ -7830,6 +9033,45 @@ fn find_menu_item_by_id<R: Runtime>(
 mod tests {
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_utf16_and_utf8_text_share_the_decoded_cap() {
+        clipboard_limits::assert_text_encoding_size_admission(
+            "public.utf16-plain-text",
+            "public.utf8-plain-text",
+        );
+    }
+
+    #[test]
+    fn insert_menu_is_shared_by_both_platforms_and_follows_edit() {
+        assert!(is_routed_menu_command("template.insertDialog"));
+        assert!(!is_routed_menu_command("template.insert.beta-cyclodextrin"));
+        let source = include_str!("lib.rs");
+        let builder = source
+            .split("fn create_app_menu_for_toolsets<R: Runtime>")
+            .nth(1)
+            .unwrap()
+            .split("/// Close Window")
+            .next()
+            .unwrap();
+        assert!(builder.contains("let insert_menu = build_insert_submenu(app)?;"));
+        assert!(builder.find("\"Edit\"").unwrap() < builder.find("&insert_menu,").unwrap());
+        assert!(builder.find("&insert_menu,").unwrap() < builder.find("&view_menu,").unwrap());
+        let helper = source
+            .split("fn build_insert_submenu<R: Runtime>")
+            .nth(1)
+            .unwrap()
+            .split("fn build_analyze_submenu")
+            .next()
+            .unwrap();
+        assert!(helper.contains("\"Insert\""));
+        // Table… (tables) and Templates… (structure templates) share the Insert menu.
+        assert!(helper.contains("\"Table…\""));
+        assert!(helper.contains("\"Templates…\""));
+        assert!(helper.find("\"Table…\"").unwrap() < helper.find("\"Templates…\"").unwrap());
+        assert!(!helper.contains("#[cfg"));
+    }
 
     #[test]
     fn main_window_starts_hidden_so_setup_can_place_it_before_showing() {
@@ -8681,6 +9923,7 @@ mod tests {
         let saved = ToolsetLayoutState {
             version: 1,
             toolsets: HashMap::new(),
+            plugin_panels: HashMap::new(),
             main_window: Some(MainWindowGeometry {
                 x: 12.0,
                 y: 34.0,
@@ -8861,7 +10104,8 @@ mod tests {
     fn registered_commands_have_permissions_and_capability_grants() {
         let lib_source = include_str!("lib.rs");
         let capability = format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
+            include_str!("../capabilities/palette-focus-diagnostic.json"),
             include_str!("../capabilities/window-drag.json"),
             include_str!("../capabilities/default.json"),
             include_str!("../capabilities/document-dialogs.json"),
@@ -8997,10 +10241,166 @@ mod tests {
         expect_false(toolset_window_focusable());
     }
 
+    #[test]
+    fn toolset_tooltip_suppression_tracks_all_visible_popovers() {
+        assert!(!toolset_tooltip_suppressed([]));
+        let mut windows = [
+            ("main", true),
+            ("toolset-core-art", true),
+            (TOOLSET_TOOLTIP_WINDOW_LABEL, true),
+            ("toolset-popover-core-main", false),
+            ("toolset-popover-core-art", false),
+            ("toolset-popover-core-bondStereo", false),
+        ];
+        // Visible palettes and a tooltip, plus hidden prewarmed popovers, leave hovers unchanged.
+        assert!(!toolset_tooltip_suppressed(windows));
+        for index in 3..windows.len() {
+            windows[index].1 = true;
+            assert!(toolset_tooltip_suppressed(windows));
+            windows[index].1 = false;
+            assert!(!toolset_tooltip_suppressed(windows));
+        }
+        // Closing one popover is insufficient when another is still visible.
+        windows[3].1 = true;
+        windows[4].1 = true;
+        windows[3].1 = false;
+        assert!(toolset_tooltip_suppressed(windows));
+        windows[4].1 = false;
+        assert!(!toolset_tooltip_suppressed(windows));
+    }
+
+    fn assert_bond_stereo_mouse_creation() {
+        let config = toolset_popover_window_config(
+            "toolset-popover-core-bondStereo",
+            "core.bondStereo",
+            "flyout",
+            false,
+            ToolsetPopoverFocusMode::Preserve,
+        );
+        // These are passed directly to WebviewWindowBuilder::from_config.
+        #[cfg(windows)]
+        assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
+        #[cfg(not(windows))]
+        assert_eq!(config.parent, None);
+        assert!(!config.focusable);
+        assert!(!config.focus); // Tao's Windows SW_SHOWNOACTIVATE path.
+        assert!(!config.visible);
+        assert!(config.skip_taskbar);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bond_stereo_mouse_popover_is_owned_and_nonactivating() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        };
+        assert_bond_stereo_mouse_creation();
+        let style = toolset_popover_extended_style(
+            WS_EX_APPWINDOW as isize,
+            ToolsetPopoverFocusMode::Preserve,
+        );
+        assert_ne!(style & WS_EX_NOACTIVATE as isize, 0);
+        assert_ne!(style & WS_EX_TOOLWINDOW as isize, 0);
+        assert_eq!(style & WS_EX_APPWINDOW as isize, 0);
+        // Reusing the same window for an explicit keyboard focus lease must work.
+        let focused = toolset_popover_extended_style(style, ToolsetPopoverFocusMode::Focus);
+        assert_eq!(focused & WS_EX_NOACTIVATE as isize, 0);
+        assert_ne!(focused & WS_EX_TOOLWINDOW as isize, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bond_stereo_mouse_popover_is_unparented_and_nonactivating() {
+        assert_bond_stereo_mouse_creation();
+    }
+
+    #[test]
+    fn keyboard_popovers_and_color_picker_inputs_remain_focusable() {
+        for (toolset, kind, prewarm) in [
+            ("core.bondStereo", "flyout", false),
+            ("core.main", "flyout", false),
+            ("core.main", "artColor", true),
+            ("core.art", "artColor", false),
+            ("core.art", "artColor", true),
+        ] {
+            let config = toolset_popover_window_config(
+                "popover",
+                toolset,
+                kind,
+                prewarm,
+                ToolsetPopoverFocusMode::Focus,
+            );
+            assert!(config.focusable);
+            assert_eq!(
+                config.title,
+                if toolset == "core.bondStereo" {
+                    "E/Z not specified"
+                } else if kind == "artColor" {
+                    "ChemDraft color picker"
+                } else {
+                    "ChemDraft tools"
+                }
+            );
+            assert!(!config.focus);
+            assert!(!config.visible);
+            #[cfg(windows)]
+            assert_eq!(config.parent.as_deref(), Some(MAIN_WINDOW_LABEL));
+            #[cfg(not(windows))]
+            assert_eq!(config.parent, None);
+        }
+    }
+
+    #[test]
+    fn reused_popover_titles_follow_content() {
+        let art = toolset_popover_window_label("core.art");
+        assert_eq!(
+            toolset_popover_title(&art, "artColor"),
+            "ChemDraft color picker"
+        );
+        assert_eq!(toolset_popover_title(&art, "flyout"), "ChemDraft tools");
+        assert_eq!(
+            toolset_popover_title(&art, "artColor"),
+            "ChemDraft color picker"
+        );
+        assert_eq!(
+            toolset_popover_title(&toolset_popover_window_label("core.bondStereo"), "flyout"),
+            "E/Z not specified"
+        );
+    }
+
+    #[test]
+    fn palette_popovers_open_without_focus_and_lease_their_fields() {
+        let bond_stereo = toolset_popover_window_label("core.bondStereo");
+        assert!(
+            effective_toolset_popover_focus_mode(&bond_stereo, ToolsetPopoverFocusMode::Focus)
+                == ToolsetPopoverFocusMode::Focus
+        );
+        assert!(
+            effective_toolset_popover_focus_mode(&bond_stereo, ToolsetPopoverFocusMode::Preserve)
+                == ToolsetPopoverFocusMode::Preserve
+        );
+        for toolset in ["core.art", "core.drawnStructureSettings", "core.text"] {
+            let label = toolset_popover_window_label(toolset);
+            assert!(
+                effective_toolset_popover_focus_mode(&label, ToolsetPopoverFocusMode::Focus)
+                    == ToolsetPopoverFocusMode::Preserve
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn toolset_utility_windows_float_above_document_windows() {
-        expect_true(toolset_utility_window_level() > objc2_app_kit::NSNormalWindowLevel);
+    fn toolset_popover_level_stays_above_palettes_after_release() {
+        let palette_level = toolset_utility_window_level(&toolset_window_label("core.main"));
+        assert_eq!(palette_level, NSFloatingWindowLevel);
+        assert!(palette_level > objc2_app_kit::NSNormalWindowLevel);
+        for toolset in ["core.main", "core.art", "core.bondStereo"] {
+            assert!(
+                toolset_utility_window_level(&toolset_popover_window_label(toolset))
+                    > palette_level,
+                "{toolset}: click ordering within the palette level must never cover a popover"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -9058,18 +10458,21 @@ mod tests {
         let items = vec![
             PluginMenuItemInput {
                 id: "plugin.first".to_owned(),
+                core_routed: false,
                 label: "First".to_owned(),
                 location: "plugins".to_owned(),
                 enabled: true,
             },
             PluginMenuItemInput {
                 id: "plugin.analyze".to_owned(),
+                core_routed: false,
                 label: "Analyze".to_owned(),
                 location: "analyze".to_owned(),
                 enabled: true,
             },
             PluginMenuItemInput {
                 id: "plugin.second".to_owned(),
+                core_routed: false,
                 label: "Second".to_owned(),
                 location: "plugins".to_owned(),
                 enabled: false,
@@ -9104,6 +10507,31 @@ mod tests {
     #[test]
     fn plugin_manager_menu_command_is_routed() {
         expect_true(is_routed_menu_command("plugins.manage"));
+    }
+
+    #[test]
+    fn dynamic_core_menu_commands_require_explicit_routing() {
+        let mut item = PluginMenuItemInput {
+            id: "plugins.showUpdates".to_owned(),
+            core_routed: false,
+            label: "Plugin Updates Available (1)…".to_owned(),
+            location: "plugins".to_owned(),
+            enabled: true,
+        };
+        assert!(!is_routed_menu_command(&item.id));
+        assert!(!is_core_routed_dynamic_menu_command(
+            &item.id,
+            std::slice::from_ref(&item)
+        ));
+        item.core_routed = true;
+        assert!(is_core_routed_dynamic_menu_command(
+            &item.id,
+            std::slice::from_ref(&item)
+        ));
+        assert!(!is_core_routed_dynamic_menu_command(
+            "plugins.other",
+            &[item]
+        ));
     }
 
     #[test]
@@ -9872,6 +11300,58 @@ mod tests {
         ));
         expect_false(is_opaque_clipboard_type("com.mdli.molfile"));
         expect_false(is_opaque_clipboard_type("text/plain"));
+    }
+
+    // This stomps the user's clipboard. Run alone on macOS with:
+    // cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml native_macos_multiformat_round_trip -- --ignored --test-threads=1
+    #[test]
+    #[ignore = "overwrites the user's native clipboard"]
+    #[cfg(target_os = "macos")]
+    fn native_macos_multiformat_round_trip() {
+        use clipboard_formats::{macos_type_for_payload_type, native_test_data as fixture};
+
+        let (items, png) = fixture::items();
+        let items = validate_clipboard_items(items).expect("valid multi-format request");
+        // The native transaction used by write_clipboard_items, without creating a Tauri runtime.
+        let result = write_native_clipboard_items(&items);
+        assert!(result.ok, "{:?}", result.failed);
+        assert!(result.failed.is_empty());
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.written.len(), 5);
+
+        let payload = read_clipboard_payload_impl().expect("read native clipboard");
+        for (kind, expected) in [
+            (fixture::PRIVATE_TYPE, fixture::JSON),
+            ("text/plain", fixture::TEXT),
+            ("text/html", fixture::HTML),
+            ("text/rtf", fixture::RTF),
+        ] {
+            let native_type = macos_type_for_payload_type(kind);
+            assert!(payload.types.iter().any(|kind| kind == native_type));
+            assert_eq!(
+                payload
+                    .text_items
+                    .iter()
+                    .find(|item| item.r#type == native_type)
+                    .expect("text flavour reads back")
+                    .text,
+                expected
+            );
+        }
+        assert!(payload.types.iter().any(|kind| kind == "public.png"));
+        assert_eq!(payload.image_items.len(), 1);
+        assert!(payload.skipped_image_items.is_empty());
+        assert_eq!(payload.image_items[0].bytes_base64, {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            STANDARD.encode(&png)
+        });
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let data = pasteboard
+            .dataForType(&NSString::from_str("public.png"))
+            .expect("PNG reads back");
+        clipboard_images::check_image_byte_length("public.png", data.length())
+            .expect("PNG fits the clipboard image limit");
+        assert_eq!(data.to_vec(), png);
     }
 
     /// Round-trips the real NSPasteboard, so it stomps the user's clipboard — run explicitly

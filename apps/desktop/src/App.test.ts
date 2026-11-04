@@ -2060,7 +2060,8 @@ describe("ChemDraft desktop shell", () => {
     // Unbound keys show no shortcut at all — not the stale ChemDraft key.
     expect(tooltipFor("tool.lasso")?.shortcut).toBeNull();
     expect(tooltipFor("tool.lasso")?.shortcutLabel).toBeNull();
-    expect(tooltipFor("tool.cyclopentane")?.shortcut).toBeNull();
+    expect(items.some(item => item.id === "tool.cyclopentane")).toBe(false);
+    expect(tooltipFor("tool.benzene")?.shortcutLabel).toBe("J");
 
     // The default scheme still shows the ChemDraft keys.
     const chemdraftItems = getToolsetItemGroups(
@@ -2086,7 +2087,8 @@ describe("ChemDraft desktop shell", () => {
     expect(shouldLetSystemClipboardHandleCommand("layout.group")).toBe(false);
     expect(mainWindowSource).toContain('window.addEventListener("copy", handleCopy)');
     expect(mainWindowSource).toContain('window.addEventListener("cut", handleCut)');
-    expect(mainWindowSource).toContain("writeClipboardDataTransfer(event.clipboardData, selectionClipboardTextItems(payload))");
+    expect(mainWindowSource).toContain("writeClipboardDataTransfer(event.clipboardData, "
+      + "tableCopy?.items ?? selectionClipboardTextItems(payload))");
   });
 
   it("has the window publish which build it is running, on load, hot update and focus", () => {
@@ -2433,6 +2435,7 @@ describe("ChemDraft desktop shell", () => {
     expect(hoveredNativeTargetShortcutCommand(bondTarget, "2")).toBe("bond.setHoveredBondOrder.double");
     expect(hoveredNativeTargetShortcutCommand(bondTarget, "3")).toBe("bond.setHoveredBondOrder.triple");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "k")).toBe("atom.addCarbonylToHoveredAtom");
+    expect(hoveredNativeTargetShortcutCommand(atomTarget, "K")).toBe("atom.addCarbonylToHoveredAtom");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "c")).toBe("atom.setHoveredElement.C");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "t")).toBeUndefined();
     expect(hoveredNativeTargetShortcutCommand(bondTarget, "c")).toBeUndefined();
@@ -2494,6 +2497,7 @@ describe("ChemDraft desktop shell", () => {
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "1", "chemdraw")).toBe("atom.addSingleBondToHoveredAtom");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "2", "chemdraw")).toBe("atom.addCarbonylToHoveredAtom");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "k", "chemdraw")).toBeUndefined();
+    expect(hoveredNativeTargetShortcutCommand(atomTarget, "K", "chemdraw")).toBeUndefined();
     // The numeric sprout row and its "a" aliases.
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "3", "chemdraw")).toBe("atom.attachRingToHoveredAtom.benzene");
     expect(hoveredNativeTargetShortcutCommand(atomTarget, "a", "chemdraw")).toBe("atom.attachRingToHoveredAtom.benzene");
@@ -2581,7 +2585,7 @@ describe("ChemDraft desktop shell", () => {
     // is the flush (documentForFlush), which writes the document as an open label edit's close
     // would leave it. History snapshots strip live drafts before a seventh normalization;
     // restoring each document tab normalizes it through the same funnel once more.
-    // Modeless Page Size, arrangement spacing and reaction conditions also commit into inactive tab histories
+    // Modeless Page Size, arrangement spacing, reaction conditions and Insert Table also commit into inactive tab histories
     // through this funnel; each must normalize the document it installs.
     // Assistant pushes/amendments share prepareDocumentCommit with ordinary edits, so they
     // record label bond sides while retaining one request entry, including in inactive tabs.
@@ -4236,7 +4240,7 @@ describe("ChemDraft desktop shell", () => {
     const eyedropperCommand = getToolsetCommandSpecs().find((command) => command.id === "tool.art.eyedropper");
     const measureCommand = getToolsetCommandSpecs().find((command) => command.id === "tool.art.measure");
 
-    expect(assetCommands.length).toBeGreaterThanOrEqual(50);
+    expect(assetCommands.length).toBeGreaterThanOrEqual(48);
     expect(assetCommands.every((command) => command.category)).toBe(true);
     expect(assetCommands.some((command) => command.description?.includes("toolset action"))).toBe(false);
     expect(eyedropperCommand).toMatchObject({
@@ -5173,8 +5177,8 @@ describe("ChemDraft desktop shell", () => {
     );
 
     expect(markup).toContain('data-object-type="text"');
+    expect(markup).toContain('font-size="12.96px"');
     expect(markup).not.toContain('baseline-shift="super"');
-    expect(markup).toContain('font-size="12.96"');
     expect(markup).toContain('fill="#b3261e"');
   });
 
@@ -5216,7 +5220,8 @@ describe("ChemDraft desktop shell", () => {
 
     expect(markup).toContain('stroke="#b3261e"');
     expect(markup).toContain('fill="#c75c12"');
-    expect(markup).toContain('data-atom-label="NH2"');
+    // The first atom's bond leaves to its right, so its hydrogens lead the label.
+    expect(markup).toContain('data-atom-label="H2N"');
     expect(appCss).not.toMatch(/\\.native-bond-line\\s*{[^}]*stroke\\s*:/);
     expect(appCss).not.toMatch(/\\.native-atom-label\\s*{[^}]*fill\\s*:/);
   });
